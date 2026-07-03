@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-MONEY TRADER - MEXC USDT SİNYAL PANELİ (STREAMLIT WEB SÜRÜMÜ)
+MONEY TRADER - BINANCE USDT SİNYAL PANELİ (STREAMLIT WEB SÜRÜMÜ)
 ✅ Pine Script ile BİREBİR UYUMLU RSI/Fibo Onayı
 ✅ SADECE SON MUMDA GELEN SİNYALLER (REPAINT YOK!)
 ✅ ÇOKLU ZAMAN DİLİMİ: 5dk, 15dk, 30dk, 1sa, 4sa, 1gün
-✅ TÜM MEXC USDT paritelerini tarar
+✅ TÜM Binance USDT paritelerini tarar
 ✅ Tarayıcıdan / telefondan erişilebilir (orijinal tkinter masaüstü sürümünün web hali)
 """
 import os
@@ -76,7 +76,7 @@ TIMEFRAME_OPTIONS = {
     "1d": {"label": "Günlük", "interval": "1d", "limit": 500},
 }
 
-TRADES_FILE = "active_trades_mexc.json"
+TRADES_FILE = "active_trades_binance.json"
 
 # ══════════════════════════════════════════════════════════════
 # 📊 TEKNİK GÖSTERGE HESAPLAMALARI (orijinal mantık korunmuştur)
@@ -143,16 +143,16 @@ def calc_vol_ratio(df, period=20):
 
 
 # ══════════════════════════════════════════════════════════════
-# 🌐 MEXC API
+# 🌐 BINANCE API
 # ══════════════════════════════════════════════════════════════
-MEXC_BASE = "https://api.mexc.com"
-MEXC_SESSION = requests.Session()
-MEXC_SESSION.headers.update({"User-Agent": "MoneyTrader-MEXC/1.0"})
+BINANCE_BASE = "https://data-api.binance.vision"
+BINANCE_SESSION = requests.Session()
+BINANCE_SESSION.headers.update({"User-Agent": "MoneyTrader-Binance/1.0"})
 
 
-def get_mexc_usdt_symbols(min_volume=0):
+def get_binance_usdt_symbols(min_volume=0):
     try:
-        r = MEXC_SESSION.get(f"{MEXC_BASE}/api/v3/ticker/24hr", timeout=30, verify=False)
+        r = BINANCE_SESSION.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", timeout=30, verify=False)
         r.raise_for_status()
         data = r.json()
         if not isinstance(data, list):
@@ -181,7 +181,7 @@ def get_mexc_usdt_symbols(min_volume=0):
         symbols.sort(key=lambda x: x["volume_24h"], reverse=True)
         return symbols
     except Exception as e:
-        st.session_state.setdefault("errors", []).append(f"MEXC sembol cekme hatasi: {e}")
+        st.session_state.setdefault("errors", []).append(f"Binance sembol cekme hatasi: {e}")
         return []
 
 
@@ -191,13 +191,13 @@ def get_stock_data(symbol, timeframe="1h"):
         sym = f"{sym}USDT"
 
     tf_config = TIMEFRAME_OPTIONS.get(timeframe, TIMEFRAME_OPTIONS["1h"])
-    mexc_interval = tf_config["interval"]
+    binance_interval = tf_config["interval"]
     limit = tf_config["limit"]
 
     try:
-        r = MEXC_SESSION.get(
-            f"{MEXC_BASE}/api/v3/klines",
-            params={"symbol": sym, "interval": mexc_interval, "limit": limit},
+        r = BINANCE_SESSION.get(
+            f"{BINANCE_BASE}/api/v3/klines",
+            params={"symbol": sym, "interval": binance_interval, "limit": limit},
             timeout=20, verify=False
         )
         if r.status_code != 200:
@@ -536,19 +536,19 @@ def get_ai_reason(signal):
 
 
 # ══════════════════════════════════════════════════════════════
-# 📋 MEXC USDT COİNLERİNİ TARA
+# 📋 BINANCE USDT COİNLERİNİ TARA
 # ══════════════════════════════════════════════════════════════
-def scan_all_mexc(settings, max_coins, min_volume, timeframe, progress_bar=None, status_text=None):
+def scan_all_binance(settings, max_coins, min_volume, timeframe, progress_bar=None, status_text=None):
     results = []
 
     if status_text:
-        status_text.text(f"📊 MEXC'den coin listesi yükleniyor... (TF: {TIMEFRAME_OPTIONS[timeframe]['label']})")
+        status_text.text(f"📊 Binance'den coin listesi yükleniyor... (TF: {TIMEFRAME_OPTIONS[timeframe]['label']})")
 
-    symbols = get_mexc_usdt_symbols(min_volume=min_volume)
+    symbols = get_binance_usdt_symbols(min_volume=min_volume)
 
     if not symbols:
         if status_text:
-            status_text.text("❌ MEXC'den coin listesi alınamadı! (Ağ/API erişimini kontrol edin)")
+            status_text.text("❌ Binance'den coin listesi alınamadı! (Ağ/API erişimini kontrol edin)")
         return []
 
     if max_coins is not None:
@@ -708,7 +708,7 @@ class ActiveTrades:
 # 🖥️ STREAMLIT ARAYÜZÜ
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="MONEY TRADER - MEXC Kripto Tarama Paneli",
+    page_title="MONEY TRADER - Binance Kripto Tarama Paneli",
     page_icon="💰",
     layout="wide"
 )
@@ -732,7 +732,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("💰 MONEY TRADER — MEXC USDT Sinyal Paneli")
+st.title("💰 MONEY TRADER — Binance USDT Sinyal Paneli")
 st.caption("🎯 Sadece GÜÇLÜ AL/SAT sinyalleri • ✅ Pine Script ile birebir uyumlu RSI/Fibo onayı • ⚠️ REPAINT YOK — sadece son mumda gelen sinyaller")
 
 # ══════════════════════════════════════════════════════════════
@@ -798,7 +798,7 @@ if scan_clicked:
     progress_bar = st.progress(0)
     status_text = st.empty()
     with st.spinner("Taranıyor..."):
-        results = scan_all_mexc(
+        results = scan_all_binance(
             st.session_state.settings,
             max_coins=max_coins,
             min_volume=min_volume,
@@ -861,7 +861,7 @@ else:
     st.download_button(
         "💾 CSV Olarak İndir",
         data=csv,
-        file_name=f"money_trader_mexc_rapor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        file_name=f"money_trader_binance_rapor_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
         mime="text/csv"
     )
 
