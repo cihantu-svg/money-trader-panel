@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-MONEY TRADER - BINANCE USDT SİNYAL PANELİ (STREAMLIT WEB SÜRÜMÜ)
+MONEY TRADER - BINANCE FUTURES SİNYAL PANELİ (STREAMLIT WEB SÜRÜMÜ)
 ✅ Pine Script ile BİREBİR UYUMLU RSI/Fibo Onayı
 ✅ SADECE SON MUMDA GELEN SİNYALLER (REPAINT YOK!)
 ✅ ÇOKLU ZAMAN DİLİMİ: 5dk, 15dk, 30dk, 1sa, 4sa, 1gün
-✅ TÜM Binance USDT paritelerini tarar
+✅ TÜM Binance Futures (USDT-M Perpetual) paritelerini tarar
 ✅ Tarayıcıdan / telefondan erişilebilir (orijinal tkinter masaüstü sürümünün web hali)
 """
 import os
@@ -76,7 +76,7 @@ TIMEFRAME_OPTIONS = {
     "1d": {"label": "Günlük", "interval": "1d", "limit": 500},
 }
 
-TRADES_FILE = "active_trades_binance.json"
+TRADES_FILE = "active_trades_binance_futures.json"
 
 # ══════════════════════════════════════════════════════════════
 # 📊 TEKNİK GÖSTERGE HESAPLAMALARI (orijinal mantık korunmuştur)
@@ -143,16 +143,19 @@ def calc_vol_ratio(df, period=20):
 
 
 # ══════════════════════════════════════════════════════════════
-# 🌐 BINANCE API
+# 🌐 BINANCE FUTURES API (USDT-M Perpetual)
+# ⚠️ fapi.binance.com için Spot'taki gibi coğrafi kısıtlamasız resmi bir ayna
+#    adres yoktur. Streamlit Cloud (ABD sunucusu) üzerinden 451 hatası alma
+#    ihtimali vardır. Alırsanız bana bildirin, alternatif barındırma öneririm.
 # ══════════════════════════════════════════════════════════════
-BINANCE_BASE = "https://data-api.binance.vision"
+BINANCE_BASE = "https://fapi.binance.com"
 BINANCE_SESSION = requests.Session()
-BINANCE_SESSION.headers.update({"User-Agent": "MoneyTrader-Binance/1.0"})
+BINANCE_SESSION.headers.update({"User-Agent": "MoneyTrader-BinanceFutures/1.0"})
 
 
 def get_binance_usdt_symbols(min_volume=0):
     try:
-        r = BINANCE_SESSION.get(f"{BINANCE_BASE}/api/v3/ticker/24hr", timeout=30, verify=False)
+        r = BINANCE_SESSION.get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=30, verify=False)
         r.raise_for_status()
         data = r.json()
         if not isinstance(data, list):
@@ -164,6 +167,8 @@ def get_binance_usdt_symbols(min_volume=0):
             sym = str(t.get("symbol", "")).upper()
             if not sym.endswith("USDT"):
                 continue
+            if "_" in sym:
+                continue  # çeyreklik/vadeli kontratları hariç tut, sadece PERPETUAL kalsın
             base = sym[:-4]
             if any(base.endswith(x) for x in exclude):
                 continue
@@ -181,7 +186,7 @@ def get_binance_usdt_symbols(min_volume=0):
         symbols.sort(key=lambda x: x["volume_24h"], reverse=True)
         return symbols
     except Exception as e:
-        st.session_state.setdefault("errors", []).append(f"Binance sembol cekme hatasi: {e}")
+        st.session_state.setdefault("errors", []).append(f"Binance Futures sembol cekme hatasi: {e}")
         return []
 
 
@@ -196,7 +201,7 @@ def get_stock_data(symbol, timeframe="1h"):
 
     try:
         r = BINANCE_SESSION.get(
-            f"{BINANCE_BASE}/api/v3/klines",
+            f"{BINANCE_BASE}/fapi/v1/klines",
             params={"symbol": sym, "interval": binance_interval, "limit": limit},
             timeout=20, verify=False
         )
@@ -536,7 +541,7 @@ def get_ai_reason(signal):
 
 
 # ══════════════════════════════════════════════════════════════
-# 📋 BINANCE USDT COİNLERİNİ TARA
+# 📋 BINANCE FUTURES USDT COİNLERİNİ TARA
 # ══════════════════════════════════════════════════════════════
 def scan_all_binance(settings, max_coins, min_volume, timeframe, progress_bar=None, status_text=None):
     results = []
@@ -708,7 +713,7 @@ class ActiveTrades:
 # 🖥️ STREAMLIT ARAYÜZÜ
 # ══════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title="MONEY TRADER - Binance Kripto Tarama Paneli",
+    page_title="MONEY TRADER - Binance Futures Tarama Paneli",
     page_icon="💰",
     layout="wide"
 )
@@ -732,8 +737,16 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.title("💰 MONEY TRADER — Binance USDT Sinyal Paneli")
-st.caption("🎯 Sadece GÜÇLÜ AL/SAT sinyalleri • ✅ Pine Script ile birebir uyumlu RSI/Fibo onayı • ⚠️ REPAINT YOK — sadece son mumda gelen sinyaller")
+st.title("💰 MONEY TRADER — Binance Futures Sinyal Paneli")
+st.caption("🎯 Sadece GÜÇLÜ AL/SAT sinyalleri • ✅ Pine Script ile birebir uyumlu RSI/Fibo onayı • ⚠️ REPAINT YOK — sadece son mumda gelen sinyaller • 📡 Veri Kaynağı: Binance Futures (USDT-M Perpetual)")
+
+if "futures_conn_notice_shown" not in st.session_state:
+    st.session_state.futures_conn_notice_shown = True
+    st.info(
+        "ℹ️ Bu panel Binance Futures API'sini kullanır. Eğer tarama sırasında sürekli "
+        "'coin listesi alınamadı' hatası görürseniz, barındırma sunucusunun bulunduğu "
+        "bölgeden kaynaklanan bir erişim kısıtlaması olabilir — bu durumda bana bildirin."
+    )
 
 # ══════════════════════════════════════════════════════════════
 # SIDEBAR — Ayarlar
