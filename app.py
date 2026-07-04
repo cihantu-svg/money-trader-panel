@@ -156,9 +156,19 @@ BINANCE_SESSION.headers.update({"User-Agent": "MoneyTrader-BinanceFutures/1.0"})
 def get_binance_usdt_symbols(min_volume=0):
     try:
         r = BINANCE_SESSION.get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=30, verify=False)
-        r.raise_for_status()
+        if r.status_code != 200:
+            detail = f"HTTP {r.status_code}"
+            try:
+                detail += f" — {r.text[:300]}"
+            except Exception:
+                pass
+            st.session_state.setdefault("errors", []).append(f"Binance Futures API hatasi: {detail}")
+            return []
         data = r.json()
         if not isinstance(data, list):
+            st.session_state.setdefault("errors", []).append(
+                f"Binance Futures beklenmeyen yanit formati: {str(data)[:300]}"
+            )
             return []
 
         exclude = ("3L", "3S", "5L", "5S", "UP", "DOWN", "BULL", "BEAR")
@@ -186,7 +196,7 @@ def get_binance_usdt_symbols(min_volume=0):
         symbols.sort(key=lambda x: x["volume_24h"], reverse=True)
         return symbols
     except Exception as e:
-        st.session_state.setdefault("errors", []).append(f"Binance Futures sembol cekme hatasi: {e}")
+        st.session_state.setdefault("errors", []).append(f"Binance Futures baglanti hatasi: {type(e).__name__}: {e}")
         return []
 
 
@@ -807,6 +817,7 @@ with st.sidebar:
 # TARAMA ÇALIŞTIRMA
 # ══════════════════════════════════════════════════════════════
 if scan_clicked:
+    st.session_state.errors = []
     st.session_state.last_scan_tf = timeframe
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -821,6 +832,17 @@ if scan_clicked:
         )
     st.session_state.scan_results = results
     progress_bar.empty()
+
+if st.session_state.get("errors"):
+    with st.expander("🔧 Hata Detayı (destek için bu kutuyu paylaşın)", expanded=True):
+        for err in st.session_state.errors[:5]:
+            st.code(err, language=None)
+        if "451" in " ".join(st.session_state.errors):
+            st.warning(
+                "Bu '451' hatası, barındırma sunucusunun bulunduğu bölgeden Binance Futures "
+                "API'sine erişimin engellendiği anlamına gelir. Bu durumda farklı bir barındırma "
+                "servisine geçmemiz gerekir — bu ekran görüntüsünü Claude'a gösterin."
+            )
 
 # ══════════════════════════════════════════════════════════════
 # SONUÇLAR
