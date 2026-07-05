@@ -404,20 +404,27 @@ def scan_money_trader(df, settings=None, timeframe="1h"):
     if not raw_sources:
         return []
 
-    # RSI/FİBO ONAYI (BİREBİR - REPAINT YOK!)
-    rsi_cross_ema_up = (current_rsi > current_rsi_ema) and (prev_rsi <= prev_rsi_ema)
+    # RSI/FİBO ONAYI - gevşetilmiş (crossover yerine mevcut durum da kabul edilir)
+    # Crossover: tam geçiş anı
+    rsi_cross_ema_up   = (current_rsi > current_rsi_ema) and (prev_rsi <= prev_rsi_ema)
     rsi_cross_ema_down = (current_rsi < current_rsi_ema) and (prev_rsi >= prev_rsi_ema)
+    rsi_cross_fib_up   = (current_rsi > prev_fib_500)    and (prev_rsi <= prev_fib_500)
+    rsi_cross_fib_down = (current_rsi < prev_fib_500)    and (prev_rsi >= prev_fib_500)
 
-    rsi_cross_fib_up = (current_rsi > prev_fib_500) and (prev_rsi <= prev_fib_500)
-    rsi_cross_fib_down = (current_rsi < prev_fib_500) and (prev_rsi >= prev_fib_500)
+    # Mevcut durum: RSI zaten EMA/Fib üstündeyse kabul et (daha az kısıtlayıcı)
+    rsi_above_ema  = current_rsi > current_rsi_ema
+    rsi_below_ema  = current_rsi < current_rsi_ema
+    rsi_above_fib  = current_rsi > current_fib_500
+    rsi_below_fib  = current_rsi < current_fib_500
 
     mom_bull = current_mom > 0
     mom_bear = current_mom < 0
-
     vol_high = current_vol > current_vol_ma
 
-    ind2_confirmed_buy = (rsi_cross_ema_up or rsi_cross_fib_up) and mom_bull and vol_high
-    ind2_confirmed_sell = (rsi_cross_ema_down or rsi_cross_fib_down) and mom_bear and vol_high
+    # AL onayı: RSI EMA veya Fib üstünde (crossover veya mevcut durum) + momentum pozitif
+    ind2_confirmed_buy  = (rsi_cross_ema_up or rsi_cross_fib_up or rsi_above_ema or rsi_above_fib) and mom_bull
+    # SAT onayı: RSI EMA veya Fib altında + momentum negatif
+    ind2_confirmed_sell = (rsi_cross_ema_down or rsi_cross_fib_down or rsi_below_ema or rsi_below_fib) and mom_bear
 
     buy_sources = [src for src in raw_sources if src in ["TAVAN", "QUANTUM", "OBV_AL"]]
     sell_sources = [src for src in raw_sources if src in ["DESTEK", "OBV_SAT"]]
