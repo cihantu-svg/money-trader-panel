@@ -811,7 +811,7 @@ trades_mgr = st.session_state.trades_manager
 
 st.markdown("""
 <style>
-    .stApp { background-color: #0a0a0a; }
+    .stApp { background-color: #ffffff; }
     div[data-testid="stMetricValue"] { color: #ffd700; }
 </style>
 """, unsafe_allow_html=True)
