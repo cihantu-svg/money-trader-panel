@@ -251,235 +251,297 @@ def get_stock_data(symbol, timeframe="1h"):
 # 🎯 SİNYAL TARAMA - PINE SCRIPT İLE BİREBİR UYUMLU (REPAINT YOK!)
 # ══════════════════════════════════════════════════════════════
 def scan_money_trader(df, settings=None, timeframe="1h"):
-    """
-    Repaint Önleme Koşulları:
-    1. Sadece son mum (i=-1) kontrol edilir
-    2. Önceki mum (i=-2) ile karşılaştırma yapılır
-    3. ta.crossover mantığı: current > level AND prev <= level
-    4. RSI Fibo için önceki mumun fib değeri kullanılır
-    """
     s = settings or DEFAULT_SETTINGS
     if df is None or len(df) < 50:
         return []
 
-    close = df['Close']
-    high = df['High']
-    low = df['Low']
-    volume = df['Volume']
+    close    = df['Close']
+    high     = df['High']
+    low      = df['Low']
+    volume   = df['Volume']
 
-    rsi_val = calc_rsi(close, s['rsi_period'])
-    rsi_ema = calc_ema(rsi_val, s['ema_period'])
+    # ── Göstergeler ──────────────────────────────────────────
+    rsi_val      = calc_rsi(close, s['rsi_period'])
+    rsi_ema      = calc_ema(rsi_val, s['ema_period'])
     momentum_val = calc_momentum(close, s['mom_period'])
-    vol_ma = calc_sma(volume, s['vol_ma_period'])
-    vol_ratio = calc_vol_ratio(df, s['vol_ma_period'])
-    atr_val = calc_atr(df, s['atr_period'])
+    vol_ma       = calc_sma(volume, s['vol_ma_period'])
+    vol_ratio    = calc_vol_ratio(df, s['vol_ma_period'])
+    atr_val      = calc_atr(df, s['atr_period'])
 
-    rsi_top = rsi_val.rolling(window=s['fib_len']).max()
-    rsi_bot = rsi_val.rolling(window=s['fib_len']).min()
-    rsi_diff = rsi_top - rsi_bot
-    fib_500 = rsi_top - rsi_diff * 0.500
+    # RSI Fibonacci 50 seviyesi (Pine Script'teki fib_500_2)
+    rsi_top  = rsi_val.rolling(window=s['fib_len']).max()
+    rsi_bot  = rsi_val.rolling(window=s['fib_len']).min()
+    fib_500  = rsi_top - (rsi_top - rsi_bot) * 0.500
 
-    ha = calc_heikin_ashi(df)
+    ha       = calc_heikin_ashi(df)
     ha_close = ha['haClose']
-    ha_open = ha['haOpen']
-    ha_high = ha['haHigh']
+    ha_open  = ha['haOpen']
+    ha_high  = ha['haHigh']
 
-    obv_val = calc_obv(df)
-    obv_ema = calc_ema(obv_val, s['obv_ema_len'])
+    obv_val  = calc_obv(df)
+    obv_ema  = calc_ema(obv_val, s['obv_ema_len'])
 
     pdh = high.shift(1)
     pdl = low.shift(1)
 
-    i = -1
+    i      = -1
     i_prev = -2
 
-    current_close = float(close.iloc[i])
-    prev_close = float(close.iloc[i_prev])
-
-    current_pdh = float(pdh.iloc[i]) if not pd.isna(pdh.iloc[i]) else current_close
-    current_pdl = float(pdl.iloc[i]) if not pd.isna(pdl.iloc[i]) else current_close
-
-    current_vol_ratio = float(vol_ratio.iloc[i]) if not pd.isna(vol_ratio.iloc[i]) else 1.0
-    current_vol = float(volume.iloc[i])
-    current_vol_ma = float(vol_ma.iloc[i]) if not pd.isna(vol_ma.iloc[i]) else current_vol
-    current_atr = float(atr_val.iloc[i]) if not pd.isna(atr_val.iloc[i]) else current_close * 0.02
-
-    current_rsi = float(rsi_val.iloc[i]) if not pd.isna(rsi_val.iloc[i]) else 50
-    prev_rsi = float(rsi_val.iloc[i_prev]) if not pd.isna(rsi_val.iloc[i_prev]) else 50
-    current_rsi_ema = float(rsi_ema.iloc[i]) if not pd.isna(rsi_ema.iloc[i]) else 50
-    prev_rsi_ema = float(rsi_ema.iloc[i_prev]) if not pd.isna(rsi_ema.iloc[i_prev]) else 50
-
-    current_fib_500 = float(fib_500.iloc[i]) if not pd.isna(fib_500.iloc[i]) else 50
-    prev_fib_500 = float(fib_500.iloc[i_prev]) if not pd.isna(fib_500.iloc[i_prev]) else 50
-
-    current_mom = float(momentum_val.iloc[i]) if not pd.isna(momentum_val.iloc[i]) else 0
-
-    current_obv = float(obv_val.iloc[i])
-    prev_obv = float(obv_val.iloc[i_prev])
-    current_obv_ema = float(obv_ema.iloc[i])
+    # ── Anlık değerler ───────────────────────────────────────
+    cur_close    = float(close.iloc[i])
+    prev_close   = float(close.iloc[i_prev])
+    cur_pdh      = float(pdh.iloc[i])   if not pd.isna(pdh.iloc[i])   else cur_close
+    cur_pdl      = float(pdl.iloc[i])   if not pd.isna(pdl.iloc[i])   else cur_close
+    cur_vol_r    = float(vol_ratio.iloc[i]) if not pd.isna(vol_ratio.iloc[i]) else 1.0
+    cur_vol      = float(volume.iloc[i])
+    cur_vol_ma   = float(vol_ma.iloc[i])   if not pd.isna(vol_ma.iloc[i])   else cur_vol
+    cur_atr      = float(atr_val.iloc[i])  if not pd.isna(atr_val.iloc[i])  else cur_close * 0.02
+    cur_rsi      = float(rsi_val.iloc[i])  if not pd.isna(rsi_val.iloc[i])  else 50.0
+    prev_rsi     = float(rsi_val.iloc[i_prev]) if not pd.isna(rsi_val.iloc[i_prev]) else 50.0
+    cur_fib500   = float(fib_500.iloc[i])  if not pd.isna(fib_500.iloc[i])  else 50.0
+    prev_fib500  = float(fib_500.iloc[i_prev]) if not pd.isna(fib_500.iloc[i_prev]) else 50.0
+    cur_mom      = float(momentum_val.iloc[i]) if not pd.isna(momentum_val.iloc[i]) else 0.0
+    cur_obv      = float(obv_val.iloc[i])
+    prev_obv     = float(obv_val.iloc[i_prev])
+    cur_obv_ema  = float(obv_ema.iloc[i])
     prev_obv_ema = float(obv_ema.iloc[i_prev])
+    cur_ha_c     = float(ha_close.iloc[i])
+    cur_ha_o     = float(ha_open.iloc[i])
+    prev_ha_c    = float(ha_close.iloc[i_prev])
+    prev_ha_o    = float(ha_open.iloc[i_prev])
+    prev_ha_h    = float(ha_high.iloc[i_prev])
 
-    current_ha_close = float(ha_close.iloc[i])
-    current_ha_open = float(ha_open.iloc[i])
-    prev_ha_close = float(ha_close.iloc[i_prev])
-    prev_ha_open = float(ha_open.iloc[i_prev])
-    prev_ha_high = float(ha_high.iloc[i_prev])
+    # ══════════════════════════════════════════════════════════
+    # 📈 MOMENTUM SİNYALİ (Pine Script: Hacim + Momentum Yükselişi)
+    # RSI > 50 crossover + hacim ortalamanın üstünde
+    # ══════════════════════════════════════════════════════════
+    mom_rsi_cross_up   = (cur_rsi > 50) and (prev_rsi <= 50)    # RSI 50'yi yukarı kesti
+    mom_rsi_cross_down = (cur_rsi < 50) and (prev_rsi >= 50)    # RSI 50'yi aşağı kesti
+    vol_yukari         = cur_vol > cur_vol_ma * s['tavan_min_vol_ratio']  # hacim artışı
+    vol_dusuk          = cur_vol < cur_vol_ma * s['vol_ma_period'] * 0.05  # düşük hacim (sat için)
 
-    raw_sources = []
-    signal_gucu = 0
-    olasilik = s['base_olasilik']
+    momentum_al  = mom_rsi_cross_up  and (cur_vol > cur_vol_ma)
+    momentum_sat = mom_rsi_cross_down and (cur_vol > cur_vol_ma)
 
-    # SİNYAL 1: TAVAN ADAYI (AL)
-    if s['enable_tavan_al']:
-        breakout = (current_close > current_pdh) and (prev_close <= current_pdh)
-        threshold = current_pdh * (1 + s['tavan_breakout_pct'] / 100)
-        confirmed = current_close > threshold
-        vol_ok = current_vol_ratio >= s['tavan_min_vol_ratio']
+    # ══════════════════════════════════════════════════════════
+    # 📊 FİBO SİNYALİ (Pine Script: AL Fibo / SAT Fibo)
+    # RSI Fibonacci 50 seviyesini crossover
+    # ══════════════════════════════════════════════════════════
+    fibo_al  = (cur_rsi > prev_fib500) and (prev_rsi <= prev_fib500)   # Fib 50'yi yukarı kesti
+    fibo_sat = (cur_rsi < prev_fib500) and (prev_rsi >= prev_fib500)   # Fib 50'yi aşağı kesti
 
-        auto_high = high.rolling(window=s['auto_zone_days']).max().iloc[i]
-        peak_top = auto_high
-        peak_bot = auto_high * (1 - s['auto_peak_pct'] / 100)
-        pdh_in_peak = current_pdh >= peak_bot and current_pdh <= peak_top
+    # ══════════════════════════════════════════════════════════
+    # 🚀 CONFLUENCE: İKİSİ AYNI MUMDA → EN GÜÇLÜ SİNYAL
+    # ══════════════════════════════════════════════════════════
+    confluence_al  = momentum_al  and fibo_al
+    confluence_sat = momentum_sat and fibo_sat
 
-        if breakout and confirmed and vol_ok and not pdh_in_peak:
-            raw_sources.append("TAVAN")
-            signal_gucu = max(signal_gucu, 85)
+    # ── Diğer yardımcı sinyaller ─────────────────────────────
+    # OBV
+    obv_cross_up   = (cur_obv > cur_obv_ema)  and (prev_obv <= prev_obv_ema)
+    obv_cross_down = (cur_obv < cur_obv_ema)  and (prev_obv >= prev_obv_ema)
 
-    # SİNYAL 2: SAT (Destek Kırılımı)
-    if s['enable_sat']:
-        breakdown = (current_close < current_pdl) and (prev_close >= current_pdl)
-        threshold_sat = current_pdl * (1 - s['sat_breakout_pct'] / 100)
-        confirmed_sat = current_close < threshold_sat
-        vol_ok_sat = current_vol_ratio >= s['sat_min_vol_ratio']
+    # Quantum HA
+    ha_is_up     = cur_ha_c > cur_ha_o
+    ha_was_down  = prev_ha_c <= prev_ha_o
+    sert_yukselis = cur_ha_c > prev_ha_h
+    govde        = ((cur_ha_c - cur_ha_o) / cur_ha_o * 100) if cur_ha_o > 0 else 0
+    mutlak       = abs(govde)
+    quantum_al   = ha_is_up and (ha_was_down or sert_yukselis) and mutlak >= s['hassasiyet']
 
-        auto_low_sat = low.rolling(window=s['auto_zone_days']).min().iloc[i]
-        dip_top = auto_low_sat * (1 + s['auto_dip_pct'] / 100)
-        dip_bot = auto_low_sat
-        pdl_in_dip = current_pdl >= dip_bot and current_pdl <= dip_top
+    # Tavan/Destek kırılımı
+    auto_high  = high.rolling(window=s['auto_zone_days']).max().iloc[i]
+    auto_low   = low.rolling(window=s['auto_zone_days']).min().iloc[i]
+    peak_bot   = auto_high * (1 - s['auto_peak_pct'] / 100)
+    dip_top    = auto_low  * (1 + s['auto_dip_pct']  / 100)
 
-        if breakdown and confirmed_sat and vol_ok_sat and not pdl_in_dip:
-            raw_sources.append("DESTEK")
-            signal_gucu = max(signal_gucu, 85)
+    tavan_kirilis  = (cur_close > cur_pdh) and (prev_close <= cur_pdh) and \
+                     (cur_close > cur_pdh * (1 + s['tavan_breakout_pct']/100)) and \
+                     (cur_vol_r >= s['tavan_min_vol_ratio']) and \
+                     not (cur_pdh >= peak_bot and cur_pdh <= auto_high)
+    destek_kirilis = (cur_close < cur_pdl) and (prev_close >= cur_pdl) and \
+                     (cur_close < cur_pdl * (1 - s['sat_breakout_pct']/100)) and \
+                     (cur_vol_r >= s['sat_min_vol_ratio']) and \
+                     not (cur_pdl >= auto_low and cur_pdl <= dip_top)
 
-    # SİNYAL 3: QUANTUM AL (Heikin Ashi Momentum)
-    if s['enable_quantum_al']:
-        ha_is_up = current_ha_close > current_ha_open
-        ha_was_down = prev_ha_close <= prev_ha_open
-        sert_yukselis = current_ha_close > prev_ha_high
-
-        govde_degisim = ((current_ha_close - current_ha_open) / current_ha_open) * 100 if current_ha_open > 0 else 0
-        mutlak_degisim = abs(govde_degisim)
-
-        if ha_is_up and (ha_was_down or sert_yukselis) and mutlak_degisim >= s['hassasiyet']:
-            raw_sources.append("QUANTUM")
-
-            body_series = abs((ha_close - ha_open) / ha_open * 100)
-            avg_body = body_series.rolling(window=10).mean().iloc[i]
-            if pd.isna(avg_body):
-                avg_body = mutlak_degisim
-
-            sg = min(100, (mutlak_degisim / (avg_body if avg_body > 0 else 1)) * s['guc_carpan'])
-            olasilik_q = s['base_olasilik'] + (sg / s['olasilik_artis_bolucu'])
-            if mutlak_degisim > s['hassasiyet'] * s['hassasiyet_carpan']:
-                olasilik_q += s['ek_olasilik_bonusu']
-            olasilik_q = min(s['max_olasilik'], olasilik_q)
-
-            signal_gucu = max(signal_gucu, sg)
-            olasilik = max(olasilik, olasilik_q)
-
-    # SİNYAL 4: OBV AL
-    if s['enable_obv_al']:
-        obv_cross_up = (current_obv > current_obv_ema) and (prev_obv <= prev_obv_ema)
-        if obv_cross_up:
-            raw_sources.append("OBV_AL")
-            signal_gucu = max(signal_gucu, 75)
-
-    # SİNYAL 5: OBV SAT
-    if s['enable_obv_sat']:
-        obv_cross_down = (current_obv < current_obv_ema) and (prev_obv >= prev_obv_ema)
-        if obv_cross_down:
-            raw_sources.append("OBV_SAT")
-            signal_gucu = max(signal_gucu, 75)
-
-    if not raw_sources:
-        return []
-
-    # RSI/FİBO ONAYI - gevşetilmiş (crossover yerine mevcut durum da kabul edilir)
-    # Crossover: tam geçiş anı
-    rsi_cross_ema_up   = (current_rsi > current_rsi_ema) and (prev_rsi <= prev_rsi_ema)
-    rsi_cross_ema_down = (current_rsi < current_rsi_ema) and (prev_rsi >= prev_rsi_ema)
-    rsi_cross_fib_up   = (current_rsi > prev_fib_500)    and (prev_rsi <= prev_fib_500)
-    rsi_cross_fib_down = (current_rsi < prev_fib_500)    and (prev_rsi >= prev_fib_500)
-
-    # Mevcut durum: RSI zaten EMA/Fib üstündeyse kabul et (daha az kısıtlayıcı)
-    rsi_above_ema  = current_rsi > current_rsi_ema
-    rsi_below_ema  = current_rsi < current_rsi_ema
-    rsi_above_fib  = current_rsi > current_fib_500
-    rsi_below_fib  = current_rsi < current_fib_500
-
-    mom_bull = current_mom > 0
-    mom_bear = current_mom < 0
-    vol_high = current_vol > current_vol_ma
-
-    # AL onayı: RSI EMA veya Fib üstünde (crossover veya mevcut durum) + momentum pozitif
-    ind2_confirmed_buy  = (rsi_cross_ema_up or rsi_cross_fib_up or rsi_above_ema or rsi_above_fib) and mom_bull
-    # SAT onayı: RSI EMA veya Fib altında + momentum negatif
-    ind2_confirmed_sell = (rsi_cross_ema_down or rsi_cross_fib_down or rsi_below_ema or rsi_below_fib) and mom_bear
-
-    buy_sources = [src for src in raw_sources if src in ["TAVAN", "QUANTUM", "OBV_AL"]]
-    sell_sources = [src for src in raw_sources if src in ["DESTEK", "OBV_SAT"]]
-
-    is_strong_buy = len(buy_sources) > 0 and ind2_confirmed_buy and signal_gucu >= s['min_guc_seviyesi']
-    is_strong_sell = len(sell_sources) > 0 and ind2_confirmed_sell and signal_gucu >= s['min_guc_seviyesi']
-
+    # ══════════════════════════════════════════════════════════
+    # SONUÇ: Önce Confluence, sonra tek başına güçlü sinyaller
+    # ══════════════════════════════════════════════════════════
     final_signals = []
 
-    if is_strong_buy:
-        hedef_fiyat = current_close + (current_atr * s['atr_mult'])
-        beklenti_yuzde = ((hedef_fiyat - current_close) / current_close) * 100
-        source_txt = "+".join(buy_sources) + "+RSI/Fibo"
-
+    # ── AL sinyalleri ─────────────────────────────────────────
+    if confluence_al and s['enable_tavan_al']:
+        # En güçlü: Momentum + Fibo aynı anda
+        body_s   = abs((ha_close - ha_open) / ha_open * 100)
+        avg_body = body_s.rolling(10).mean().iloc[i]
+        sg       = min(100, (mutlak / (avg_body if avg_body > 0 else 1)) * s['guc_carpan'])
+        olas     = min(s['max_olasilik'], s['base_olasilik'] + sg / s['olasilik_artis_bolucu'] + s['ek_olasilik_bonusu'])
+        hedef    = cur_close + cur_atr * s['atr_mult']
         final_signals.append({
-            "type": "GÜÇLÜ_AL",
-            "source": source_txt,
-            "price": current_close,
-            "strength": signal_gucu,
-            "probability": olasilik,
-            "details": f"Kaynak: {source_txt} | Güç: %{signal_gucu:.1f}",
-            "hedef_fiyat": round(hedef_fiyat, 8),
-            "beklenti_yuzde": round(beklenti_yuzde, 2),
-            "atr": round(current_atr, 8),
-            "rsi": round(current_rsi, 2),
-            "vol_ratio": round(current_vol_ratio, 2),
+            "type": "CONFLUENCE_AL",
+            "source": "Momentum(RSI50) + AL(Fibo50)",
+            "price": cur_close,
+            "strength": round(sg, 1),
+            "probability": round(olas, 1),
+            "hedef_fiyat": round(hedef, 8),
+            "beklenti_yuzde": round((hedef - cur_close) / cur_close * 100, 2),
+            "atr": round(cur_atr, 8),
+            "rsi": round(cur_rsi, 2),
+            "fib500": round(cur_fib500, 2),
+            "vol_ratio": round(cur_vol_r, 2),
             "direction": "AL",
-            "rsi_onay": ind2_confirmed_buy,
-            "raw_sources": raw_sources,
+            "raw_sources": ["MOMENTUM_AL", "FIBO_AL"],
             "timeframe": timeframe
         })
 
-    if is_strong_sell:
-        hedef_fiyat_sat = current_close - (current_atr * s['atr_mult'])
-        beklenti_yuzde_sat = ((current_close - hedef_fiyat_sat) / current_close) * 100
-        source_txt = "+".join(sell_sources) + "+RSI/Fibo"
-
+    elif momentum_al and s['enable_tavan_al']:
+        # Sadece Momentum AL
+        hedef = cur_close + cur_atr * s['atr_mult']
         final_signals.append({
-            "type": "GÜÇLÜ_SAT",
-            "source": source_txt,
-            "price": current_close,
-            "strength": signal_gucu,
-            "probability": olasilik,
-            "details": f"Kaynak: {source_txt} | Güç: %{signal_gucu:.1f}",
-            "hedef_fiyat": round(hedef_fiyat_sat, 8),
-            "beklenti_yuzde": round(beklenti_yuzde_sat, 2),
-            "atr": round(current_atr, 8),
-            "rsi": round(current_rsi, 2),
-            "vol_ratio": round(current_vol_ratio, 2),
-            "direction": "SAT",
-            "rsi_onay": ind2_confirmed_sell,
-            "raw_sources": raw_sources,
+            "type": "MOMENTUM_AL",
+            "source": "RSI50 Crossover + Hacim",
+            "price": cur_close,
+            "strength": 70.0,
+            "probability": round(s['base_olasilik'], 1),
+            "hedef_fiyat": round(hedef, 8),
+            "beklenti_yuzde": round((hedef - cur_close) / cur_close * 100, 2),
+            "atr": round(cur_atr, 8),
+            "rsi": round(cur_rsi, 2),
+            "fib500": round(cur_fib500, 2),
+            "vol_ratio": round(cur_vol_r, 2),
+            "direction": "AL",
+            "raw_sources": ["MOMENTUM_AL"],
             "timeframe": timeframe
         })
 
+    elif fibo_al and s['enable_tavan_al']:
+        # Sadece Fibo AL
+        hedef = cur_close + cur_atr * s['atr_mult']
+        final_signals.append({
+            "type": "FIBO_AL",
+            "source": "RSI Fibo50 Crossover",
+            "price": cur_close,
+            "strength": 70.0,
+            "probability": round(s['base_olasilik'], 1),
+            "hedef_fiyat": round(hedef, 8),
+            "beklenti_yuzde": round((hedef - cur_close) / cur_close * 100, 2),
+            "atr": round(cur_atr, 8),
+            "rsi": round(cur_rsi, 2),
+            "fib500": round(cur_fib500, 2),
+            "vol_ratio": round(cur_vol_r, 2),
+            "direction": "AL",
+            "raw_sources": ["FIBO_AL"],
+            "timeframe": timeframe
+        })
+
+    # Tavan + OBV + Quantum → ek AL sinyalleri
+    for src, label, enabled in [
+        (tavan_kirilis, "TAVAN_KIRILIS", s['enable_tavan_al']),
+        (obv_cross_up and s['enable_obv_al'], "OBV_AL", s['enable_obv_al']),
+        (quantum_al and s['enable_quantum_al'], "QUANTUM_AL", s['enable_quantum_al']),
+    ]:
+        if src and enabled and not any(sig["direction"] == "AL" and sig["type"] == label for sig in final_signals):
+            hedef = cur_close + cur_atr * s['atr_mult']
+            final_signals.append({
+                "type": label,
+                "source": label.replace("_", " "),
+                "price": cur_close,
+                "strength": 75.0,
+                "probability": round(s['base_olasilik'], 1),
+                "hedef_fiyat": round(hedef, 8),
+                "beklenti_yuzde": round((hedef - cur_close) / cur_close * 100, 2),
+                "atr": round(cur_atr, 8),
+                "rsi": round(cur_rsi, 2),
+                "fib500": round(cur_fib500, 2),
+                "vol_ratio": round(cur_vol_r, 2),
+                "direction": "AL",
+                "raw_sources": [label],
+                "timeframe": timeframe
+            })
+
+    # ── SAT sinyalleri ────────────────────────────────────────
+    if confluence_sat and s['enable_sat']:
+        hedef_sat = cur_close - cur_atr * s['atr_mult']
+        final_signals.append({
+            "type": "CONFLUENCE_SAT",
+            "source": "Momentum(RSI50) + SAT(Fibo50)",
+            "price": cur_close,
+            "strength": 90.0,
+            "probability": round(s['max_olasilik'] * 0.9, 1),
+            "hedef_fiyat": round(hedef_sat, 8),
+            "beklenti_yuzde": round((cur_close - hedef_sat) / cur_close * 100, 2),
+            "atr": round(cur_atr, 8),
+            "rsi": round(cur_rsi, 2),
+            "fib500": round(cur_fib500, 2),
+            "vol_ratio": round(cur_vol_r, 2),
+            "direction": "SAT",
+            "raw_sources": ["MOMENTUM_SAT", "FIBO_SAT"],
+            "timeframe": timeframe
+        })
+
+    elif momentum_sat and s['enable_sat']:
+        hedef_sat = cur_close - cur_atr * s['atr_mult']
+        final_signals.append({
+            "type": "MOMENTUM_SAT",
+            "source": "RSI50 Crossunder + Hacim",
+            "price": cur_close,
+            "strength": 70.0,
+            "probability": round(s['base_olasilik'], 1),
+            "hedef_fiyat": round(hedef_sat, 8),
+            "beklenti_yuzde": round((cur_close - hedef_sat) / cur_close * 100, 2),
+            "atr": round(cur_atr, 8),
+            "rsi": round(cur_rsi, 2),
+            "fib500": round(cur_fib500, 2),
+            "vol_ratio": round(cur_vol_r, 2),
+            "direction": "SAT",
+            "raw_sources": ["MOMENTUM_SAT"],
+            "timeframe": timeframe
+        })
+
+    elif fibo_sat and s['enable_sat']:
+        hedef_sat = cur_close - cur_atr * s['atr_mult']
+        final_signals.append({
+            "type": "FIBO_SAT",
+            "source": "RSI Fibo50 Crossunder",
+            "price": cur_close,
+            "strength": 70.0,
+            "probability": round(s['base_olasilik'], 1),
+            "hedef_fiyat": round(hedef_sat, 8),
+            "beklenti_yuzde": round((cur_close - hedef_sat) / cur_close * 100, 2),
+            "atr": round(cur_atr, 8),
+            "rsi": round(cur_rsi, 2),
+            "fib500": round(cur_fib500, 2),
+            "vol_ratio": round(cur_vol_r, 2),
+            "direction": "SAT",
+            "raw_sources": ["FIBO_SAT"],
+            "timeframe": timeframe
+        })
+
+    for src, label, enabled in [
+        (destek_kirilis, "DESTEK_KIRILIS", s['enable_sat']),
+        (obv_cross_down and s['enable_obv_sat'], "OBV_SAT", s['enable_obv_sat']),
+    ]:
+        if src and enabled and not any(sig["direction"] == "SAT" and sig["type"] == label for sig in final_signals):
+            hedef_sat = cur_close - cur_atr * s['atr_mult']
+            final_signals.append({
+                "type": label,
+                "source": label.replace("_", " "),
+                "price": cur_close,
+                "strength": 75.0,
+                "probability": round(s['base_olasilik'], 1),
+                "hedef_fiyat": round(hedef_sat, 8),
+                "beklenti_yuzde": round((cur_close - hedef_sat) / cur_close * 100, 2),
+                "atr": round(cur_atr, 8),
+                "rsi": round(cur_rsi, 2),
+                "fib500": round(cur_fib500, 2),
+                "vol_ratio": round(cur_vol_r, 2),
+                "direction": "SAT",
+                "raw_sources": [label],
+                "timeframe": timeframe
+            })
+
+    # Min güç filtresi
+    final_signals = [sig for sig in final_signals if sig["strength"] >= s['min_guc_seviyesi']]
     return final_signals
 
 
