@@ -811,7 +811,7 @@ trades_mgr = st.session_state.trades_manager
 
 st.markdown("""
 <style>
-    .stApp { background-color: #ffffff; }
+    .stApp { background-color: #0a0a0a; }
     div[data-testid="stMetricValue"] { color: #ffd700; }
 </style>
 """, unsafe_allow_html=True)
@@ -850,6 +850,22 @@ with st.sidebar:
         "Min 24 Saatlik Hacim (USDT)",
         min_value=0, value=500_000, step=100_000
     )
+
+    st.divider()
+    st.markdown("### 🎯 Sinyal Filtresi")
+    sinyal_filtresi = st.radio(
+        "Hangi sinyalleri göster?",
+        options=[
+            "🚀 Sadece CONFLUENCE (Momentum + Fibo aynı anda)",
+            "📈 Momentum + Fibo + Confluence (hepsi)",
+            "🔧 Tüm Sinyaller",
+        ],
+        index=0,
+        help="Confluence = RSI 50 crossover (Momentum) VE RSI Fibo 50 crossover aynı mumda tetiklenir. En güçlü sinyal budur."
+    )
+    if "sinyal_filtresi" not in st.session_state:
+        st.session_state.sinyal_filtresi = sinyal_filtresi
+    st.session_state.sinyal_filtresi = sinyal_filtresi
 
     st.divider()
     with st.expander("🎚️ Gelişmiş Sinyal Ayarları"):
@@ -934,19 +950,36 @@ st.subheader(f"📊 Güçlü Sinyal Listesi (TF: {tf_label})")
 if not results:
     st.info("⚠️ Henüz sinyal yok. Soldaki '🔍 TÜMÜNÜ TARA' butonuna basarak taramayı başlatın.")
 else:
-    filter_choice = st.radio("Filtrele:", ["Tümü", "Sadece AL", "Sadece SAT"], horizontal=True)
+    # Sidebar'daki sinyal filtresi uygula
+    sf = st.session_state.get("sinyal_filtresi", "🔧 Tüm Sinyaller")
+    confluence_types = {"CONFLUENCE_AL", "CONFLUENCE_SAT"}
+    momentum_fibo_types = {"CONFLUENCE_AL", "CONFLUENCE_SAT", "MOMENTUM_AL", "MOMENTUM_SAT", "FIBO_AL", "FIBO_SAT"}
 
-    filtered = results
-    if filter_choice == "Sadece AL":
-        filtered = [r for r in results if r['signal']['direction'] == 'AL']
-    elif filter_choice == "Sadece SAT":
-        filtered = [r for r in results if r['signal']['direction'] == 'SAT']
+    if "Sadece CONFLUENCE" in sf:
+        filtered_by_type = [r for r in results if r['signal']['type'] in confluence_types]
+    elif "Momentum + Fibo" in sf:
+        filtered_by_type = [r for r in results if r['signal']['type'] in momentum_fibo_types]
+    else:
+        filtered_by_type = results
+
+    confluence_count = sum(1 for r in filtered_by_type if r['signal']['type'] in confluence_types)
+    if confluence_count > 0:
+        st.success(f"🚀 {confluence_count} adet CONFLUENCE sinyali bulundu! (Momentum + Fibo aynı anda)")
+
+    filter_choice = st.radio("Yön Filtresi:", ["Tümü", "Sadece AL 🟢", "Sadece SAT 🔴"], horizontal=True)
+
+    filtered = filtered_by_type
+    if filter_choice == "Sadece AL 🟢":
+        filtered = [r for r in filtered_by_type if r['signal']['direction'] == 'AL']
+    elif filter_choice == "Sadece SAT 🔴":
+        filtered = [r for r in filtered_by_type if r['signal']['direction'] == 'SAT']
 
     table_rows = []
     for r in filtered:
         sig = r['signal']
         table_rows.append({
             "Sembol": r['symbol'],
+            "Sinyal": "🚀 CONFLUENCE" if "CONFLUENCE" in sig['type'] else ("📈 MOMENTUM" if "MOMENTUM" in sig['type'] else ("📊 FIBO" if "FIBO" in sig['type'] else sig['type'])),
             "Yön": "🟢 AL" if sig['direction'] == 'AL' else "🔴 SAT",
             "Fiyat": sig['price'],
             "Hedef": sig['hedef_fiyat'],
