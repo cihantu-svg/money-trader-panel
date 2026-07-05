@@ -34,10 +34,10 @@ DEFAULT_SETTINGS = {
     "enable_obv_sat": True,
 
     "rsi_period": 14,
-    "ema_period": 20,
-    "mom_period": 9,
+    "ema_period": 10,
+    "mom_period": 10,
     "vol_ma_period": 20,
-    "fib_len": 14,
+    "fib_len": 100,
 
     "obv_ema_len": 3,
 
