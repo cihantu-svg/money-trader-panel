@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 MAJOR KIRILIM BOT
-Strateji: Fiyat SMA100 (Major/turuncu cizgi) crossover ile kirar
-+ Squeeze Momentum onayi (sikisma serbest kalmasi VEYA momentum yonu uyumlu)
-+ hacim onayi (son mum hacmi ortalamanin VOL_MULT kati ustunde) olursa
-Telegram bildirimi gonderir.
+Strateji: Market Structure Break (MSB - zigzag yapi kirilmasi) yonu ile
+fiyatin SMA100 (Major/turuncu cizgi) konumu ayni tarafta olursa
+Telegram bildirimi gonderir (hacim sarti yok).
 Zaman dilimi: 15 dakika
 Tarama araligi: 5 dakika (ayarlanabilir)
 Borsa: Binance Futures (USDT-M Perpetual)
@@ -108,6 +107,56 @@ def calc_squeeze(df: pd.DataFrame, length: int = 20, mult_kc: float = 1.5, lengt
 
     return sqz_on, sqz_off, val
 
+def calc_msb(df: pd.DataFrame, zigzag_len: int = 9, fib_factor: float = 0.33):
+    """
+    Market Structure Break (MSB) - EmreKb Pine Script mantiginin Python portu.
+    Zigzag ile swing high/low takip edilir, yeni bir swing onceki karsit swingi
+    fib_factor tamponuyla asarsa yapi kirilmasi (MSB) olusur.
+    Donus: msb_up, msb_dn (bool numpy array) - o barda boga/ayi MSB olustu mu
+    """
+    high = df['High'].to_numpy()
+    low = df['Low'].to_numpy()
+    n = len(df)
+
+    highest = df['High'].rolling(zigzag_len).max().to_numpy()
+    lowest = df['Low'].rolling(zigzag_len).min().to_numpy()
+    to_up = high >= highest
+    to_down = low <= lowest
+
+    trend = np.ones(n, dtype=int)
+    msb_up = np.zeros(n, dtype=bool)
+    msb_dn = np.zeros(n, dtype=bool)
+
+    h0 = h1 = l0 = l1 = np.nan
+    market = 1
+
+    for i in range(1, n):
+        prev_t = trend[i - 1]
+        if prev_t == 1 and to_down[i]:
+            trend[i] = -1
+        elif prev_t == -1 and to_up[i]:
+            trend[i] = 1
+        else:
+            trend[i] = prev_t
+
+        if trend[i] != prev_t:
+            if trend[i] == 1:
+                l1 = l0
+                l0 = low[i]
+            else:
+                h1 = h0
+                h0 = high[i]
+
+            if not (np.isnan(l0) or np.isnan(l1) or np.isnan(h0) or np.isnan(h1)):
+                if market == 1 and l0 < l1 and l0 < l1 - abs(h0 - l1) * fib_factor:
+                    market = -1
+                    msb_dn[i] = True
+                elif market == -1 and h0 > h1 and h0 > h1 + abs(h1 - l0) * fib_factor:
+                    market = 1
+                    msb_up[i] = True
+
+    return msb_up, msb_dn
+
 # ============================================================
 # BINANCE FUTURES API
 # ============================================================
@@ -179,8 +228,8 @@ def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
 # ============================================================
 def check_signal(df: pd.DataFrame, symbol: str) -> list:
     """
-    AL : Fiyat SMA100 (turuncu cizgi) yukari kirdi + Squeeze Momentum onayi + hacim onayi
-    SAT: Fiyat SMA100 (turuncu cizgi) asagi kirdi + Squeeze Momentum onayi + hacim onayi
+    AL : MSB yukari kirilim olustu VE fiyat SMA100 (turuncu cizgi) ustunde
+    SAT: MSB asagi kirilim olustu VE fiyat SMA100 (turuncu cizgi) altinda
     """
     if df is None or len(df) < MAJOR_LEN + 5:
         return []
@@ -194,7 +243,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     spanb = calc_spanb(high, low, SPANB_LEN)
     atr = calc_atr(df, 14)
     vol_ma = vol.rolling(window=VOL_MA_LEN).mean()
-    sqz_on, sqz_off, sqz_val = calc_squeeze(df)
+    msb_up_arr, msb_dn_arr = calc_msb(df)
 
     i, ip = -2, -3  # son iki kapanmis mum (repaint yok)
 
@@ -214,14 +263,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     cur_atr = safe(atr, i, cur_close * 0.01)
     cur_vol = safe(vol, i)
     cur_vol_ma = safe(vol_ma, i, 0.0)
-    prev_sqz_on = bool(sqz_on.iloc[ip]) if not pd.isna(sqz_on.iloc[ip]) else False
-    cur_sqz_off = bool(sqz_off.iloc[i]) if not pd.isna(sqz_off.iloc[i]) else False
-    cur_sqz_val = safe(sqz_val, i, 0.0)
-    squeeze_release = prev_sqz_on and cur_sqz_off
-    momentum_up = cur_sqz_val > 0
-    momentum_dn = cur_sqz_val < 0
-    squeeze_ok_al = squeeze_release or momentum_up
-    squeeze_ok_sat = squeeze_release or momentum_dn
+    cur_msb_up = bool(msb_up_arr[i])
+    cur_msb_dn = bool(msb_dn_arr[i])
 
     if cur_major <= 0 or cur_spanb <= 0:
         return []
@@ -240,8 +283,9 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     vol_ok = (cur_vol_ma > 0) and (cur_vol >= cur_vol_ma * VOL_MULT)
     vol_ratio = round(cur_vol / cur_vol_ma, 2) if cur_vol_ma > 0 else 0.0
 
-    signal_al = cross_major_up and squeeze_ok_al and vol_ok
-    signal_sat = cross_major_dn and squeeze_ok_sat and vol_ok
+    signal_al = cur_msb_up and (cur_close > cur_major)
+    signal_sat = cur_msb_dn and (cur_close < cur_major)
+    msb_dir_text = "Yukari Kirilim (MSB)" if signal_al else ("Asagi Kirilim (MSB)" if signal_sat else "-")
 
     results = []
 
@@ -250,7 +294,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "AL",
             "type": "KIRILIM_AL",
-            "kirilim": "SMA100 (Major)",
+            "kirilim": "MSB + SMA100",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -261,8 +305,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
             "vol": round(cur_vol, 2),
             "vol_ratio": vol_ratio,
             "line_gap": round(line_gap_pct, 2),
-            "sqz": "Serbest" if squeeze_release else "Momentum",
-            "momentum": round(cur_sqz_val, 6),
+            "msb": msb_dir_text,
         })
 
     if signal_sat:
@@ -270,7 +313,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "SAT",
             "type": "KIRILIM_SAT",
-            "kirilim": "SMA100 (Major)",
+            "kirilim": "MSB + SMA100",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -281,8 +324,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
             "vol": round(cur_vol, 2),
             "vol_ratio": vol_ratio,
             "line_gap": round(line_gap_pct, 2),
-            "sqz": "Serbest" if squeeze_release else "Momentum",
-            "momentum": round(cur_sqz_val, 6),
+            "msb": msb_dir_text,
         })
 
     return results
@@ -327,7 +369,7 @@ def format_message(symbol: str, sig: dict) -> str:
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001F4CA Hacim: <b>{sig['vol_ratio']}x</b> (ortalama ustu)\n"
         f"\U0001F4CF Cizgi Araligi: <b>%{sig.get('line_gap', 0)}</b> (SMA100 \u2194 Span B)\n"
-        f"\U0001F30A Squeeze: <b>{sig.get('sqz', '-')}</b>  Momentum: <b>{sig.get('momentum', 0)}</b>\n"
+        f"\U0001F9F1 Yapi Kirilimi: <b>{sig.get('msb', '-')}</b>\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001F551 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}"
     )
@@ -386,7 +428,7 @@ def run_scan():
 def main():
     log.info("=" * 55)
     log.info("MAJOR KIRILIM BOT baslatildi")
-    log.info(f"  Strateji : SMA{MAJOR_LEN} / SpanB({SPANB_LEN}) kirilim + hacim {VOL_MULT}x")
+    log.info(f"  Strateji : MSB (zigzag yapi kirilmasi) + SMA{MAJOR_LEN} konumu (hacim sarti yok)")
     log.info(f"  Zaman    : {TIMEFRAME}")
     log.info(f"  Aralik   : her {SCAN_INTERVAL} saniye")
     log.info(f"  Max coin : {MAX_COINS}")
@@ -398,7 +440,7 @@ def main():
 
     send_telegram(
         f"MAJOR KIRILIM BOT BASLADI\n"
-        f"Strateji: SMA{MAJOR_LEN} / SpanB({SPANB_LEN}) kirilim + hacim >= {VOL_MULT}x\n"
+        f"Strateji: MSB yapi kirilmasi + SMA{MAJOR_LEN} konumu (hacim sarti yok)\n"
         f"Zaman dilimi: {TIMEFRAME}\n"
         f"Tarama araligi: her {SCAN_INTERVAL//60} dakika\n"
         f"Max coin: {MAX_COINS}\n"
