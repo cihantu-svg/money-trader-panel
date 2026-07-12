@@ -3,7 +3,7 @@
 MAJOR KIRILIM BOT
 Strateji: Market Structure Break (MSB - zigzag yapi kirilmasi) yonu ile
 fiyatin SMA100 (Major/turuncu cizgi) konumu ayni tarafta olursa
-Telegram bildirimi gonderir (hacim sarti yok).
+Telegram bildirimi gonderir (VE hacim >= VOL_MULT x ortalama olmali).
 Zaman dilimi: 15 dakika
 Tarama araligi: 5 dakika (ayarlanabilir)
 Borsa: Binance Futures (USDT-M Perpetual)
@@ -43,7 +43,7 @@ MAJOR_LEN = int(os.environ.get("MAJOR_LEN", "100"))   # SMA100
 SPANB_LEN = int(os.environ.get("SPANB_LEN", "52"))    # Span B periyodu
 BREAK_PCT = float(os.environ.get("BREAK_PCT", "7.0")) # (artik kullanilmiyor - referans)
 VOL_MA_LEN = int(os.environ.get("VOL_MA_LEN", "20"))  # Hacim ortalamasi periyodu
-VOL_MULT = float(os.environ.get("VOL_MULT", "3.0"))   # Hacim onay carpani
+VOL_MULT = float(os.environ.get("VOL_MULT", "4.0"))   # Hacim onay carpani
 MAX_LINE_GAP_PCT = float(os.environ.get("MAX_LINE_GAP_PCT", "1.0"))  # SMA100 ile Span B arasi max mesafe %
 SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "3600"))  # 1 saat bekleme
 
@@ -228,8 +228,8 @@ def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
 # ============================================================
 def check_signal(df: pd.DataFrame, symbol: str) -> list:
     """
-    AL : MSB yukari kirilim olustu VE fiyat SMA100 (turuncu cizgi) ustunde
-    SAT: MSB asagi kirilim olustu VE fiyat SMA100 (turuncu cizgi) altinda
+    AL : MSB yukari kirilim olustu VE fiyat SMA100 (turuncu cizgi) ustunde VE hacim onayi
+    SAT: MSB asagi kirilim olustu VE fiyat SMA100 (turuncu cizgi) altinda VE hacim onayi
     """
     if df is None or len(df) < MAJOR_LEN + 5:
         return []
@@ -283,8 +283,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     vol_ok = (cur_vol_ma > 0) and (cur_vol >= cur_vol_ma * VOL_MULT)
     vol_ratio = round(cur_vol / cur_vol_ma, 2) if cur_vol_ma > 0 else 0.0
 
-    signal_al = cur_msb_up and (cur_close > cur_major)
-    signal_sat = cur_msb_dn and (cur_close < cur_major)
+    signal_al = cur_msb_up and (cur_close > cur_major) and vol_ok
+    signal_sat = cur_msb_dn and (cur_close < cur_major) and vol_ok
     msb_dir_text = "Yukari Kirilim (MSB)" if signal_al else ("Asagi Kirilim (MSB)" if signal_sat else "-")
 
     results = []
@@ -428,7 +428,7 @@ def run_scan():
 def main():
     log.info("=" * 55)
     log.info("MAJOR KIRILIM BOT baslatildi")
-    log.info(f"  Strateji : MSB (zigzag yapi kirilmasi) + SMA{MAJOR_LEN} konumu (hacim sarti yok)")
+    log.info(f"  Strateji : MSB (zigzag yapi kirilmasi) + SMA{MAJOR_LEN} konumu + hacim >= {VOL_MULT}x")
     log.info(f"  Zaman    : {TIMEFRAME}")
     log.info(f"  Aralik   : her {SCAN_INTERVAL} saniye")
     log.info(f"  Max coin : {MAX_COINS}")
@@ -440,7 +440,7 @@ def main():
 
     send_telegram(
         f"MAJOR KIRILIM BOT BASLADI\n"
-        f"Strateji: MSB yapi kirilmasi + SMA{MAJOR_LEN} konumu (hacim sarti yok)\n"
+        f"Strateji: MSB yapi kirilmasi + SMA{MAJOR_LEN} konumu + hacim >= {VOL_MULT}x\n"
         f"Zaman dilimi: {TIMEFRAME}\n"
         f"Tarama araligi: her {SCAN_INTERVAL//60} dakika\n"
         f"Max coin: {MAX_COINS}\n"
