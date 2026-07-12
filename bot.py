@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 MAJOR KIRILIM BOT
-Strateji: Fiyat SMA100 (Major) VEYA Span B (sari cizgi) crossover ile kirar
+Strateji: Fiyat SMA100 (Major/turuncu cizgi) crossover ile kirar
++ Squeeze Momentum onayi (sikisma serbest kalmasi VEYA momentum yonu uyumlu)
 + hacim onayi (son mum hacmi ortalamanin VOL_MULT kati ustunde) olursa
 Telegram bildirimi gonderir.
 Zaman dilimi: 15 dakika
@@ -43,7 +44,7 @@ MAJOR_LEN = int(os.environ.get("MAJOR_LEN", "100"))   # SMA100
 SPANB_LEN = int(os.environ.get("SPANB_LEN", "52"))    # Span B periyodu
 BREAK_PCT = float(os.environ.get("BREAK_PCT", "7.0")) # (artik kullanilmiyor - referans)
 VOL_MA_LEN = int(os.environ.get("VOL_MA_LEN", "20"))  # Hacim ortalamasi periyodu
-VOL_MULT = float(os.environ.get("VOL_MULT", "2.0"))   # Hacim onay carpani
+VOL_MULT = float(os.environ.get("VOL_MULT", "3.0"))   # Hacim onay carpani
 MAX_LINE_GAP_PCT = float(os.environ.get("MAX_LINE_GAP_PCT", "1.0"))  # SMA100 ile Span B arasi max mesafe %
 SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "3600"))  # 1 saat bekleme
 
@@ -67,6 +68,45 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     h, l, c = df['High'], df['Low'], df['Close']
     tr = pd.concat([h - l, abs(h - c.shift()), abs(l - c.shift())], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
+
+def calc_squeeze(df: pd.DataFrame, length: int = 20, mult_kc: float = 1.5, length_kc: int = 20):
+    """
+    Squeeze Momentum Indicator (LazyBear) - sikisma (squeeze) durumu ve momentum degeri.
+    sqz_on  : piyasa sikisik (dusuk volatilite)
+    sqz_off : sikisma bitti, volatilite genisliyor
+    val     : momentum (linreg) degeri - pozitif ise yukari, negatif ise asagi momentum
+    """
+    high = df['High']; low = df['Low']; close = df['Close']
+
+    basis = close.rolling(length).mean()
+    dev = mult_kc * close.rolling(length).std(ddof=0)
+    upper_bb = basis + dev
+    lower_bb = basis - dev
+
+    ma = close.rolling(length_kc).mean()
+    tr_kc = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    rangema = tr_kc.rolling(length_kc).mean()
+    upper_kc = ma + rangema * mult_kc
+    lower_kc = ma - rangema * mult_kc
+
+    sqz_on = (lower_bb > lower_kc) & (upper_bb < upper_kc)
+    sqz_off = (lower_bb < lower_kc) & (upper_bb > upper_kc)
+
+    highest_h = high.rolling(length_kc).max()
+    lowest_l = low.rolling(length_kc).min()
+    sma_c = close.rolling(length_kc).mean()
+    avg_val = ((highest_h + lowest_l) / 2 + sma_c) / 2
+    diff = close - avg_val
+
+    def _linreg_last(arr):
+        n = len(arr)
+        x = np.arange(n)
+        slope, intercept = np.polyfit(x, arr, 1)
+        return slope * (n - 1) + intercept
+
+    val = diff.rolling(length_kc).apply(_linreg_last, raw=True)
+
+    return sqz_on, sqz_off, val
 
 # ============================================================
 # BINANCE FUTURES API
@@ -139,9 +179,8 @@ def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
 # ============================================================
 def check_signal(df: pd.DataFrame, symbol: str) -> list:
     """
-    AL : Fiyat SMA100 VEYA Span B yukari kirdi (crossover) + hacim onayi
-    SAT: Fiyat SMA100 VEYA Span B asagi kirdi (crossover) + hacim onayi
-    (%7 mesafe sarti KALDIRILDI - sadece kirilim + hacim)
+    AL : Fiyat SMA100 (turuncu cizgi) yukari kirdi + Squeeze Momentum onayi + hacim onayi
+    SAT: Fiyat SMA100 (turuncu cizgi) asagi kirdi + Squeeze Momentum onayi + hacim onayi
     """
     if df is None or len(df) < MAJOR_LEN + 5:
         return []
@@ -155,6 +194,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     spanb = calc_spanb(high, low, SPANB_LEN)
     atr = calc_atr(df, 14)
     vol_ma = vol.rolling(window=VOL_MA_LEN).mean()
+    sqz_on, sqz_off, sqz_val = calc_squeeze(df)
 
     i, ip = -2, -3  # son iki kapanmis mum (repaint yok)
 
@@ -174,6 +214,14 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     cur_atr = safe(atr, i, cur_close * 0.01)
     cur_vol = safe(vol, i)
     cur_vol_ma = safe(vol_ma, i, 0.0)
+    prev_sqz_on = bool(sqz_on.iloc[ip]) if not pd.isna(sqz_on.iloc[ip]) else False
+    cur_sqz_off = bool(sqz_off.iloc[i]) if not pd.isna(sqz_off.iloc[i]) else False
+    cur_sqz_val = safe(sqz_val, i, 0.0)
+    squeeze_release = prev_sqz_on and cur_sqz_off
+    momentum_up = cur_sqz_val > 0
+    momentum_dn = cur_sqz_val < 0
+    squeeze_ok_al = squeeze_release or momentum_up
+    squeeze_ok_sat = squeeze_release or momentum_dn
 
     if cur_major <= 0 or cur_spanb <= 0:
         return []
@@ -192,8 +240,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     vol_ok = (cur_vol_ma > 0) and (cur_vol >= cur_vol_ma * VOL_MULT)
     vol_ratio = round(cur_vol / cur_vol_ma, 2) if cur_vol_ma > 0 else 0.0
 
-    signal_al = cross_major_up and vol_ok
-    signal_sat = cross_major_dn and vol_ok
+    signal_al = cross_major_up and squeeze_ok_al and vol_ok
+    signal_sat = cross_major_dn and squeeze_ok_sat and vol_ok
 
     results = []
 
@@ -213,6 +261,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
             "vol": round(cur_vol, 2),
             "vol_ratio": vol_ratio,
             "line_gap": round(line_gap_pct, 2),
+            "sqz": "Serbest" if squeeze_release else "Momentum",
+            "momentum": round(cur_sqz_val, 6),
         })
 
     if signal_sat:
@@ -231,6 +281,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
             "vol": round(cur_vol, 2),
             "vol_ratio": vol_ratio,
             "line_gap": round(line_gap_pct, 2),
+            "sqz": "Serbest" if squeeze_release else "Momentum",
+            "momentum": round(cur_sqz_val, 6),
         })
 
     return results
@@ -275,6 +327,7 @@ def format_message(symbol: str, sig: dict) -> str:
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001F4CA Hacim: <b>{sig['vol_ratio']}x</b> (ortalama ustu)\n"
         f"\U0001F4CF Cizgi Araligi: <b>%{sig.get('line_gap', 0)}</b> (SMA100 \u2194 Span B)\n"
+        f"\U0001F30A Squeeze: <b>{sig.get('sqz', '-')}</b>  Momentum: <b>{sig.get('momentum', 0)}</b>\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001F551 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}"
     )
