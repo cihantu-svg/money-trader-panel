@@ -43,7 +43,8 @@ MAJOR_LEN = int(os.environ.get("MAJOR_LEN", "100"))   # SMA100
 SPANB_LEN = int(os.environ.get("SPANB_LEN", "52"))    # Span B periyodu
 BREAK_PCT = float(os.environ.get("BREAK_PCT", "7.0")) # (artik kullanilmiyor - referans)
 VOL_MA_LEN = int(os.environ.get("VOL_MA_LEN", "20"))  # Hacim ortalamasi periyodu
-VOL_MULT = float(os.environ.get("VOL_MULT", "1.5"))   # Hacim onay carpani
+VOL_MULT = float(os.environ.get("VOL_MULT", "2.0"))   # Hacim onay carpani
+MAX_LINE_GAP_PCT = float(os.environ.get("MAX_LINE_GAP_PCT", "1.0"))  # SMA100 ile Span B arasi max mesafe %
 SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "3600"))  # 1 saat bekleme
 
 BINANCE_BASE = "https://fapi.binance.com"
@@ -179,6 +180,9 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
 
     dist_major = (cur_close - cur_major) / cur_major * 100
     dist_spanb = (cur_close - cur_spanb) / cur_spanb * 100
+    # SMA100 (Major) ile Span B (Sari) cizgileri arasindaki mesafe (fiyata gore %)
+    line_gap_pct = abs(cur_major - cur_spanb) / cur_close * 100
+    line_gap_ok = line_gap_pct <= MAX_LINE_GAP_PCT
 
     cross_major_up = (cur_close > cur_major) and (prev_close <= prev_major)
     cross_major_dn = (cur_close < cur_major) and (prev_close >= prev_major)
@@ -188,8 +192,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     vol_ok = (cur_vol_ma > 0) and (cur_vol >= cur_vol_ma * VOL_MULT)
     vol_ratio = round(cur_vol / cur_vol_ma, 2) if cur_vol_ma > 0 else 0.0
 
-    signal_al = (cross_major_up or cross_spanb_up) and vol_ok
-    signal_sat = (cross_major_dn or cross_spanb_dn) and vol_ok
+    signal_al = (cross_major_up or cross_spanb_up) and vol_ok and line_gap_ok
+    signal_sat = (cross_major_dn or cross_spanb_dn) and vol_ok and line_gap_ok
 
     results = []
 
@@ -198,6 +202,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "AL",
             "type": "KIRILIM_AL",
+            "kirilim": "SMA100 (Major)" if cross_major_up else "Span B (Sari)",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -207,6 +212,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
             "beklenti": round((hedef - cur_close) / cur_close * 100, 2),
             "vol": round(cur_vol, 2),
             "vol_ratio": vol_ratio,
+            "line_gap": round(line_gap_pct, 2),
         })
 
     if signal_sat:
@@ -214,6 +220,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "SAT",
             "type": "KIRILIM_SAT",
+            "kirilim": "SMA100 (Major)" if cross_major_dn else "Span B (Sari)",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -223,6 +230,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
             "beklenti": round((cur_close - hedef) / cur_close * 100, 2),
             "vol": round(cur_vol, 2),
             "vol_ratio": vol_ratio,
+            "line_gap": round(line_gap_pct, 2),
         })
 
     return results
@@ -248,22 +256,27 @@ def send_telegram(message: str) -> bool:
 
 def format_message(symbol: str, sig: dict) -> str:
     yon = sig["direction"]
-    ok = "yukari" if yon == "AL" else "asagi"
+    if yon == "AL":
+        bas = "\U0001F7E2 <b>AL SINYALI</b> \U0001F4C8"
+    else:
+        bas = "\U0001F534 <b>SAT SINYALI</b> \U0001F4C9"
+
+    coin = symbol.replace("USDT", "/USDT")
 
     return (
-        f"MAJOR KIRILIM SINYALI\n"
-        f"---------------------\n"
-        f"{symbol}  {yon}\n"
-        f"Zaman Dilimi: {TIMEFRAME}\n"
-        f"---------------------\n"
-        f"Fiyat: {sig['price']}\n"
-        f"Hedef: {sig['hedef']} (%{sig['beklenti']})\n"
-        f"---------------------\n"
-        f"Major (SMA{MAJOR_LEN}): {sig['major']}  Mesafe %{sig['dist_major']:+.2f} {ok}\n"
-        f"Span B ({SPANB_LEN}): {sig['spanb']}  Mesafe %{sig['dist_spanb']:+.2f} {ok}\n"
-        f"---------------------\n"
-        f"Hacim: {sig['vol_ratio']}x (ortalama ustu)\n"
-        f"{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
+        f"{bas}\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001F4CD <b>{coin}</b>\n"
+        f"\u23F1 Zaman Dilimi: <b>{TIMEFRAME}</b>\n"
+        f"\U0001F3AF Kirilim: <b>{sig.get('kirilim', '-')}</b>\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001F4B2 Fiyat: <b>{sig['price']}</b>\n"
+        f"\U0001F3C1 Hedef: <b>{sig['hedef']}</b>  (%{sig['beklenti']})\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001F4CA Hacim: <b>{sig['vol_ratio']}x</b> (ortalama ustu)\n"
+        f"\U0001F4CF Cizgi Araligi: <b>%{sig.get('line_gap', 0)}</b> (SMA100 \u2194 Span B)\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001F551 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}"
     )
 
 
