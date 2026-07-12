@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 MAJOR KIRILIM BOT
-Strateji: Market Structure Break (MSB - zigzag yapi kirilmasi) yonu ile
-fiyatin SMA100 (Major/turuncu cizgi) konumu ayni tarafta olursa
-Telegram bildirimi gonderir (VE hacim >= VOL_MULT x ortalama olmali).
-Zaman dilimi: 15 dakika
+Strateji: SMA100 (Major/turuncu cizgi) kesisimi + kesen mumun govde
+buyuklugu (BODY_PCT_MIN yuzde ve uzeri) - yesil mum yukari kesiste AL,
+kirmizi mum asagi kesiste SAT sinyali uretir.
+Zaman dilimi: 1 saat
 Tarama araligi: 5 dakika (ayarlanabilir)
 Borsa: Binance Futures (USDT-M Perpetual)
 """
@@ -34,7 +34,7 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))  # 5 dakika
-TIMEFRAME = os.environ.get("SCAN_TIMEFRAME", "15m")  # 15 dakika
+TIMEFRAME = os.environ.get("SCAN_TIMEFRAME", "1h")  # 1 saat
 MAX_COINS = int(os.environ.get("MAX_COINS", "200"))
 MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "1000000"))
 
@@ -42,8 +42,9 @@ MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "1000000"))
 MAJOR_LEN = int(os.environ.get("MAJOR_LEN", "100"))   # SMA100
 SPANB_LEN = int(os.environ.get("SPANB_LEN", "52"))    # Span B periyodu
 BREAK_PCT = float(os.environ.get("BREAK_PCT", "7.0")) # (artik kullanilmiyor - referans)
-VOL_MA_LEN = int(os.environ.get("VOL_MA_LEN", "20"))  # Hacim ortalamasi periyodu
-VOL_MULT = float(os.environ.get("VOL_MULT", "4.0"))   # Hacim onay carpani
+VOL_MA_LEN = int(os.environ.get("VOL_MA_LEN", "20"))  # (artik kullanilmiyor - referans)
+VOL_MULT = float(os.environ.get("VOL_MULT", "4.0"))   # (artik kullanilmiyor - referans)
+BODY_PCT_MIN = float(os.environ.get("BODY_PCT_MIN", "5.0"))   # Kesisim mumunun min govde yuzdesi
 MAX_LINE_GAP_PCT = float(os.environ.get("MAX_LINE_GAP_PCT", "1.0"))  # SMA100 ile Span B arasi max mesafe %
 SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "3600"))  # 1 saat bekleme
 
@@ -67,96 +68,6 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     h, l, c = df['High'], df['Low'], df['Close']
     tr = pd.concat([h - l, abs(h - c.shift()), abs(l - c.shift())], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
-
-def calc_squeeze(df: pd.DataFrame, length: int = 20, mult_kc: float = 1.5, length_kc: int = 20):
-    """
-    Squeeze Momentum Indicator (LazyBear) - sikisma (squeeze) durumu ve momentum degeri.
-    sqz_on  : piyasa sikisik (dusuk volatilite)
-    sqz_off : sikisma bitti, volatilite genisliyor
-    val     : momentum (linreg) degeri - pozitif ise yukari, negatif ise asagi momentum
-    """
-    high = df['High']; low = df['Low']; close = df['Close']
-
-    basis = close.rolling(length).mean()
-    dev = mult_kc * close.rolling(length).std(ddof=0)
-    upper_bb = basis + dev
-    lower_bb = basis - dev
-
-    ma = close.rolling(length_kc).mean()
-    tr_kc = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
-    rangema = tr_kc.rolling(length_kc).mean()
-    upper_kc = ma + rangema * mult_kc
-    lower_kc = ma - rangema * mult_kc
-
-    sqz_on = (lower_bb > lower_kc) & (upper_bb < upper_kc)
-    sqz_off = (lower_bb < lower_kc) & (upper_bb > upper_kc)
-
-    highest_h = high.rolling(length_kc).max()
-    lowest_l = low.rolling(length_kc).min()
-    sma_c = close.rolling(length_kc).mean()
-    avg_val = ((highest_h + lowest_l) / 2 + sma_c) / 2
-    diff = close - avg_val
-
-    def _linreg_last(arr):
-        n = len(arr)
-        x = np.arange(n)
-        slope, intercept = np.polyfit(x, arr, 1)
-        return slope * (n - 1) + intercept
-
-    val = diff.rolling(length_kc).apply(_linreg_last, raw=True)
-
-    return sqz_on, sqz_off, val
-
-def calc_msb(df: pd.DataFrame, zigzag_len: int = 9, fib_factor: float = 0.33):
-    """
-    Market Structure Break (MSB) - EmreKb Pine Script mantiginin Python portu.
-    Zigzag ile swing high/low takip edilir, yeni bir swing onceki karsit swingi
-    fib_factor tamponuyla asarsa yapi kirilmasi (MSB) olusur.
-    Donus: msb_up, msb_dn (bool numpy array) - o barda boga/ayi MSB olustu mu
-    """
-    high = df['High'].to_numpy()
-    low = df['Low'].to_numpy()
-    n = len(df)
-
-    highest = df['High'].rolling(zigzag_len).max().to_numpy()
-    lowest = df['Low'].rolling(zigzag_len).min().to_numpy()
-    to_up = high >= highest
-    to_down = low <= lowest
-
-    trend = np.ones(n, dtype=int)
-    msb_up = np.zeros(n, dtype=bool)
-    msb_dn = np.zeros(n, dtype=bool)
-
-    h0 = h1 = l0 = l1 = np.nan
-    market = 1
-
-    for i in range(1, n):
-        prev_t = trend[i - 1]
-        if prev_t == 1 and to_down[i]:
-            trend[i] = -1
-        elif prev_t == -1 and to_up[i]:
-            trend[i] = 1
-        else:
-            trend[i] = prev_t
-
-        if trend[i] != prev_t:
-            if trend[i] == 1:
-                l1 = l0
-                l0 = low[i]
-            else:
-                h1 = h0
-                h0 = high[i]
-
-            if not (np.isnan(l0) or np.isnan(l1) or np.isnan(h0) or np.isnan(h1)):
-                if market == 1 and l0 < l1 and l0 < l1 - abs(h0 - l1) * fib_factor:
-                    market = -1
-                    msb_dn[i] = True
-                elif market == -1 and h0 > h1 and h0 > h1 + abs(h1 - l0) * fib_factor:
-                    market = 1
-                    msb_up[i] = True
-
-    return msb_up, msb_dn
-
 # ============================================================
 # BINANCE FUTURES API
 # ============================================================
@@ -228,8 +139,8 @@ def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
 # ============================================================
 def check_signal(df: pd.DataFrame, symbol: str) -> list:
     """
-    AL : MSB yukari kirilim olustu VE fiyat SMA100 (turuncu cizgi) ustunde VE hacim onayi
-    SAT: MSB asagi kirilim olustu VE fiyat SMA100 (turuncu cizgi) altinda VE hacim onayi
+    AL : Govdesi >= BODY_PCT_MIN olan YESIL mum, SMA100 (turuncu cizgi) yukari yonlu keserse
+    SAT: Govdesi >= BODY_PCT_MIN olan KIRMIZI mum, SMA100 (turuncu cizgi) asagi yonlu keserse
     """
     if df is None or len(df) < MAJOR_LEN + 5:
         return []
@@ -237,13 +148,11 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
-    vol = df["Volume"]
+    opn = df["Open"]
 
     major = calc_sma(close, MAJOR_LEN)
     spanb = calc_spanb(high, low, SPANB_LEN)
     atr = calc_atr(df, 14)
-    vol_ma = vol.rolling(window=VOL_MA_LEN).mean()
-    msb_up_arr, msb_dn_arr = calc_msb(df)
 
     i, ip = -2, -3  # son iki kapanmis mum (repaint yok)
 
@@ -256,15 +165,12 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
 
     cur_close = safe(close, i)
     prev_close = safe(close, ip)
+    cur_open = safe(opn, i)
     cur_major = safe(major, i)
     prev_major = safe(major, ip)
     cur_spanb = safe(spanb, i)
     prev_spanb = safe(spanb, ip)
     cur_atr = safe(atr, i, cur_close * 0.01)
-    cur_vol = safe(vol, i)
-    cur_vol_ma = safe(vol_ma, i, 0.0)
-    cur_msb_up = bool(msb_up_arr[i])
-    cur_msb_dn = bool(msb_dn_arr[i])
 
     if cur_major <= 0 or cur_spanb <= 0:
         return []
@@ -280,12 +186,13 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     cross_spanb_up = (cur_close > cur_spanb) and (prev_close <= prev_spanb)
     cross_spanb_dn = (cur_close < cur_spanb) and (prev_close >= prev_spanb)
 
-    vol_ok = (cur_vol_ma > 0) and (cur_vol >= cur_vol_ma * VOL_MULT)
-    vol_ratio = round(cur_vol / cur_vol_ma, 2) if cur_vol_ma > 0 else 0.0
+    body_pct = abs(cur_close - cur_open) / cur_open * 100 if cur_open > 0 else 0.0
+    candle_green = cur_close > cur_open
+    candle_red = cur_close < cur_open
+    body_ok = body_pct >= BODY_PCT_MIN
 
-    signal_al = cur_msb_up and (cur_close > cur_major) and vol_ok
-    signal_sat = cur_msb_dn and (cur_close < cur_major) and vol_ok
-    msb_dir_text = "Yukari Kirilim (MSB)" if signal_al else ("Asagi Kirilim (MSB)" if signal_sat else "-")
+    signal_al = cross_major_up and candle_green and body_ok
+    signal_sat = cross_major_dn and candle_red and body_ok
 
     results = []
 
@@ -294,7 +201,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "AL",
             "type": "KIRILIM_AL",
-            "kirilim": "MSB + SMA100",
+            "kirilim": "SMA100 Kesisim + Govde%",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -302,10 +209,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
             "dist_spanb": round(dist_spanb, 2),
             "hedef": round(hedef, 8),
             "beklenti": round((hedef - cur_close) / cur_close * 100, 2),
-            "vol": round(cur_vol, 2),
-            "vol_ratio": vol_ratio,
+            "govde_yuzde": round(body_pct, 2),
             "line_gap": round(line_gap_pct, 2),
-            "msb": msb_dir_text,
         })
 
     if signal_sat:
@@ -313,7 +218,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "SAT",
             "type": "KIRILIM_SAT",
-            "kirilim": "MSB + SMA100",
+            "kirilim": "SMA100 Kesisim + Govde%",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -321,10 +226,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
             "dist_spanb": round(dist_spanb, 2),
             "hedef": round(hedef, 8),
             "beklenti": round((cur_close - hedef) / cur_close * 100, 2),
-            "vol": round(cur_vol, 2),
-            "vol_ratio": vol_ratio,
+            "govde_yuzde": round(body_pct, 2),
             "line_gap": round(line_gap_pct, 2),
-            "msb": msb_dir_text,
         })
 
     return results
@@ -367,9 +270,8 @@ def format_message(symbol: str, sig: dict) -> str:
         f"\U0001F4B2 Fiyat: <b>{sig['price']}</b>\n"
         f"\U0001F3C1 Hedef: <b>{sig['hedef']}</b>  (%{sig['beklenti']})\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001F4CA Hacim: <b>{sig['vol_ratio']}x</b> (ortalama ustu)\n"
+        f"\U0001F4CA Govde Buyuklugu: <b>%{sig.get('govde_yuzde', 0)}</b>\n"
         f"\U0001F4CF Cizgi Araligi: <b>%{sig.get('line_gap', 0)}</b> (SMA100 \u2194 Span B)\n"
-        f"\U0001F9F1 Yapi Kirilimi: <b>{sig.get('msb', '-')}</b>\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001F551 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}"
     )
@@ -387,7 +289,7 @@ def should_send(symbol: str, sig_type: str) -> bool:
 # ANA TARAMA DONGUSU
 # ============================================================
 def run_scan():
-    log.info(f"Tarama basladi TF:{TIMEFRAME} VolMult:{VOL_MULT}x Max:{MAX_COINS}")
+    log.info(f"Tarama basladi TF:{TIMEFRAME} GovdeMin:%{BODY_PCT_MIN} Max:{MAX_COINS}")
 
     symbols = get_symbols(min_volume=MIN_VOLUME)
     if not symbols:
@@ -409,7 +311,7 @@ def run_scan():
                 if should_send(symbol, sig["type"]):
                     msg = format_message(symbol, sig)
                     if send_telegram(msg):
-                        log.info(f"OK {symbol} {sig['type']} vol {sig['vol_ratio']}x")
+                        log.info(f"OK {symbol} {sig['type']} govde %{sig['govde_yuzde']}")
                         found += 1
                     time.sleep(0.3)
 
@@ -428,7 +330,7 @@ def run_scan():
 def main():
     log.info("=" * 55)
     log.info("MAJOR KIRILIM BOT baslatildi")
-    log.info(f"  Strateji : MSB (zigzag yapi kirilmasi) + SMA{MAJOR_LEN} konumu + hacim >= {VOL_MULT}x")
+    log.info(f"  Strateji : SMA{MAJOR_LEN} kesisim + govde >= %{BODY_PCT_MIN}")
     log.info(f"  Zaman    : {TIMEFRAME}")
     log.info(f"  Aralik   : her {SCAN_INTERVAL} saniye")
     log.info(f"  Max coin : {MAX_COINS}")
@@ -440,7 +342,7 @@ def main():
 
     send_telegram(
         f"MAJOR KIRILIM BOT BASLADI\n"
-        f"Strateji: MSB yapi kirilmasi + SMA{MAJOR_LEN} konumu + hacim >= {VOL_MULT}x\n"
+        f"Strateji: SMA{MAJOR_LEN} kesisim + govde >= %{BODY_PCT_MIN}\n"
         f"Zaman dilimi: {TIMEFRAME}\n"
         f"Tarama araligi: her {SCAN_INTERVAL//60} dakika\n"
         f"Max coin: {MAX_COINS}\n"
