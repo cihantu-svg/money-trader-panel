@@ -44,7 +44,7 @@ SPANB_LEN = int(os.environ.get("SPANB_LEN", "52"))    # Span B periyodu
 BREAK_PCT = float(os.environ.get("BREAK_PCT", "7.0")) # (artik kullanilmiyor - referans)
 VOL_MA_LEN = int(os.environ.get("VOL_MA_LEN", "20"))  # (artik kullanilmiyor - referans)
 VOL_MULT = float(os.environ.get("VOL_MULT", "4.0"))   # (artik kullanilmiyor - referans)
-BODY_PCT_MIN = float(os.environ.get("BODY_PCT_MIN", "5.0"))   # Kesisim mumunun min govde yuzdesi
+BODY_PCT_MIN = float(os.environ.get("BODY_PCT_MIN", "4.0"))   # Kesisim mumunun min govde yuzdesi
 MAX_LINE_GAP_PCT = float(os.environ.get("MAX_LINE_GAP_PCT", "1.0"))  # SMA100 ile Span B arasi max mesafe %
 SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "3600"))  # 1 saat bekleme
 
