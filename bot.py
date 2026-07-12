@@ -192,8 +192,8 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     vol_ok = (cur_vol_ma > 0) and (cur_vol >= cur_vol_ma * VOL_MULT)
     vol_ratio = round(cur_vol / cur_vol_ma, 2) if cur_vol_ma > 0 else 0.0
 
-    signal_al = (cross_major_up or cross_spanb_up) and vol_ok and line_gap_ok
-    signal_sat = (cross_major_dn or cross_spanb_dn) and vol_ok and line_gap_ok
+    signal_al = cross_major_up and vol_ok
+    signal_sat = cross_major_dn and vol_ok
 
     results = []
 
@@ -202,7 +202,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "AL",
             "type": "KIRILIM_AL",
-            "kirilim": "SMA100 (Major)" if cross_major_up else "Span B (Sari)",
+            "kirilim": "SMA100 (Major)",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -220,7 +220,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "SAT",
             "type": "KIRILIM_SAT",
-            "kirilim": "SMA100 (Major)" if cross_major_dn else "Span B (Sari)",
+            "kirilim": "SMA100 (Major)",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
