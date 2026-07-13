@@ -133,16 +133,18 @@ def send_telegram(message: str) -> bool:
 def format_message(symbol: str, sig: dict) -> str:
     emoji = "\U0001F7E2" if sig["direction"] == "YESIL" else "\U0001F534"
     coin = symbol.replace("USDT", "/USDT")
-    return (
-        f"{emoji} <b>GOVDE %{BODY_PCT_MIN:.0f}+ TARAMA</b>\n"
-        f"\u2501" * 12 + "\n"
-        f"\U0001F4CD <b>{coin}</b>\n"
-        f"\u23F1 Zaman Dilimi: <b>{TIMEFRAME}</b>\n"
-        f"\U0001F4B0 Fiyat: <b>{sig['price']}</b>\n"
-        f"\U0001F4CA Govde Buyuklugu: <b>%{sig['govde_yuzde']}</b>\n"
-        f"\u2501" * 12 + "\n"
-        f"\U0001F551 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}"
-    )
+    sep = "\u2501" * 12
+    lines = [
+        f"{emoji} <b>GOVDE %{BODY_PCT_MIN:.0f}+ TARAMA</b>",
+        sep,
+        f"\U0001F4CD <b>{coin}</b>",
+        f"\u23F1 Zaman Dilimi: <b>{TIMEFRAME}</b>",
+        f"\U0001F4B0 Fiyat: <b>{sig['price']}</b>",
+        f"\U0001F4CA Govde Buyuklugu: <b>%{sig['govde_yuzde']}</b>",
+        sep,
+        f"\U0001F551 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}",
+    ]
+    return "\n".join(lines)
 
 
 def should_send(symbol: str) -> bool:
