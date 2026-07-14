@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """
 HACIM+MOMENTUM & RSI-FIBO CONFLUENCE BOT
-Strateji: Ayni 1 saatlik mumda hem "Hacim+Momentum" hem "RSI Fibo (Altin Oran)"
-sinyali AYNI YONDE olusursa AL/SAT sinyali gonderir.
+Pine 'MONEY TRADER - FULL PAKET (CONFLUENCE)' mantigi birebir portlandi.
+  AL  = (Hacim yukselisi + RSI 50 yukari kesim)  VE  (RSI kendi EMA'sini VEYA orta-Fibo'yu yukari kesim)
+  SAT = (Hacim dususu + RSI 50 asagi kesim)       VE  (RSI kendi EMA'sini VEYA orta-Fibo'yu asagi kesim)
+  Iki grup da AYNI (KAPANMIS) mumda saglanirsa sinyal gonderilir (repaint yok).
 """
 import os, time, logging
 from datetime import datetime
@@ -24,8 +26,12 @@ TIMEFRAME = os.getenv("SCAN_TIMEFRAME", "1h")
 MAX_COINS = int(os.getenv("MAX_COINS", "200"))
 
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
+RSI_EMA_LEN = int(os.getenv("RSI_EMA_LEN", "10"))
+MOM_LEN = int(os.getenv("MOM_LEN", "10"))
 VOL_MA_LEN = int(os.getenv("VOL_MA_LEN", "20"))
-VOL_RATIO = float(os.getenv("VOL_RATIO", "1.2"))
+VOL_MULT_UP = float(os.getenv("VOL_MULT_UP", "1.5"))
+VOL_MULT_DOWN = float(os.getenv("VOL_MULT_DOWN", "0.7"))
+RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50"))
 FIB_LEN = int(os.getenv("FIB_LEN", "100"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 
@@ -44,11 +50,11 @@ def get_symbols():
         log.error(f"get_symbols hata: {e}")
         return []
 
-def get_klines(symbol, limit=250):
+def get_klines(symbol, limit=300):
     try:
         r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/klines",
-                         params={"symbol": symbol, "interval": TIMEFRAME, "limit": limit},
-                         timeout=10)
+                        params={"symbol": symbol, "interval": TIMEFRAME, "limit": limit},
+                        timeout=10)
         raw = r.json()
         df = pd.DataFrame(raw, columns=[
             "open_time","open","high","low","close","volume","close_time",
@@ -68,40 +74,62 @@ def rsi(series, length):
     rs = ma_up / ma_down.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+def ema(series, length):
+    return series.ewm(span=length, adjust=False).mean()
+
 def check_signal(df):
-    if df is None or len(df) < FIB_LEN + 5:
+    if df is None or len(df) < FIB_LEN + 20:
         return None
 
-    close, volume = df["close"], df["volume"]
+    # Son satir olusmakta olan (kapanmamis) mum -> repaint'i onlemek icin at
+    df = df.iloc[:-1]
+    if len(df) < FIB_LEN + 5:
+        return None
+
+    close = df["close"]
+    volume = df["volume"]
+
     rsi_val = rsi(close, RSI_LEN)
+    rsi_ema = ema(rsi_val, RSI_EMA_LEN)
+    mom_val = close - close.shift(MOM_LEN)
     vol_ma = volume.rolling(VOL_MA_LEN).mean()
 
     rsi_top = rsi_val.rolling(FIB_LEN).max()
     rsi_bot = rsi_val.rolling(FIB_LEN).min()
     fib_500 = rsi_top - (rsi_top - rsi_bot) * 0.5
 
-    i, p = -1, -2  # simdiki mum, onceki mum
+    i, p = -1, -2  # i: son KAPANMIS mum, p: onceki mum
     rsi_now, rsi_prev = rsi_val.iloc[i], rsi_val.iloc[p]
-    fib_now, fib_prev = fib_500.iloc[i], fib_500.iloc[p]
+    ema_now, ema_prev = rsi_ema.iloc[i], rsi_ema.iloc[p]
+    mom_now = mom_val.iloc[i]
     vol_now, vol_ma_now = volume.iloc[i], vol_ma.iloc[i]
+    fib_prev = fib_500.iloc[p]  # Pine'daki fib_500[1]
 
-    # 1) Hacim + Momentum
-    mom_up = rsi_prev <= 50 and rsi_now > 50
-    mom_down = rsi_prev >= 50 and rsi_now < 50
-    vol_up = vol_now > vol_ma_now * VOL_RATIO
-    vol_down = vol_now < vol_ma_now / VOL_RATIO
-    vol_mom_up = mom_up and vol_up
-    vol_mom_down = mom_down and vol_down
+    if pd.isna(rsi_now) or pd.isna(vol_ma_now) or pd.isna(fib_prev):
+        return None
 
-    # 2) RSI Fibo (Altin Oran kesisimi)
-    fibo_al = rsi_prev <= fib_prev and rsi_now > fib_now
-    fibo_sat = rsi_prev >= fib_prev and rsi_now < fib_now
+    # === GRUP 1: Hacim + Momentum (RSI 50 kesimi) ===
+    trigger_al = (vol_now > vol_ma_now * VOL_MULT_UP) and (rsi_prev <= RSI_LEVEL and rsi_now > RSI_LEVEL)
+    trigger_sat = (vol_now < vol_ma_now * VOL_MULT_DOWN) and (rsi_prev >= RSI_LEVEL and rsi_now < RSI_LEVEL)
 
-    # Ikisi AYNI mumda AYNI yonde olursa sinyal
-    if vol_mom_up and fibo_al:
-        return {"direction": "AL", "price": close.iloc[i], "rsi": round(rsi_now, 2)}
-    if vol_mom_down and fibo_sat:
-        return {"direction": "SAT", "price": close.iloc[i], "rsi": round(rsi_now, 2)}
+    # === GRUP 2: AL / AL-Fibo  ve  SAT / SAT-Fibo ===
+    mom_bull = mom_now > 0
+    mom_bear = mom_now < 0
+    vol_high = vol_now > vol_ma_now
+
+    rsi_cross_up = rsi_prev <= ema_prev and rsi_now > ema_now
+    fibo_al = rsi_now > fib_prev and rsi_prev <= fib_prev
+    confluence_al = (rsi_cross_up and mom_bull and vol_high) or (fibo_al and mom_bull and vol_high)
+
+    rsi_cross_down = rsi_prev >= ema_prev and rsi_now < ema_now
+    fibo_sat = rsi_now < fib_prev and rsi_prev >= fib_prev
+    confluence_sat = (rsi_cross_down and mom_bear) or (fibo_sat and mom_bear)
+
+    # === CONFLUENCE: iki grup ayni mumda ===
+    if trigger_al and confluence_al:
+        return {"direction": "AL", "price": close.iloc[i], "rsi": round(float(rsi_now), 2)}
+    if trigger_sat and confluence_sat:
+        return {"direction": "SAT", "price": close.iloc[i], "rsi": round(float(rsi_now), 2)}
     return None
 
 def should_send(symbol, direction):
@@ -115,8 +143,8 @@ def should_send(symbol, direction):
 def send_telegram(text):
     try:
         r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-                           data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-                           timeout=10)
+                          data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+                          timeout=10)
         return r.status_code == 200
     except Exception as e:
         log.error(f"Telegram hata: {e}")
@@ -134,7 +162,7 @@ def format_message(symbol, sig):
         f"\U0001F4B0 Fiyat: <b>{sig['price']}</b>",
         f"\U0001F4CA RSI: <b>{sig['rsi']}</b>",
         sep,
-        f"\U0001F551 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}",
+        f"\U0001F551 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
     return "\n".join(lines)
 
