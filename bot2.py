@@ -123,8 +123,8 @@ def check_signal(df):
 
     rsi_cross_down = rsi_prev >= ema_prev and rsi_now < ema_now
     fibo_sat = rsi_now < fib_prev and rsi_prev >= fib_prev
-    confluence_sat = (rsi_cross_down and mom_bear) or (fibo_sat and mom_bear)
-
+        confluence_sat = (rsi_cross_down and mom_bear and vol_high) or (fibo_sat and mom_bear and vol_high)
+  
     # === CONFLUENCE: iki grup ayni mumda ===
     if trigger_al and confluence_al:
         return {"direction": "AL", "price": close.iloc[i], "rsi": round(float(rsi_now), 2)}
