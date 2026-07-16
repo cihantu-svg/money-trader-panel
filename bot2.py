@@ -38,7 +38,7 @@ SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 # YENI: Major Bolge ayarlari
 AUTO_ZONE_DAYS = int(os.getenv("AUTO_ZONE_DAYS", "50"))
 AUTO_MAJOR_BINS = int(os.getenv("AUTO_MAJOR_BINS", "10"))
-MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "4.0"))
+MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "2.0"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
@@ -85,35 +85,51 @@ def ema(series, length):
 
 
 def calculate_major_zone(df):
+    """
+    Pine'daki auto_major hesaplamasi:
+    Son N mumda en cok fiyatin kapandigi bolgeyi bul (histogram).
+    Daha genis bir bolge bulmak icin: tum high-low araligini kullan.
+    """
     if df is None or len(df) < AUTO_ZONE_DAYS + 10:
         return None, None
     df_closed = df.iloc[:-1]
     if len(df_closed) < AUTO_ZONE_DAYS:
         return None, None
-    close = df_closed["close"]
+    # Tum fiyat araligini kullan (high-low) daha genis bolge icin
     lookback = min(AUTO_ZONE_DAYS, len(df_closed))
-    auto_highest = close.iloc[-lookback:].max()
-    auto_lowest = close.iloc[-lookback:].min()
-    price_range = auto_highest - auto_lowest
+    period_high = df_closed["high"].iloc[-lookback:].max()
+    period_low = df_closed["low"].iloc[-lookback:].min()
+    price_range = period_high - period_low
     if price_range <= 0 or AUTO_MAJOR_BINS <= 0:
         return None, None
     step = price_range / AUTO_MAJOR_BINS
     bins = [0] * AUTO_MAJOR_BINS
-    for price in close.iloc[-lookback:]:
-        idx = min(AUTO_MAJOR_BINS - 1, max(0, int((price - auto_lowest) / step)))
-        bins[idx] += 1
+    # Tum mumlarin (high+low)/2 degerini kullan
+    for idx in range(-lookback, 0):
+        mid_price = (df_closed["high"].iloc[idx] + df_closed["low"].iloc[idx]) / 2
+        bin_idx = min(AUTO_MAJOR_BINS - 1, max(0, int((mid_price - period_low) / step)))
+        bins[bin_idx] += 1
     max_bin = 0
     max_val = bins[0]
     for j in range(1, AUTO_MAJOR_BINS):
         if bins[j] > max_val:
             max_val = bins[j]
             max_bin = j
-    major_bot = auto_lowest + step * max_bin
-    major_top = auto_lowest + step * (max_bin + 1)
+    major_bot = period_low + step * max_bin
+    major_top = period_low + step * (max_bin + 1)
+    # Genisletilmis bolge: 2 bin genisliginde
+    major_bot = period_low + step * max(0, max_bin - 1)
+    major_top = period_low + step * min(AUTO_MAJOR_BINS - 1, max_bin + 2)
     return float(major_bot), float(major_top)
 
 
 def check_signal(df):
+    """
+    SADECE Major Bolge % kirilim sinyali:
+    - Fiyat major_top'un % ustune cikarsa -> AL
+    - Fiyat major_bot'un % altina duserse -> SAT
+    - Kapanmis mum uzerinden kontrol (repaint yok)
+    """
     if df is None or len(df) < AUTO_ZONE_DAYS + 20:
         return None
     major_bot, major_top = calculate_major_zone(df)
@@ -125,10 +141,13 @@ def check_signal(df):
     i, p = -1, -2
     close_now = df_closed["close"].iloc[i]
     close_prev = df_closed["close"].iloc[p]
+    # Kirilim esikleri: major bolge sinirlarindan % uzakta
     break_up_threshold = major_top * (1 + MAJOR_BREAK_PCT / 100)
     break_dn_threshold = major_bot * (1 - MAJOR_BREAK_PCT / 100)
+    # AL: Onceki mum major_top altinda (veya icinde), su anki mum % ustunde
     prev_below_major = close_prev <= major_top
     now_above_break = close_now >= break_up_threshold
+    # SAT: Onceki mum major_bot ustunde (veya icinde), su anki mum % altinda
     prev_above_major = close_prev >= major_bot
     now_below_break = close_now <= break_dn_threshold
     if prev_below_major and now_above_break:
@@ -159,7 +178,7 @@ def format_message(symbol, sig):
     coin = symbol.replace("USDT", "/USDT")
     sep = "\u2501" * 14
     lines = [
-        f"{emoji} <b>MAJOR BOLGE %4 KIRILIM - {sig['direction']}</b>",
+        f"{emoji} <b>MAJOR BOLGE % KIRILIM - {sig['direction']}</b>",
         sep,
         f"\U0001F4CD <b>{coin}</b>",
         f"\u23F1 Zaman Dilimi: <b>{TIMEFRAME}</b>",
