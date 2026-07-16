@@ -34,6 +34,11 @@ VOL_MULT_DOWN = float(os.getenv("VOL_MULT_DOWN", "0.7"))
 RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50"))
 FIB_LEN = int(os.getenv("FIB_LEN", "100"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
+# YENI: Major Bolge ayarlari (Pine'dan birebir)
+AUTO_ZONE_DAYS = int(os.getenv("AUTO_ZONE_DAYS", "50"))      # Bolge periyodu (mum)
+AUTO_MAJOR_BINS = int(os.getenv("AUTO_MAJOR_BINS", "10"))    # Histogram bin sayisi
+MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "4.0")) # %4 kirilim mesafesi
+
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
@@ -77,59 +82,92 @@ def rsi(series, length):
 def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
+def calculate_major_zone(df):
+    """
+    Pine'daki auto_major hesaplamasi:
+    Son N mumda en cok fiyatin kapandigi bolgeyi bul (histogram).
+    """
+    if df is None or len(df) < AUTO_ZONE_DAYS + 10:
+        return None, None
+
+    df_closed = df.iloc[:-1]
+    if len(df_closed) < AUTO_ZONE_DAYS:
+        return None, None
+
+    close = df_closed["close"]
+    lookback = min(AUTO_ZONE_DAYS, len(df_closed))
+    auto_highest = close.iloc[-lookback:].max()
+    auto_lowest = close.iloc[-lookback:].min()
+
+    price_range = auto_highest - auto_lowest
+    if price_range <= 0 or AUTO_MAJOR_BINS <= 0:
+        return None, None
+
+    step = price_range / AUTO_MAJOR_BINS
+    bins = [0] * AUTO_MAJOR_BINS
+    for price in close.iloc[-lookback:]:
+        idx = min(AUTO_MAJOR_BINS - 1, max(0, int((price - auto_lowest) / step)))
+        bins[idx] += 1
+
+    max_bin = 0
+    max_val = bins[0]
+    for j in range(1, AUTO_MAJOR_BINS):
+        if bins[j] > max_val:
+            max_val = bins[j]
+            max_bin = j
+
+    major_bot = auto_lowest + step * max_bin
+    major_top = auto_lowest + step * (max_bin + 1)
+    return float(major_bot), float(major_top)
+
+
 def check_signal(df):
-    if df is None or len(df) < FIB_LEN + 20:
+    """
+    SADECE Major Bolge %4 kirilim sinyali:
+    - Fiyat major_top'un %4 ustune cikarsa -> AL
+    - Fiyat major_bot'un %4 altina duserse -> SAT
+    - Kapanmis mum uzerinden kontrol (repaint yok)
+    """
+    if df is None or len(df) < AUTO_ZONE_DAYS + 20:
         return None
 
-    # Son satir olusmakta olan (kapanmamis) mum -> repaint'i onlemek icin at
-    df = df.iloc[:-1]
-    if len(df) < FIB_LEN + 5:
+    major_bot, major_top = calculate_major_zone(df)
+    if major_bot is None or major_top is None:
         return None
 
-    close = df["close"]
-    volume = df["volume"]
-
-    rsi_val = rsi(close, RSI_LEN)
-    rsi_ema = ema(rsi_val, RSI_EMA_LEN)
-    mom_val = close - close.shift(MOM_LEN)
-    vol_ma = volume.rolling(VOL_MA_LEN).mean()
-
-    rsi_top = rsi_val.rolling(FIB_LEN).max()
-    rsi_bot = rsi_val.rolling(FIB_LEN).min()
-    fib_500 = rsi_top - (rsi_top - rsi_bot) * 0.5
-
-    i, p = -1, -2  # i: son KAPANMIS mum, p: onceki mum
-    rsi_now, rsi_prev = rsi_val.iloc[i], rsi_val.iloc[p]
-    ema_now, ema_prev = rsi_ema.iloc[i], rsi_ema.iloc[p]
-    mom_now = mom_val.iloc[i]
-    vol_now, vol_ma_now = volume.iloc[i], vol_ma.iloc[i]
-    fib_prev = fib_500.iloc[p]  # Pine'daki fib_500[1]
-
-    if pd.isna(rsi_now) or pd.isna(vol_ma_now) or pd.isna(fib_prev):
+    df_closed = df.iloc[:-1]
+    if len(df_closed) < 2:
         return None
 
-    # === GRUP 1: Hacim + Momentum (RSI 50 kesimi) ===
-    trigger_al = (vol_now > vol_ma_now * VOL_MULT_UP) and (rsi_prev <= RSI_LEVEL and rsi_now > RSI_LEVEL)
-    trigger_sat = (vol_now < vol_ma_now * VOL_MULT_DOWN) and (rsi_prev >= RSI_LEVEL and rsi_now < RSI_LEVEL)
+    i, p = -1, -2
+    close_now = df_closed["close"].iloc[i]
+    close_prev = df_closed["close"].iloc[p]
 
-    # === GRUP 2: AL / AL-Fibo  ve  SAT / SAT-Fibo ===
-    mom_bull = mom_now > 0
-    mom_bear = mom_now < 0
-    vol_high = vol_now > vol_ma_now
+    break_up_threshold = major_top * (1 + MAJOR_BREAK_PCT / 100)
+    break_dn_threshold = major_bot * (1 - MAJOR_BREAK_PCT / 100)
 
-    rsi_cross_up = rsi_prev <= ema_prev and rsi_now > ema_now
-    fibo_al = rsi_now > fib_prev and rsi_prev <= fib_prev
-    confluence_al = (rsi_cross_up and mom_bull and vol_high) or (fibo_al and mom_bull and vol_high)
+    prev_below_major = close_prev <= major_top
+    now_above_break = close_now >= break_up_threshold
 
-    rsi_cross_down = rsi_prev >= ema_prev and rsi_now < ema_now
-    fibo_sat = rsi_now < fib_prev and rsi_prev >= fib_prev
-    confluence_sat = (rsi_cross_down and mom_bear and vol_high) or (fibo_sat and mom_bear and vol_high)
-  
-    # === CONFLUENCE: iki grup ayni mumda ===
-    if trigger_al and confluence_al:
-        return {"direction": "AL", "price": close.iloc[i], "rsi": round(float(rsi_now), 2)}
-    if trigger_sat and confluence_sat:
-        return {"direction": "SAT", "price": close.iloc[i], "rsi": round(float(rsi_now), 2)}
+    prev_above_major = close_prev >= major_bot
+    now_below_break = close_now <= break_dn_threshold
+
+    if prev_below_major and now_above_break:
+        return {
+            "direction": "AL",
+            "price": round(float(close_now), 4),
+            "major_zone": f"{round(major_bot, 4)} - {round(major_top, 4)}",
+            "break_level": round(float(break_up_threshold), 4)
+        }
+
+    if prev_above_major and now_below_break:
+        return {
+            "direction": "SAT",
+            "price": round(float(close_now), 4),
+            "major_zone": f"{round(major_bot, 4)} - {round(major_top, 4)}",
+            "break_level": round(float(break_dn_threshold), 4)
+        }
+
     return None
 
 def should_send(symbol, direction):
@@ -150,17 +188,19 @@ def send_telegram(text):
         log.error(f"Telegram hata: {e}")
         return False
 
+
 def format_message(symbol, sig):
     emoji = "\U0001F7E2" if sig["direction"] == "AL" else "\U0001F534"
     coin = symbol.replace("USDT", "/USDT")
-    sep = "\u2501" * 12
+    sep = "\u2501" * 14
     lines = [
-        f"{emoji} <b>HACIM+MOMENTUM & FIBO ONAYLI {sig['direction']}</b>",
+        f"{emoji} <b>MAJOR BOLGE %4 KIRILIM - {sig['direction']}</b>",
         sep,
         f"\U0001F4CD <b>{coin}</b>",
         f"\u23F1 Zaman Dilimi: <b>{TIMEFRAME}</b>",
         f"\U0001F4B0 Fiyat: <b>{sig['price']}</b>",
-        f"\U0001F4CA RSI: <b>{sig['rsi']}</b>",
+        f"\U0001F3D7 Major Bolge: <b>{sig['major_zone']}</b>",
+        f"\U0001F6A9 Kirilim Seviyesi: <b>{sig['break_level']}</b>",
         sep,
         f"\U0001F551 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
