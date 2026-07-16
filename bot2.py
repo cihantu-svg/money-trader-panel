@@ -23,7 +23,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
 TIMEFRAME = os.getenv("SCAN_TIMEFRAME", "1h")
-MAX_COINS = int(os.getenv("MAX_COINS", "200"))
+MAX_COINS = int(os.getenv("MAX_COINS", "600"))
 
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
 RSI_EMA_LEN = int(os.getenv("RSI_EMA_LEN", "10"))
