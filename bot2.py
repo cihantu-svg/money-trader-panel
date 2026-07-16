@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
-TIMEFRAME = os.getenv("SCAN_TIMEFRAME", "1h")
+TIMEFRAME = os.getenv("SCAN_TIMEFRAME", "15m")
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
 
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
@@ -34,11 +34,11 @@ VOL_MULT_DOWN = float(os.getenv("VOL_MULT_DOWN", "0.7"))
 RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50"))
 FIB_LEN = int(os.getenv("FIB_LEN", "100"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
-# YENI: Major Bolge ayarlari (Pine'dan birebir)
-AUTO_ZONE_DAYS = int(os.getenv("AUTO_ZONE_DAYS", "50"))      # Bolge periyodu (mum)
-AUTO_MAJOR_BINS = int(os.getenv("AUTO_MAJOR_BINS", "10"))    # Histogram bin sayisi
-MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "4.0")) # %4 kirilim mesafesi
 
+# YENI: Major Bolge ayarlari
+AUTO_ZONE_DAYS = int(os.getenv("AUTO_ZONE_DAYS", "50"))
+AUTO_MAJOR_BINS = int(os.getenv("AUTO_MAJOR_BINS", "10"))
+MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "4.0"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
@@ -82,94 +82,60 @@ def rsi(series, length):
 def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
+
+
 def calculate_major_zone(df):
-    """
-    Pine'daki auto_major hesaplamasi:
-    Son N mumda en cok fiyatin kapandigi bolgeyi bul (histogram).
-    """
     if df is None or len(df) < AUTO_ZONE_DAYS + 10:
         return None, None
-
     df_closed = df.iloc[:-1]
     if len(df_closed) < AUTO_ZONE_DAYS:
         return None, None
-
     close = df_closed["close"]
     lookback = min(AUTO_ZONE_DAYS, len(df_closed))
     auto_highest = close.iloc[-lookback:].max()
     auto_lowest = close.iloc[-lookback:].min()
-
     price_range = auto_highest - auto_lowest
     if price_range <= 0 or AUTO_MAJOR_BINS <= 0:
         return None, None
-
     step = price_range / AUTO_MAJOR_BINS
     bins = [0] * AUTO_MAJOR_BINS
     for price in close.iloc[-lookback:]:
         idx = min(AUTO_MAJOR_BINS - 1, max(0, int((price - auto_lowest) / step)))
         bins[idx] += 1
-
     max_bin = 0
     max_val = bins[0]
     for j in range(1, AUTO_MAJOR_BINS):
         if bins[j] > max_val:
             max_val = bins[j]
             max_bin = j
-
     major_bot = auto_lowest + step * max_bin
     major_top = auto_lowest + step * (max_bin + 1)
     return float(major_bot), float(major_top)
 
 
 def check_signal(df):
-    """
-    SADECE Major Bolge %4 kirilim sinyali:
-    - Fiyat major_top'un %4 ustune cikarsa -> AL
-    - Fiyat major_bot'un %4 altina duserse -> SAT
-    - Kapanmis mum uzerinden kontrol (repaint yok)
-    """
     if df is None or len(df) < AUTO_ZONE_DAYS + 20:
         return None
-
     major_bot, major_top = calculate_major_zone(df)
     if major_bot is None or major_top is None:
         return None
-
     df_closed = df.iloc[:-1]
     if len(df_closed) < 2:
         return None
-
     i, p = -1, -2
     close_now = df_closed["close"].iloc[i]
     close_prev = df_closed["close"].iloc[p]
-
     break_up_threshold = major_top * (1 + MAJOR_BREAK_PCT / 100)
     break_dn_threshold = major_bot * (1 - MAJOR_BREAK_PCT / 100)
-
     prev_below_major = close_prev <= major_top
     now_above_break = close_now >= break_up_threshold
-
     prev_above_major = close_prev >= major_bot
     now_below_break = close_now <= break_dn_threshold
-
     if prev_below_major and now_above_break:
-        return {
-            "direction": "AL",
-            "price": round(float(close_now), 4),
-            "major_zone": f"{round(major_bot, 4)} - {round(major_top, 4)}",
-            "break_level": round(float(break_up_threshold), 4)
-        }
-
+        return {"direction": "AL", "price": round(float(close_now), 4), "major_zone": f"{round(major_bot, 4)} - {round(major_top, 4)}", "break_level": round(float(break_up_threshold), 4)}
     if prev_above_major and now_below_break:
-        return {
-            "direction": "SAT",
-            "price": round(float(close_now), 4),
-            "major_zone": f"{round(major_bot, 4)} - {round(major_top, 4)}",
-            "break_level": round(float(break_dn_threshold), 4)
-        }
-
+        return {"direction": "SAT", "price": round(float(close_now), 4), "major_zone": f"{round(major_bot, 4)} - {round(major_top, 4)}", "break_level": round(float(break_dn_threshold), 4)}
     return None
-
 def should_send(symbol, direction):
     key = f"{symbol}_{direction}"
     now = time.time()
@@ -188,7 +154,6 @@ def send_telegram(text):
         log.error(f"Telegram hata: {e}")
         return False
 
-
 def format_message(symbol, sig):
     emoji = "\U0001F7E2" if sig["direction"] == "AL" else "\U0001F534"
     coin = symbol.replace("USDT", "/USDT")
@@ -205,7 +170,6 @@ def format_message(symbol, sig):
         f"\U0001F551 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
     return "\n".join(lines)
-
 def run_scan():
     symbols = get_symbols()
     log.info(f"Tarama basladi TF:{TIMEFRAME} Coin:{len(symbols)}")
