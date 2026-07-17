@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-COK GUCLU ROKET AL / SAT BOT
-Pine Script'teki "Quantum Golden + Confluence" stratejisinin birebir Python portu.
-15dk mumlar, Binance Futures USDT ciftleri, Telegram bildirim.
+SADECE COK GUCLU ROKET AL / SAT
+Pine'daki is_confluence_quantum ve is_confluence_quantum_sat mantigi birebir.
+Diger hicbir sinyal yok.
 """
 import os, time, logging
 from datetime import datetime
@@ -25,18 +25,15 @@ TIMEFRAME = os.getenv("SCAN_TIMEFRAME", "15m")
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 
-# Quantum Golden Ayarlari
 HASSASIYET = float(os.getenv("HASSASIYET", "0.1"))
 ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))
 
-# Confluence Ayarlari
 RSI_PERIOD_2 = int(os.getenv("RSI_PERIOD_2", "14"))
 EMA_PERIOD_2 = int(os.getenv("EMA_PERIOD_2", "10"))
 MOM_PERIOD_2 = int(os.getenv("MOM_PERIOD_2", "10"))
 VOL_MA_PERIOD_2 = int(os.getenv("VOL_MA_PERIOD_2", "20"))
 FIB_LEN_2 = int(os.getenv("FIB_LEN_2", "100"))
 
-# Major Level Ayarlari
 MAJOR_LINE_LEN = int(os.getenv("MAJOR_LINE_LEN", "100"))
 MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "1.0"))
 USE_MAJOR_FILTER = os.getenv("USE_MAJOR_FILTER", "false").lower() == "true"
@@ -45,7 +42,7 @@ BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
 last_signal = {}
 
-# VERI CEKME
+
 def get_symbols():
     try:
         r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo", timeout=10)
@@ -56,6 +53,7 @@ def get_symbols():
     except Exception as e:
         log.error(f"get_symbols hata: {e}")
         return []
+
 
 def get_klines(symbol, limit=300):
     try:
@@ -72,7 +70,7 @@ def get_klines(symbol, limit=300):
     except Exception:
         return None
 
-# TEKNIK INDIKATORLER
+
 def rsi(series, length):
     delta = series.diff()
     up = delta.clip(lower=0)
@@ -82,11 +80,14 @@ def rsi(series, length):
     rs = ma_up / ma_down.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
+
 def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
+
 def sma(series, length):
     return series.rolling(window=length).mean()
+
 
 def atr(df, period):
     high_low = df["high"] - df["low"]
@@ -95,7 +96,7 @@ def atr(df, period):
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
 
-# HEIKIN ASHI
+
 def calculate_heikin_ashi(df):
     ha = pd.DataFrame(index=df.index)
     ha["close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
@@ -107,7 +108,7 @@ def calculate_heikin_ashi(df):
     ha["low"] = pd.concat([df["low"], ha["open"], ha["close"]], axis=1).min(axis=1)
     return ha
 
-# CONFLUENCE
+
 def calculate_confluence(df):
     close = df["close"]
     volume = df["volume"]
@@ -145,7 +146,7 @@ def calculate_confluence(df):
 
     return {"buy": buy_signal_2, "sell": sell_signal_2}
 
-# MAJOR LEVEL
+
 def calculate_major_level(df):
     major_level = sma(df["close"], MAJOR_LINE_LEN)
     close_now = df["close"].iloc[-1]
@@ -169,8 +170,10 @@ def calculate_major_level(df):
         "trend_up": close_now > major_now
     }
 
-# SINYAL KONTROL
+
+# Her coin icin son sinyal durumu (Pine'daki var int sonSinyal = 0)
 son_sinyal_dict = {}
+
 
 def check_signal(df, symbol):
     if df is None or len(df) < max(MAJOR_LINE_LEN, FIB_LEN_2) + 20:
@@ -217,23 +220,25 @@ def check_signal(df, symbol):
 
     son_sinyal = son_sinyal_dict.get(symbol, 0)
 
-    # ROKET AL
+    # ============================================================
+    # SADECE COK GUCLU ROKET AL (Pine'daki is_confluence_quantum)
+    # ============================================================
     signal_al = (son_sinyal != 1 and 
                  ha_is_up and 
                  (ha_was_down or sert_yukselis) and 
                  mutlak_degisim >= HASSASIYET and 
-                 major["up"] and
-                 confluence["buy"])
+                 major["up"])
 
-    if signal_al:
+    is_confluence_al = signal_al and confluence["buy"]
+
+    if is_confluence_al:
         son_sinyal_dict[symbol] = 1
         t_price = close_now + (atr_val * 2)
         beklenti_yuzde = ((t_price - close_now) / close_now) * 100
-        is_strong = 85 <= olasilik_son <= 90
 
         return {
             "direction": "AL",
-            "type": "GUCU AL" if is_strong else "AL",
+            "type": "COK GUCLU ROKET AL",
             "price": round(float(close_now), 4),
             "target": round(float(t_price), 4),
             "beklenti": round(float(beklenti_yuzde), 2),
@@ -243,7 +248,9 @@ def check_signal(df, symbol):
             "major_dist": round(float(major["dist"]), 2) if major["dist"] else None
         }
 
-    # ROKET SAT
+    # ============================================================
+    # SADECE COK GUCLU ROKET SAT (tersi)
+    # ============================================================
     ha_was_up = ha_close_prev > ha_open_prev
     sert_dusus = ha_close_now < ha["low"].iloc[p]
 
@@ -251,18 +258,18 @@ def check_signal(df, symbol):
                   ha_is_down and 
                   (ha_was_up or sert_dusus) and 
                   mutlak_degisim >= HASSASIYET and 
-                  major["down"] and
-                  confluence["sell"])
+                  major["down"])
 
-    if signal_sat:
+    is_confluence_sat = signal_sat and confluence["sell"]
+
+    if is_confluence_sat:
         son_sinyal_dict[symbol] = -1
         t_price = close_now - (atr_val * 2)
         beklenti_yuzde = ((close_now - t_price) / close_now) * 100
-        is_strong = 85 <= olasilik_son <= 90
 
         return {
             "direction": "SAT",
-            "type": "GUCU SAT" if is_strong else "SAT",
+            "type": "COK GUCLU ROKET SAT",
             "price": round(float(close_now), 4),
             "target": round(float(t_price), 4),
             "beklenti": round(float(beklenti_yuzde), 2),
@@ -272,12 +279,13 @@ def check_signal(df, symbol):
             "major_dist": round(float(major["dist"]), 2) if major["dist"] else None
         }
 
+    # Pine'daki gibi: HA kirmizi ise AL sinyalini resetle
     if ha_is_down:
         son_sinyal_dict[symbol] = 0
 
     return None
 
-# TELEGRAM
+
 def should_send(symbol, direction):
     key = f"{symbol}_{direction}"
     now = time.time()
@@ -285,6 +293,7 @@ def should_send(symbol, direction):
         return False
     last_signal[key] = now
     return True
+
 
 def send_telegram(text):
     try:
@@ -296,13 +305,14 @@ def send_telegram(text):
         log.error(f"Telegram hata: {e}")
         return False
 
+
 def format_message(symbol, sig):
     emoji = "RO" if sig["direction"] == "AL" else "SAT"
     coin = symbol.replace("USDT", "/USDT")
     sep = "=" * 16
 
     lines = [
-        f"{emoji} {sig['type']} - COK GUCLU ROKET {sig['direction']}",
+        f"{emoji} {sig['type']} - {sig['direction']}",
         sep,
         f"Coin: {coin}",
         f"Zaman: {TIMEFRAME}",
@@ -323,7 +333,7 @@ def format_message(symbol, sig):
 
     return "\n".join(lines)
 
-# TARAMA
+
 def run_scan():
     symbols = get_symbols()
     log.info(f"ROKET TARAMA basladi TF:{TIMEFRAME} Coin:{len(symbols)}")
@@ -337,7 +347,7 @@ def run_scan():
             if sig and should_send(symbol, sig["direction"]):
                 if send_telegram(format_message(symbol, sig)):
                     found += 1
-                    log.info(f"SINYAL {symbol} {sig['direction']} Fiyat:{sig['price']} Hedef:{sig['target']}")
+                    log.info(f"SINYAL {symbol} {sig['type']} Fiyat:{sig['price']}")
 
             time.sleep(0.15)
 
@@ -350,7 +360,7 @@ def run_scan():
 
     log.info(f"Tarama tamamlandi {found} sinyal gonderildi")
 
-# MAIN
+
 def main():
     log.info("COK GUCLU ROKET AL/SAT BOT baslatildi")
 
@@ -361,9 +371,7 @@ def main():
     send_telegram(
         f"COK GUCLU ROKET AL/SAT BOT BASLADI\n"
         f"Zaman dilimi: {TIMEFRAME}\n"
-        f"Major Level: SMA{MAJOR_LINE_LEN}\n"
-        f"Hassasiyet: %{HASSASIYET}\n"
-        f"Confluence: RSI+EMA+Momentum+Hacim"
+        f"Major Level: SMA{MAJOR_LINE_LEN}"
     )
 
     while True:
@@ -372,6 +380,7 @@ def main():
         except Exception as e:
             log.error(f"run_scan genel hata: {e}")
         time.sleep(SCAN_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
