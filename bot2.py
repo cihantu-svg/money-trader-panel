@@ -365,9 +365,7 @@ def format_message(symbol, sig):
         sep,
         f"🕐 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ])
-
-    return "
-".join(lines)
+return "\\n".join(lines)
 
 # ════════════════════════════════════════════════════════════════════════════
 # 🔄 TARAMA
