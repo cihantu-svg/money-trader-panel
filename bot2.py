@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-HACIM+MOMENTUM & RSI-FIBO CONFLUENCE BOT
-Pine 'MONEY TRADER - FULL PAKET (CONFLUENCE)' mantigi birebir portlandi.
-  AL  = (Hacim yukselisi + RSI 50 yukari kesim)  VE  (RSI kendi EMA'sini VEYA orta-Fibo'yu yukari kesim)
-  SAT = (Hacim dususu + RSI 50 asagi kesim)       VE  (RSI kendi EMA'sini VEYA orta-Fibo'yu asagi kesim)
-  Iki grup da AYNI (KAPANMIS) mumda saglanirsa sinyal gonderilir (repaint yok).
+ÇOK GÜÇLÜ ROKET AL / SAT BOT
+Pine Script'teki "Quantum Golden + Confluence" stratejisinin birebir Python portu.
+15dk mumlar, Binance Futures USDT ciftleri, Telegram bildirim.
 """
 import os, time, logging
 from datetime import datetime
@@ -19,31 +17,39 @@ warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
+# ════════════════════════════════════════════════════════════════════════════
+# ⚙️ AYARLAR
+# ════════════════════════════════════════════════════════════════════════════
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
 TIMEFRAME = os.getenv("SCAN_TIMEFRAME", "15m")
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
-
-RSI_LEN = int(os.getenv("RSI_LEN", "14"))
-RSI_EMA_LEN = int(os.getenv("RSI_EMA_LEN", "10"))
-MOM_LEN = int(os.getenv("MOM_LEN", "10"))
-VOL_MA_LEN = int(os.getenv("VOL_MA_LEN", "20"))
-VOL_MULT_UP = float(os.getenv("VOL_MULT_UP", "1.5"))
-VOL_MULT_DOWN = float(os.getenv("VOL_MULT_DOWN", "0.7"))
-RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50"))
-FIB_LEN = int(os.getenv("FIB_LEN", "100"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 
-# YENI: Major Bolge ayarlari
-AUTO_ZONE_DAYS = int(os.getenv("AUTO_ZONE_DAYS", "50"))
-AUTO_MAJOR_BINS = int(os.getenv("AUTO_MAJOR_BINS", "10"))
-MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "2.0"))
+# Quantum Golden Ayarlari (Pine'dan birebir)
+HASSASIYET = float(os.getenv("HASSASIYET", "0.1"))       # Min momentum esigi %
+ATR_PERIOD = int(os.getenv("ATR_PERIOD", "14"))            # Hedef ATR periyodu
+
+# Confluence Ayarlari
+RSI_PERIOD_2 = int(os.getenv("RSI_PERIOD_2", "14"))
+EMA_PERIOD_2 = int(os.getenv("EMA_PERIOD_2", "10"))
+MOM_PERIOD_2 = int(os.getenv("MOM_PERIOD_2", "10"))
+VOL_MA_PERIOD_2 = int(os.getenv("VOL_MA_PERIOD_2", "20"))
+FIB_LEN_2 = int(os.getenv("FIB_LEN_2", "100"))
+
+# Major Level Ayarlari
+MAJOR_LINE_LEN = int(os.getenv("MAJOR_LINE_LEN", "100"))
+MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "1.0"))
+USE_MAJOR_FILTER = os.getenv("USE_MAJOR_FILTER", "false").lower() == "true"
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
 last_signal = {}
 
+# ════════════════════════════════════════════════════════════════════════════
+# 📊 VERI CEKME
+# ════════════════════════════════════════════════════════════════════════════
 def get_symbols():
     try:
         r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo", timeout=10)
@@ -70,6 +76,9 @@ def get_klines(symbol, limit=300):
     except Exception:
         return None
 
+# ════════════════════════════════════════════════════════════════════════════
+# 📈 TEKNIK INDIKATORLER
+# ════════════════════════════════════════════════════════════════════════════
 def rsi(series, length):
     delta = series.diff()
     up = delta.clip(lower=0)
@@ -82,79 +91,238 @@ def rsi(series, length):
 def ema(series, length):
     return series.ewm(span=length, adjust=False).mean()
 
+def sma(series, length):
+    return series.rolling(window=length).mean()
 
+def atr(df, period):
+    high_low = df["high"] - df["low"]
+    high_close = np.abs(df["high"] - df["close"].shift())
+    low_close = np.abs(df["low"] - df["close"].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(window=period).mean()
 
-def calculate_major_zone(df):
-    """
-    Pine'daki auto_major hesaplamasi:
-    Son N mumda en cok fiyatin kapandigi bolgeyi bul (histogram).
-    Daha genis bir bolge bulmak icin: tum high-low araligini kullan.
-    """
-    if df is None or len(df) < AUTO_ZONE_DAYS + 10:
-        return None, None
-    df_closed = df.iloc[:-1]
-    if len(df_closed) < AUTO_ZONE_DAYS:
-        return None, None
-    # Tum fiyat araligini kullan (high-low) daha genis bolge icin
-    lookback = min(AUTO_ZONE_DAYS, len(df_closed))
-    period_high = df_closed["high"].iloc[-lookback:].max()
-    period_low = df_closed["low"].iloc[-lookback:].min()
-    price_range = period_high - period_low
-    if price_range <= 0 or AUTO_MAJOR_BINS <= 0:
-        return None, None
-    step = price_range / AUTO_MAJOR_BINS
-    bins = [0] * AUTO_MAJOR_BINS
-    # Tum mumlarin (high+low)/2 degerini kullan
-    for idx in range(-lookback, 0):
-        mid_price = (df_closed["high"].iloc[idx] + df_closed["low"].iloc[idx]) / 2
-        bin_idx = min(AUTO_MAJOR_BINS - 1, max(0, int((mid_price - period_low) / step)))
-        bins[bin_idx] += 1
-    max_bin = 0
-    max_val = bins[0]
-    for j in range(1, AUTO_MAJOR_BINS):
-        if bins[j] > max_val:
-            max_val = bins[j]
-            max_bin = j
-    major_bot = period_low + step * max_bin
-    major_top = period_low + step * (max_bin + 1)
-    # Genisletilmis bolge: 2 bin genisliginde
-    major_bot = period_low + step * max(0, max_bin - 1)
-    major_top = period_low + step * min(AUTO_MAJOR_BINS - 1, max_bin + 2)
-    return float(major_bot), float(major_top)
+# ════════════════════════════════════════════════════════════════════════════
+# 🚀 QUANTUM GOLDEN HESAPLAMA (Heikin Ashi)
+# ════════════════════════════════════════════════════════════════════════════
+def calculate_heikin_ashi(df):
+    """Pine'daki Heikin Ashi hesaplamasi"""
+    ha = pd.DataFrame(index=df.index)
+    ha["close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+    ha["open"] = pd.Series(np.nan, index=df.index)
+    ha.loc[0, "open"] = (df.loc[0, "open"] + df.loc[0, "close"]) / 2
+    for i in range(1, len(df)):
+        ha.loc[i, "open"] = (ha.loc[i-1, "open"] + ha.loc[i-1, "close"]) / 2
+    ha["high"] = pd.concat([df["high"], ha["open"], ha["close"]], axis=1).max(axis=1)
+    ha["low"] = pd.concat([df["low"], ha["open"], ha["close"]], axis=1).min(axis=1)
+    return ha
 
+# ════════════════════════════════════════════════════════════════════════════
+# 🔗 CONFLUENCE HESAPLAMA (Ikinci Indikator)
+# ════════════════════════════════════════════════════════════════════════════
+def calculate_confluence(df):
+    """Pine'daki confluence_active hesaplamasi"""
+    close = df["close"]
+    volume = df["volume"]
 
-def check_signal(df):
+    rsi_val = rsi(close, RSI_PERIOD_2)
+    rsi_ema = ema(rsi_val, EMA_PERIOD_2)
+    momentum = close - close.shift(MOM_PERIOD_2)
+    vol_ma = sma(volume, VOL_MA_PERIOD_2)
+
+    rsi_top = rsi_val.rolling(FIB_LEN_2).max()
+    rsi_bot = rsi_val.rolling(FIB_LEN_2).min()
+    fib_500 = rsi_top - (rsi_top - rsi_bot) * 0.5
+
+    # Son kapanmis mum
+    i, p = -1, -2
+    rsi_now, rsi_prev = rsi_val.iloc[i], rsi_val.iloc[p]
+    ema_now, ema_prev = rsi_ema.iloc[i], rsi_ema.iloc[p]
+    mom_now = momentum.iloc[i]
+    vol_now, vol_ma_now = volume.iloc[i], vol_ma.iloc[i]
+    fib_prev = fib_500.iloc[p]
+
+    if pd.isna(rsi_now) or pd.isna(vol_ma_now) or pd.isna(fib_prev):
+        return False
+
+    mom_bull = mom_now > 0
+    mom_bear = mom_now < 0
+    vol_high = vol_now > vol_ma_now
+
+    # AL confluence
+    rsi_cross_up = rsi_prev <= ema_prev and rsi_now > ema_now
+    fibo_al = rsi_now > fib_prev and rsi_prev <= fib_prev
+    buy_signal_2 = (rsi_cross_up and mom_bull and vol_high) or (fibo_al and mom_bull and vol_high)
+
+    # SAT confluence
+    rsi_cross_down = rsi_prev >= ema_prev and rsi_now < ema_now
+    fibo_sat = rsi_now < fib_prev and rsi_prev >= fib_prev
+    sell_signal_2 = (rsi_cross_down and mom_bear and vol_high) or (fibo_sat and mom_bear and vol_high)
+
+    return {"buy": buy_signal_2, "sell": sell_signal_2}
+
+# ════════════════════════════════════════════════════════════════════════════
+# 📈 MAJOR LEVEL HESAPLAMA
+# ════════════════════════════════════════════════════════════════════════════
+def calculate_major_level(df):
+    """Pine'daki majorLevel hesaplamasi"""
+    major_level = sma(df["close"], MAJOR_LINE_LEN)
+    close_now = df["close"].iloc[-1]
+    major_now = major_level.iloc[-1]
+
+    if pd.isna(major_now):
+        return {"up": True, "down": True, "level": None}
+
+    dist = abs(close_now - major_now) / major_now * 100
+    major_break_up = close_now > major_now and dist >= MAJOR_BREAK_PCT
+    major_break_dn = close_now < major_now and dist >= MAJOR_BREAK_PCT
+
+    major_filter_long = not USE_MAJOR_FILTER or major_break_up
+    major_filter_short = not USE_MAJOR_FILTER or major_break_dn
+
+    return {
+        "up": major_filter_long,
+        "down": major_filter_short,
+        "level": major_now,
+        "dist": dist,
+        "trend_up": close_now > major_now
+    }
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🚀 SINYAL KONTROL: ÇOK GÜÇLÜ ROKET AL / SAT
+# ════════════════════════════════════════════════════════════════════════════
+# Her coin icin son sinyal durumunu tut (tekrar onlemek icin)
+son_sinyal_dict = {}  # {symbol: 0=none, 1=AL, -1=SAT}
+
+def check_signal(df, symbol):
     """
-    SADECE Major Bolge % kirilim sinyali:
-    - Fiyat major_top'un % ustune cikarsa -> AL
-    - Fiyat major_bot'un % altina duserse -> SAT
-    - Kapanmis mum uzerinden kontrol (repaint yok)
+    Pine'daki Quantum Golden + Confluence mantigi:
+    AL: Heikin Ashi donusu + Confluence + Major Filter
+    SAT: Heikin Ashi donusu (asagi) + Confluence + Major Filter
     """
-    if df is None or len(df) < AUTO_ZONE_DAYS + 20:
+    if df is None or len(df) < max(MAJOR_LINE_LEN, FIB_LEN_2) + 20:
         return None
-    major_bot, major_top = calculate_major_zone(df)
-    if major_bot is None or major_top is None:
-        return None
+
+    # Son kapanmis mum
     df_closed = df.iloc[:-1]
     if len(df_closed) < 2:
         return None
-    i, p = -1, -2
+
+    # Heikin Ashi hesapla
+    ha = calculate_heikin_ashi(df_closed)
+
+    i = -1   # Son kapanmis mum
+    p = -2   # Onceki kapanmis mum
+
+    ha_close_now = ha["close"].iloc[i]
+    ha_open_now = ha["open"].iloc[i]
+    ha_close_prev = ha["close"].iloc[p]
+    ha_open_prev = ha["open"].iloc[p]
+    ha_high_prev = ha["high"].iloc[p]
+
+    # Mum durumlari
+    ha_is_up = ha_close_now > ha_open_now
+    ha_is_down = ha_close_now < ha_open_now
+    ha_was_down = ha_close_prev < ha_open_prev
+    sert_yukselis = ha_close_now > ha_high_prev
+
+    # Mum gucu hesaplama
+    govde_degisim = ((ha_close_now - ha_open_now) / ha_open_now) * 100
+    mutlak_degisim = abs(govde_degisim)
+
+    avg_body = pd.Series([abs((ha["close"].iloc[j] - ha["open"].iloc[j]) / ha["open"].iloc[j] * 100) 
+                          for j in range(-10, 0)]).mean()
+    sinyal_gucu = min(100, (mutlak_degisim / (avg_body if avg_body > 0 else 1)) * 50)
+
+    # Basari olasiligi
+    olasilik = 65 + (sinyal_gucu / 4) + (12 if mutlak_degisim > HASSASIYET * 2.5 else 0)
+    olasilik_son = min(98, olasilik)
+
+    # ATR hedef hesaplama
+    atr_val = atr(df_closed, ATR_PERIOD).iloc[i]
     close_now = df_closed["close"].iloc[i]
-    close_prev = df_closed["close"].iloc[p]
-    # Kirilim esikleri: major bolge sinirlarindan % uzakta
-    break_up_threshold = major_top * (1 + MAJOR_BREAK_PCT / 100)
-    break_dn_threshold = major_bot * (1 - MAJOR_BREAK_PCT / 100)
-    # AL: Onceki mum major_top altinda (veya icinde), su anki mum % ustunde
-    prev_below_major = close_prev <= major_top
-    now_above_break = close_now >= break_up_threshold
-    # SAT: Onceki mum major_bot ustunde (veya icinde), su anki mum % altinda
-    prev_above_major = close_prev >= major_bot
-    now_below_break = close_now <= break_dn_threshold
-    if prev_below_major and now_above_break:
-        return {"direction": "AL", "price": round(float(close_now), 4), "major_zone": f"{round(major_bot, 4)} - {round(major_top, 4)}", "break_level": round(float(break_up_threshold), 4)}
-    if prev_above_major and now_below_break:
-        return {"direction": "SAT", "price": round(float(close_now), 4), "major_zone": f"{round(major_bot, 4)} - {round(major_top, 4)}", "break_level": round(float(break_dn_threshold), 4)}
+
+    # Confluence hesapla
+    confluence = calculate_confluence(df_closed)
+    if confluence is None:
+        return None
+
+    # Major Level hesapla
+    major = calculate_major_level(df_closed)
+
+    # Son sinyal durumu (tekrar onleme)
+    son_sinyal = son_sinyal_dict.get(symbol, 0)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 🚀 ÇOK GÜÇLÜ ROKET AL
+    # ═══════════════════════════════════════════════════════════════════
+    signal_al = (son_sinyal != 1 and 
+                 ha_is_up and 
+                 (ha_was_down or sert_yukselis) and 
+                 mutlak_degisim >= HASSASIYET and 
+                 major["up"] and
+                 confluence["buy"])
+
+    if signal_al:
+        son_sinyal_dict[symbol] = 1
+        t_price = close_now + (atr_val * 2)
+        beklenti_yuzde = ((t_price - close_now) / close_now) * 100
+        is_strong = 85 <= olasilik_son <= 90
+
+        return {
+            "direction": "AL",
+            "type": "💎 GÜÇLÜ AL" if is_strong else "⚡ AL",
+            "is_confluence": True,
+            "price": round(float(close_now), 4),
+            "target": round(float(t_price), 4),
+            "beklenti": round(float(beklenti_yuzde), 2),
+            "sinyal_gucu": round(float(sinyal_gucu), 0),
+            "olasilik": round(float(olasilik_son), 0),
+            "major_level": round(float(major["level"]), 4) if major["level"] else None,
+            "major_dist": round(float(major["dist"]), 2) if major["dist"] else None
+        }
+
+    # ═══════════════════════════════════════════════════════════════════
+    # 🔻 ÇOK GÜÇLÜ ROKET SAT
+    # ═══════════════════════════════════════════════════════════════════
+    # SAT icin: Heikin Ashi asagi donus + Confluence sell + Major filter
+    ha_was_up = ha_close_prev > ha_open_prev
+    sert_dusus = ha_close_now < ha["low"].iloc[p]
+
+    signal_sat = (son_sinyal != -1 and 
+                  ha_is_down and 
+                  (ha_was_up or sert_dusus) and 
+                  mutlak_degisim >= HASSASIYET and 
+                  major["down"] and
+                  confluence["sell"])
+
+    if signal_sat:
+        son_sinyal_dict[symbol] = -1
+        t_price = close_now - (atr_val * 2)
+        beklenti_yuzde = ((close_now - t_price) / close_now) * 100
+        is_strong = 85 <= olasilik_son <= 90
+
+        return {
+            "direction": "SAT",
+            "type": "💥 GÜÇLÜ SAT" if is_strong else "🔻 SAT",
+            "is_confluence": True,
+            "price": round(float(close_now), 4),
+            "target": round(float(t_price), 4),
+            "beklenti": round(float(beklenti_yuzde), 2),
+            "sinyal_gucu": round(float(sinyal_gucu), 0),
+            "olasilik": round(float(olasilik_son), 0),
+            "major_level": round(float(major["level"]), 4) if major["level"] else None,
+            "major_dist": round(float(major["dist"]), 2) if major["dist"] else None
+        }
+
+    # Heikin Ashi kirmizi ise AL sinyalini resetle (Pine'daki mantik)
+    if ha_is_down:
+        son_sinyal_dict[symbol] = 0
+
     return None
+
+# ════════════════════════════════════════════════════════════════════════════
+# 📨 TELEGRAM
+# ════════════════════════════════════════════════════════════════════════════
 def should_send(symbol, direction):
     key = f"{symbol}_{direction}"
     now = time.time()
@@ -174,47 +342,84 @@ def send_telegram(text):
         return False
 
 def format_message(symbol, sig):
-    emoji = "\U0001F7E2" if sig["direction"] == "AL" else "\U0001F534"
+    emoji = "🚀" if sig["direction"] == "AL" else "🔻"
     coin = symbol.replace("USDT", "/USDT")
-    sep = "\u2501" * 14
+    sep = "━" * 16
+
     lines = [
-        f"{emoji} <b>MAJOR BOLGE % KIRILIM - {sig['direction']}</b>",
+        f"{emoji} <b>{sig['type']} - ÇOK GÜÇLÜ ROKET {sig['direction']}</b>",
         sep,
-        f"\U0001F4CD <b>{coin}</b>",
-        f"\u23F1 Zaman Dilimi: <b>{TIMEFRAME}</b>",
-        f"\U0001F4B0 Fiyat: <b>{sig['price']}</b>",
-        f"\U0001F3D7 Major Bolge: <b>{sig['major_zone']}</b>",
-        f"\U0001F6A9 Kirilim Seviyesi: <b>{sig['break_level']}</b>",
-        sep,
-        f"\U0001F551 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
+        f"📍 <b>{coin}</b>",
+        f"⏱ Zaman Dilimi: <b>{TIMEFRAME}</b>",
+        f"💰 Fiyat: <b>{sig['price']}</b>",
+        f"🎯 Hedef: <b>{sig['target']}</b> (%{sig['beklenti']})",
+        f"📊 Sinyal Gücü: <b>%{sig['sinyal_gucu']}</b>",
+        f"✅ Başarı Olasılığı: <b>%{sig['olasilik']}</b>",
     ]
-    return "\n".join(lines)
+
+    if sig["major_level"]:
+        trend = "📈 ÜSTÜNDE" if sig["direction"] == "AL" else "📉 ALTINDA"
+        lines.append(f"📈 Major Level (SMA{MAJOR_LINE_LEN}): <b>{sig['major_level']}</b> ({trend})")
+
+    lines.extend([
+        sep,
+        f"🕐 {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
+    ])
+
+    return "
+".join(lines)
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🔄 TARAMA
+# ════════════════════════════════════════════════════════════════════════════
 def run_scan():
     symbols = get_symbols()
-    log.info(f"Tarama basladi TF:{TIMEFRAME} Coin:{len(symbols)}")
+    log.info(f"🚀 ROKET TARAMA basladi TF:{TIMEFRAME} Coin:{len(symbols)}")
     found = 0
+
     for idx, symbol in enumerate(symbols):
         try:
-            df = get_klines(symbol)
-            sig = check_signal(df)
+            df = get_klines(symbol, limit=300)
+            sig = check_signal(df, symbol)
+
             if sig and should_send(symbol, sig["direction"]):
                 if send_telegram(format_message(symbol, sig)):
                     found += 1
-                    log.info(f"OK {symbol} {sig['direction']} rsi:{sig['rsi']}")
-            time.sleep(0.1)
+                    log.info(f"🚀 SINYAL {symbol} {sig['direction']} Fiyat:{sig['price']} Hedef:{sig['target']} Olasilik:%{sig['olasilik']}")
+
+            time.sleep(0.15)
+
         except Exception as e:
             log.error(f"{symbol} hata: {e}")
             continue
+
         if (idx + 1) % 50 == 0:
             log.info(f"[{idx+1}/{len(symbols)}] tarandi {found} sinyal")
-    log.info(f"Tarama tamamlandi {found} sinyal gonderildi")
 
+    log.info(f"🚀 Tarama tamamlandi {found} sinyal gonderildi")
+
+# ════════════════════════════════════════════════════════════════════════════
+# 🚀 MAIN
+# ════════════════════════════════════════════════════════════════════════════
 def main():
-    log.info("HACIM+MOMENTUM & FIBO CONFLUENCE BOT baslatildi")
+    log.info("🚀 ÇOK GÜÇLÜ ROKET AL/SAT BOT baslatildi")
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID eksik!")
         return
-    send_telegram(f"HACIM+MOMENTUM & FIBO CONFLUENCE BOT BASLADI\nZaman dilimi: {TIMEFRAME}")
+
+    send_telegram(
+        f"🚀 <b>ÇOK GÜÇLÜ ROKET AL/SAT BOT BASLADI</b>
+"
+        f"Zaman dilimi: <b>{TIMEFRAME}</b>
+"
+        f"Major Level: <b>SMA{MAJOR_LINE_LEN}</b>
+"
+        f"Hassasiyet: <b>%{HASSASIYET}</b>
+"
+        f"Confluence: <b>RSI+EMA+Momentum+Hacim</b>"
+    )
+
     while True:
         try:
             run_scan()
