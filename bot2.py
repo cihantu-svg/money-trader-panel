@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 ROKET AL / ROKET SAT BOT
-- 15dk grafikte Heikin Ashi tabanli Quantum Golden donusu
-  + RSI/Fibo/Momentum/Hacim confluence'i
+- 15dk grafikte Heikin Ashi tabanli Quantum Golden (COK GUCLU) donusu
   + Major Level (SMA) kesisimi
-  uc kosul ayni anda gerceklestiginde ROKET AL / ROKET SAT gonderir.
+  iki kosul ayni anda gerceklestiginde ROKET AL / ROKET SAT gonderir.
 - CANLI mum uzerinden calisir (repaint riski var, erken sinyal icin bilinçli tercih).
 """
 import os, time, logging
@@ -29,16 +28,11 @@ SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 
 # ROKET AL/SAT ayarlari (hepsinin varsayilani var, env eklemeden calisir)
 ROKET_TIMEFRAME = os.getenv("ROKET_TIMEFRAME", "15m")
-ROKET_RSI_LEN = int(os.getenv("ROKET_RSI_LEN", "14"))
-ROKET_EMA_RSI_LEN = int(os.getenv("ROKET_EMA_RSI_LEN", "10"))
-ROKET_MOM_LEN = int(os.getenv("ROKET_MOM_LEN", "10"))
-ROKET_VOL_MA_LEN = int(os.getenv("ROKET_VOL_MA_LEN", "20"))
-ROKET_FIB_LEN = int(os.getenv("ROKET_FIB_LEN", "100"))
 ROKET_HASSASIYET = float(os.getenv("ROKET_HASSASIYET", "0.1"))
 ROKET_ATR_PERIOD = int(os.getenv("ROKET_ATR_PERIOD", "14"))
 ROKET_MAJOR_LEN = int(os.getenv("ROKET_MAJOR_LEN", "100"))
 ROKET_MAJOR_BREAK_PCT = float(os.getenv("ROKET_MAJOR_BREAK_PCT", "1.0"))
-ROKET_KLINES_LIMIT = int(os.getenv("ROKET_KLINES_LIMIT", "300"))
+ROKET_KLINES_LIMIT = int(os.getenv("ROKET_KLINES_LIMIT", "150"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
@@ -74,19 +68,8 @@ def get_klines(symbol, interval, limit=500):
 
 
 # ════════════════════════════════════════════════════════════════
-# ROKET AL / ROKET SAT hesaplama (Quantum Golden + Confluence + Major Level kesisimi)
+# ROKET AL / ROKET SAT hesaplama (Quantum Golden COK GUCLU + Major Level kesisimi)
 # ════════════════════════════════════════════════════════════════
-def _rsi(series, length):
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    out = 100 - (100 / (1 + rs))
-    return out.fillna(50)
-
-
 def _atr(df, length):
     high, low, close = df["high"], df["low"], df["close"]
     prev_close = close.shift(1)
@@ -112,13 +95,14 @@ def _heikin_ashi(df):
 
 
 def check_roket_live(df_roket):
-    """15dk CANLI mum uzerinden ROKET AL / ROKET SAT ara."""
-    min_len = max(ROKET_MAJOR_LEN, ROKET_FIB_LEN) + 15
+    """15dk CANLI mum uzerinden ROKET AL / ROKET SAT ara.
+    Kosul: Quantum Golden COK GUCLU donusu + ayni anda Major Level (turuncu cizgi) kesisimi."""
+    min_len = ROKET_MAJOR_LEN + 15
     if df_roket is None or len(df_roket) < min_len:
         return None
 
     df = df_roket
-    close, volume = df["close"], df["volume"]
+    close = df["close"]
 
     # --- Major Level (turuncu SMA cizgisi) ve kesisim ---
     major_level = close.rolling(ROKET_MAJOR_LEN).mean()
@@ -148,32 +132,11 @@ def check_roket_live(df_roket):
     signal_al = ha_is_up & (prev_ha_down | sert_yukselis) & (mutlak_degisim >= ROKET_HASSASIYET)
     signal_sat = ha_is_down & (prev_ha_up | sert_dusus) & (mutlak_degisim >= ROKET_HASSASIYET)
 
-    # --- Confluence (RSI / Fibo / Momentum / Hacim) ---
-    rsi_val = _rsi(close, ROKET_RSI_LEN)
-    rsi_ema = rsi_val.ewm(span=ROKET_EMA_RSI_LEN, adjust=False).mean()
-    momentum = close.diff(ROKET_MOM_LEN)
-    vol_ma = volume.rolling(ROKET_VOL_MA_LEN).mean()
-
-    rsi_top = rsi_val.rolling(ROKET_FIB_LEN).max()
-    rsi_bot = rsi_val.rolling(ROKET_FIB_LEN).min()
-    fib_500 = rsi_top - (rsi_top - rsi_bot) * 0.5
-
-    rsi_cross_up = (rsi_val > rsi_ema) & (rsi_val.shift(1) <= rsi_ema.shift(1))
-    rsi_cross_down = (rsi_val < rsi_ema) & (rsi_val.shift(1) >= rsi_ema.shift(1))
-    rsi_cross_fib_up = (rsi_val > fib_500.shift(1)) & (rsi_val.shift(1) <= fib_500.shift(1))
-    rsi_cross_fib_down = (rsi_val < fib_500.shift(1)) & (rsi_val.shift(1) >= fib_500.shift(1))
-
-    mom_bull = momentum > 0
-    mom_bear = momentum < 0
-    vol_high = volume > vol_ma
-
-    confluence_bull = (rsi_cross_up | rsi_cross_fib_up) & mom_bull & vol_high
-    confluence_bear = (rsi_cross_down | rsi_cross_fib_down) & mom_bear & vol_high
-
     atr_val = _atr(df, ROKET_ATR_PERIOD)
 
-    roket_al = signal_al & confluence_bull & crossed_up
-    roket_sat = signal_sat & confluence_bear & crossed_down
+    # ROKET AL/SAT = Quantum Golden COK GUCLU donusu + Major Level kesisimi (2 sart)
+    roket_al = signal_al & crossed_up
+    roket_sat = signal_sat & crossed_down
 
     i = -1  # CANLI mum
 
