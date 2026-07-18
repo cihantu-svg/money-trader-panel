@@ -1,202 +1,210 @@
-// This work is licensed under a Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0) https://creativecommons.org/licenses/by-nc-sa/4.0/
-// © LuxAlgo
+# -*- coding: utf-8 -*-
+"""
+HACIM + MOMENTUM BOT (5dk)
+- AL: Hacim, 20 periyot ortalamasinin VOL_MULT_UP kati ve uzerinde + RSI 50'yi yukari kesti
+- SAT: Hacim, ortalamanin VOL_MULT_DOWN kati ve altina dustu (varsayilan ~1/3) + RSI 50'yi asagi kesti
+"""
+import os, time, logging
+from datetime import datetime
+import requests
+import pandas as pd
+import numpy as np
+import urllib3, warnings
 
-//@version=5
-indicator("Order Blocks & Breaker Blocks [LuxAlgo]", overlay = true
-  , max_lines_count  = 500
-  , max_labels_count = 500
-  , max_boxes_count  = 500)
-//------------------------------------------------------------------------------
-//Settings
-//-----------------------------------------------------------------------------{
-length   = input.int(10, 'Swing Lookback'     , minval = 3)
-showBull = input.int(3, 'Show Last Bullish OB', minval = 0)
-showBear = input.int(3, 'Show Last Bearish OB', minval = 0)
-useBody  = input(false, 'Use Candle Body')
+urllib3.disable_warnings()
+warnings.filterwarnings('ignore')
 
-//Style
-bullCss      = input(color.new(#2157f3, 80), 'Bullish OB'   , inline = 'bullcss', group = 'Style')
-bullBreakCss = input(color.new(#ff1100, 80), 'Bullish Break', inline = 'bullcss', group = 'Style')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
 
-bearCss      = input(color.new(#ff5d00, 80), 'Bearish OB'   , inline = 'bearcss', group = 'Style')
-bearBreakCss = input(color.new(#0cb51a, 80), 'Bearish Break', inline = 'bearcss', group = 'Style')
+# AYARLAR
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
+MAX_COINS = int(os.getenv("MAX_COINS", "600"))
+SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 
-showLabels = input(false, 'Show Historical Polarity Changes')
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
+VOL_MA_LEN = int(os.getenv("VOL_MA_LEN", "20"))
+RSI_LEN = int(os.getenv("RSI_LEN", "14"))
+RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50"))
+VOL_MULT_UP = float(os.getenv("VOL_MULT_UP", "5.0"))       # AL: hacim >= ortalamanin 5 kati
+VOL_MULT_DOWN = float(os.getenv("VOL_MULT_DOWN", "0.33"))  # SAT: hacim <= ortalamanin 1/3'u (~3'e 1 dusus)
+KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "100"))
 
-//-----------------------------------------------------------------------------}
-//UDT's
-//-----------------------------------------------------------------------------{
-type ob
-    float top = na
-    float btm = na
-    int   loc = bar_index
-    bool  breaker = false
-    int   break_loc = na
+BINANCE_BASE = "https://fapi.binance.com"
+SESSION = requests.Session()
+last_signal = {}
 
-type swing
-    float y = na
-    int   x = na
-    bool  crossed = false
 
-//-----------------------------------------------------------------------------}
-//Functions
-//-----------------------------------------------------------------------------{
-swings(len)=>
-    var os = 0
-    var swing top = swing.new(na, na)
-    var swing btm = swing.new(na, na)
-    
-    upper = ta.highest(len)
-    lower = ta.lowest(len)
+def get_symbols():
+    try:
+        r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo", timeout=10)
+        data = r.json()
+        syms = [s["symbol"] for s in data["symbols"]
+                if s["symbol"].endswith("USDT") and s["status"] == "TRADING"]
+        return syms[:MAX_COINS]
+    except Exception as e:
+        log.error(f"get_symbols hata: {e}")
+        return []
 
-    os := high[len] > upper ? 0 
-      : low[len] < lower ? 1 : os
 
-    if os == 0 and os[1] != 0
-        top := swing.new(high[length], bar_index[length])
-    
-    if os == 1 and os[1] != 1
-        btm := swing.new(low[length], bar_index[length])
+def get_klines(symbol, interval, limit=500):
+    try:
+        r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/klines",
+                        params={"symbol": symbol, "interval": interval, "limit": limit},
+                        timeout=10)
+        raw = r.json()
+        df = pd.DataFrame(raw, columns=[
+            "open_time","open","high","low","close","volume","close_time",
+            "qav","trades","tbv","tqv","ignore"])
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
+        return df
+    except Exception:
+        return None
 
-    [top, btm]
 
-method notransp(color css) => color.rgb(color.r(css), color.g(css), color.b(css))
+def _rsi(series, length):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    out = 100 - (100 / (1 + rs))
+    return out.fillna(50)
 
-method display(ob id, css, break_css)=>
-    if id.breaker
-        box.new(id.loc, id.top, id.break_loc, id.btm, css.notransp()
-          , bgcolor = css
-          , xloc = xloc.bar_time)
 
-        box.new(id.break_loc, id.top, time+1, id.btm, na
-          , bgcolor = break_css
-          , extend = extend.right
-          , xloc = xloc.bar_time)
-        
-        line.new(id.loc, id.top, id.break_loc, id.top, xloc.bar_time, color = css.notransp())
-        line.new(id.loc, id.btm, id.break_loc, id.btm, xloc.bar_time, color = css.notransp())
-        line.new(id.break_loc, id.top, time+1, id.top, xloc.bar_time, extend.right, break_css.notransp(), line.style_dashed)
-        line.new(id.break_loc, id.btm, time+1, id.btm, xloc.bar_time, extend.right, break_css.notransp(), line.style_dashed)
-    else
-        box.new(id.loc, id.top, time, id.btm, na
-          , bgcolor = css
-          , extend = extend.right
-          , xloc = xloc.bar_time)
-        
-        line.new(id.loc, id.top, time, id.top, xloc.bar_time, extend.right, css.notransp())
-        line.new(id.loc, id.btm, time, id.btm, xloc.bar_time, extend.right, css.notransp())
+def check_vol_momentum(df):
+    """5dk CANLI mum uzerinden Hacim+Momentum AL/SAT ara."""
+    if df is None or len(df) < VOL_MA_LEN + RSI_LEN + 5:
+        return None
 
-//-----------------------------------------------------------------------------}
-//Detect Swings
-//-----------------------------------------------------------------------------{
-n = bar_index
+    close, volume = df["close"], df["volume"]
+    vol_sma = volume.rolling(VOL_MA_LEN).mean()
+    vol_ratio = volume / vol_sma
+    rsi_val = _rsi(close, RSI_LEN)
 
-[top, btm] = swings(length)
-max = useBody ? math.max(close, open) : high
-min = useBody ? math.min(close, open) : low
+    i, p = -1, -2  # son (CANLI) mum / bir onceki mum
 
-//-----------------------------------------------------------------------------}
-//Bullish OB
-//-----------------------------------------------------------------------------{
-var bullish_ob = array.new<ob>(0)
-bull_break_conf = 0
+    if pd.isna(vol_ratio.iloc[i]) or pd.isna(rsi_val.iloc[i]) or pd.isna(rsi_val.iloc[p]):
+        return None
 
-if close > top.y and not top.crossed
-    top.crossed := true
+    vol_ratio_now = float(vol_ratio.iloc[i])
+    rsi_now = float(rsi_val.iloc[i])
+    rsi_prev = float(rsi_val.iloc[p])
+    price = float(close.iloc[i])
 
-    minima = max[1]
-    maxima = min[1]
-    loc = time[1]
+    # AL: hacim guclu artis + RSI 50 yukari kesisim
+    if vol_ratio_now >= VOL_MULT_UP and rsi_prev <= RSI_LEVEL < rsi_now:
+        return {
+            "direction": "AL",
+            "price": round(price, 6),
+            "vol_ratio": round(vol_ratio_now, 2),
+            "rsi": round(rsi_now, 1),
+        }
 
-    for i = 1 to (n - top.x)-1
-        minima := math.min(min[i], minima)
-        maxima := minima == min[i] ? max[i] : maxima
-        loc := minima == min[i] ? time[i] : loc
+    # SAT: hacim guclu dusus + RSI 50 asagi kesisim
+    if vol_ratio_now <= VOL_MULT_DOWN and rsi_prev >= RSI_LEVEL > rsi_now:
+        return {
+            "direction": "SAT",
+            "price": round(price, 6),
+            "vol_ratio": round(vol_ratio_now, 2),
+            "rsi": round(rsi_now, 1),
+        }
 
-    bullish_ob.unshift(ob.new(maxima, minima, loc))
+    return None
 
-if bullish_ob.size() > 0
-    for i = bullish_ob.size()-1 to 0
-        element = bullish_ob.get(i)
-    
-        if not element.breaker 
-            if math.min(close, open) < element.btm
-                element.breaker := true
-                element.break_loc := time
-        else
-            if close > element.top
-                bullish_ob.remove(i)
-            else if i < showBull and top.y < element.top and top.y > element.btm 
-                bull_break_conf := 1
 
-//Set label
-if bull_break_conf > bull_break_conf[1] and showLabels
-    label.new(top.x, top.y, '▼', color = na
-      , textcolor = bearCss.notransp()
-      , style = label.style_label_down
-      , size = size.tiny)
+def should_send(symbol, direction):
+    key = f"{symbol}_{direction}"
+    now = time.time()
+    if now - last_signal.get(key, 0) < SIGNAL_COOLDOWN:
+        return False
+    last_signal[key] = now
+    return True
 
-//-----------------------------------------------------------------------------}
-//Bearish OB
-//-----------------------------------------------------------------------------{
-var bearish_ob = array.new<ob>(0)
-bear_break_conf = 0
 
-if close < btm.y and not btm.crossed
-    btm.crossed := true
+def send_telegram(text):
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                          data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+                          timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        log.error(f"Telegram hata: {e}")
+        return False
 
-    minima = min[1]
-    maxima = max[1]
-    loc = time[1]
 
-    for i = 1 to (n - btm.x)-1
-        maxima := math.max(max[i], maxima)
-        minima := maxima == max[i] ? min[i] : minima
-        loc := maxima == max[i] ? time[i] : loc
+def format_message(symbol, sig):
+    emoji = "HACIM+MOMENTUM AL" if sig["direction"] == "AL" else "HACIM DUSUS+MOMENTUM KAYBI SAT"
+    coin = symbol.replace("USDT", "/USDT")
+    sep = "=" * 16
 
-    bearish_ob.unshift(ob.new(maxima, minima, loc))
+    lines = [
+        f"{emoji}",
+        sep,
+        f"Coin: {coin}",
+        f"Fiyat: {sig['price']}",
+        f"Hacim: {sig['vol_ratio']}x ortalama",
+        f"RSI: {sig['rsi']}",
+        sep,
+        f"{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
+    ]
 
-if bearish_ob.size() > 0
-    for i = bearish_ob.size()-1 to 0
-        element = bearish_ob.get(i)
+    return "\n".join(lines)
 
-        if not element.breaker 
-            if math.max(close, open) > element.top
-                element.breaker := true
-                element.break_loc := time
-        else
-            if close < element.btm
-                bearish_ob.remove(i)
-            else if i < showBear and btm.y > element.btm and btm.y < element.top 
-                bear_break_conf := 1
 
-//Set label
-if bear_break_conf > bear_break_conf[1] and showLabels
-    label.new(btm.x, btm.y, '▲', color = na
-      , textcolor = bullCss.notransp()
-      , style = label.style_label_up
-      , size = size.tiny)
+def run_scan():
+    symbols = get_symbols()
+    log.info(f"HACIM+MOMENTUM TARAMA basladi Coin:{len(symbols)}")
+    found = 0
 
-//-----------------------------------------------------------------------------}
-//Set Order Blocks
-//-----------------------------------------------------------------------------{
-for bx in box.all
-    bx.delete()
+    for idx, symbol in enumerate(symbols):
+        try:
+            df = get_klines(symbol, TIMEFRAME, limit=KLINES_LIMIT)
+            sig = check_vol_momentum(df)
 
-for l in line.all
-    l.delete()
+            if sig and should_send(symbol, sig["direction"]):
+                if send_telegram(format_message(symbol, sig)):
+                    found += 1
+                    log.info(f"SINYAL {symbol} {sig['direction']} Fiyat:{sig['price']} Vol:{sig['vol_ratio']}x RSI:{sig['rsi']}")
 
-if barstate.islast
-    //Bullish
-    if showBull > 0
-        for i = 0 to math.min(showBull-1, bullish_ob.size())
-            get_ob = bullish_ob.get(i)
-            get_ob.display(bullCss, bullBreakCss)
+            time.sleep(0.2)
 
-    //Bearish
-    if showBear > 0
-        for i = 0 to math.min(showBear-1, bearish_ob.size())
-            get_ob = bearish_ob.get(i)
-            get_ob.display(bearCss, bearBreakCss)
+        except Exception as e:
+            log.error(f"{symbol} hata: {e}")
+            continue
 
-//-----------------------------------------------------------------------------}
+        if (idx + 1) % 50 == 0:
+            log.info(f"[{idx+1}/{len(symbols)}] tarandi {found} sinyal")
+
+    log.info(f"Tarama tamamlandi {found} sinyal gonderildi")
+
+
+def main():
+    log.info("HACIM+MOMENTUM BOT baslatildi")
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID eksik!")
+        return
+
+    send_telegram(
+        f"HACIM+MOMENTUM BOT BASLADI\n"
+        f"Zaman Dilimi: {TIMEFRAME}\n"
+        f"AL: Hacim >= {VOL_MULT_UP}x ortalama + RSI {RSI_LEVEL} yukari kesisim\n"
+        f"SAT: Hacim <= {VOL_MULT_DOWN}x ortalama + RSI {RSI_LEVEL} asagi kesisim\n"
+        f"Tarama Araligi: {SCAN_INTERVAL}sn | Coin: {MAX_COINS}"
+    )
+
+    while True:
+        try:
+            run_scan()
+        except Exception as e:
+            log.error(f"run_scan genel hata: {e}")
+        time.sleep(SCAN_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
