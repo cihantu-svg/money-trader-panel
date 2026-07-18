@@ -2,7 +2,7 @@
 """
 HACIM + MOMENTUM BOT (5dk)
 - AL: Hacim, 20 periyot ortalamasinin VOL_MULT_UP kati ve uzerinde + RSI 50'yi yukari kesti
-- SAT: Hacim, ortalamanin VOL_MULT_DOWN kati ve altina dustu (varsayilan ~1/3) + RSI 50'yi asagi kesti
+- SAT: Hacim, 20 periyot ortalamasinin VOL_MULT_DOWN kati ve uzerinde + RSI 50'yi asagi kesti
 """
 import os, time, logging
 from datetime import datetime
@@ -28,8 +28,8 @@ TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 VOL_MA_LEN = int(os.getenv("VOL_MA_LEN", "20"))
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
 RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50"))
-VOL_MULT_UP = float(os.getenv("VOL_MULT_UP", "5.0"))       # AL: hacim >= ortalamanin 5 kati
-VOL_MULT_DOWN = float(os.getenv("VOL_MULT_DOWN", "0.33"))  # SAT: hacim <= ortalamanin 1/3'u (~3'e 1 dusus)
+VOL_MULT_UP = float(os.getenv("VOL_MULT_UP", "5.0"))    # AL: hacim >= ortalamanin 5 kati
+VOL_MULT_DOWN = float(os.getenv("VOL_MULT_DOWN", "3.0"))  # SAT: hacim >= ortalamanin 3 kati (AL'dan farkli esik)
 KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "100"))
 
 BINANCE_BASE = "https://fapi.binance.com"
@@ -77,7 +77,9 @@ def _rsi(series, length):
 
 
 def check_vol_momentum(df):
-    """5dk CANLI mum uzerinden Hacim+Momentum AL/SAT ara."""
+    """5dk CANLI mum uzerinden Hacim+Momentum AL/SAT ara.
+    AL: hacim >= VOL_MULT_UP x ortalama + RSI 50 yukari kesisim
+    SAT: hacim >= VOL_MULT_DOWN x ortalama + RSI 50 asagi kesisim"""
     if df is None or len(df) < VOL_MA_LEN + RSI_LEN + 5:
         return None
 
@@ -105,8 +107,8 @@ def check_vol_momentum(df):
             "rsi": round(rsi_now, 1),
         }
 
-    # SAT: hacim guclu dusus + RSI 50 asagi kesisim
-    if vol_ratio_now <= VOL_MULT_DOWN and rsi_prev >= RSI_LEVEL > rsi_now:
+    # SAT: hacim guclu artis (ayri esik) + RSI 50 asagi kesisim
+    if vol_ratio_now >= VOL_MULT_DOWN and rsi_prev >= RSI_LEVEL > rsi_now:
         return {
             "direction": "SAT",
             "price": round(price, 6),
@@ -194,7 +196,7 @@ def main():
         f"HACIM+MOMENTUM BOT BASLADI\n"
         f"Zaman Dilimi: {TIMEFRAME}\n"
         f"AL: Hacim >= {VOL_MULT_UP}x ortalama + RSI {RSI_LEVEL} yukari kesisim\n"
-        f"SAT: Hacim <= {VOL_MULT_DOWN}x ortalama + RSI {RSI_LEVEL} asagi kesisim\n"
+        f"SAT: Hacim >= {VOL_MULT_DOWN}x ortalama + RSI {RSI_LEVEL} asagi kesisim\n"
         f"Tarama Araligi: {SCAN_INTERVAL}sn | Coin: {MAX_COINS}"
     )
 
