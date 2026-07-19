@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-OB & BREAKER BLOCK CONFLUENCE SCANNER BOT (5dk)
-- LuxAlgo Order Blocks + Breaker Blocks mantığı ile çalışır
-- OB ve Breaker'ların üst üste geldiği (confluence) alanları tespit eder
-- Min %3 mum boyu ile kırıldığında AL/SAT sinyali üretir
-- Binance Futures verisi üzerinden çalışır
+OB & BREAKER BLOCK CONFLUENCE SCANNER BOT
+- LuxAlgo Order Blocks + Breaker Blocks mantigi
+- OB ve Breaker'larin ust uste geldigi (confluence) alanlari tespit eder
+- Min %3 mum boyu ile kirildiginda AL/SAT sinyali uretir
+- Binance Futures verisi uzerinden calisir
 """
 import os, time, logging
 from datetime import datetime
@@ -20,37 +20,33 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
-# AYARLAR (Eski kodundan aktarıldı)
+# AYARLAR
 # ═══════════════════════════════════════════════════════════════
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))      # Tarama aralığı (saniye)
-MAX_COINS = int(os.getenv("MAX_COINS", "600"))               # Max taranacak coin
-SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))  # Aynı coin için cooldown
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
+MAX_COINS = int(os.getenv("MAX_COINS", "600"))
+SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
+KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "100"))
 
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")                   # Zaman dilimi
-KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "100"))       # Kaç mum çekilecek
-
-# ═══════════════════════════════════════════════════════════════
-# OB & BREAKER STRATEJİ AYARLARI
-# ═══════════════════════════════════════════════════════════════
-SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "10"))       # Swing tespit periyodu
-MIN_OVERLAP_PCT = float(os.getenv("MIN_OVERLAP_PCT", "30.0")) # Min overlap % (OB↔Breaker)
-MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "3.0"))      # Min kırılım mum boyu %
-USE_BODY = os.getenv("USE_BODY", "false").lower() == "true"   # Mum gövdesi mi kullanılsın
-SHOW_BULL = int(os.getenv("SHOW_BULL", "3"))                  # Gösterilecek bull OB sayısı
-SHOW_BEAR = int(os.getenv("SHOW_BEAR", "3"))                  # Gösterilecek bear OB sayısı
+# OB & Breaker Strateji Ayarlari
+SWING_LOOKBACK = int(os.getenv("SWING_LOOKBACK", "10"))
+MIN_OVERLAP_PCT = float(os.getenv("MIN_OVERLAP_PCT", "30.0"))
+MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "3.0"))
+USE_BODY = os.getenv("USE_BODY", "false").lower() == "true"
+SHOW_BULL = int(os.getenv("SHOW_BULL", "3"))
+SHOW_BEAR = int(os.getenv("SHOW_BEAR", "3"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
 last_signal = {}
 
 # ═══════════════════════════════════════════════════════════════
-# FONKSİYONLAR
+# FONKSIYONLAR
 # ═══════════════════════════════════════════════════════════════
 
 def get_symbols():
-    """Binance Futures USDT çiftlerini çek"""
     try:
         r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo", timeout=10)
         data = r.json()
@@ -63,7 +59,6 @@ def get_symbols():
 
 
 def get_klines(symbol, interval, limit=500):
-    """Binance'den kline verisi çek"""
     try:
         r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/klines",
                         params={"symbol": symbol, "interval": interval, "limit": limit},
@@ -74,76 +69,58 @@ def get_klines(symbol, interval, limit=500):
             "qav","trades","tbv","tqv","ignore"])
         for c in ["open","high","low","close","volume"]:
             df[c] = df[c].astype(float)
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
         return df
     except Exception:
         return None
 
 
 def detect_swings(df, length=10, use_body=False):
-    """
-    LuxAlgo swing detection mantığı:
-    - length periyodundaki highest/lowest'a göre swing noktaları bulur
-    """
     if df is None or len(df) < length * 3:
         return None, None
 
     highs = df["high"].values if not use_body else np.maximum(df["open"].values, df["close"].values)
     lows = df["low"].values if not use_body else np.minimum(df["open"].values, df["close"].values)
-
+    closes = df["close"].values
     n = len(df)
 
-    # Swing tespiti
     swing_tops = []
     swing_btms = []
-
-    os = 0  # overbought/oversold state
+    os = 0
 
     for i in range(length, n - length):
         upper = np.max(highs[i-length:i])
         lower = np.min(lows[i-length:i])
 
+        prev_os = os
         if highs[i] > upper:
             os = 0
         elif lows[i] < lower:
             os = 1
 
-        if os == 0 and (i == length or os_prev := 1):
-            # Yeni swing top
-            if i > 0 and (len(swing_tops) == 0 or i - swing_tops[-1][0] > length):
-                swing_tops.append((i, highs[i]))
-
-        if os == 1 and (i == length or os_prev := 0):
-            # Yeni swing bottom
-            if i > 0 and (len(swing_btms) == 0 or i - swing_btms[-1][0] > length):
-                swing_btms.append((i, lows[i]))
+        if os == 0 and prev_os == 1:
+            swing_tops.append((i, highs[i]))
+        if os == 1 and prev_os == 0:
+            swing_btms.append((i, lows[i]))
 
     return swing_tops, swing_btms
 
 
 def find_order_blocks(df, swing_tops, swing_btms, use_body=False):
-    """
-    Order Block tespiti:
-    - Bullish OB: Swing top kırıldığında önceki mumların min/max'ı
-    - Bearish OB: Swing bottom kırıldığında önceki mumların min/max'ı
-    """
     if df is None or len(df) < 20:
         return [], []
 
     highs = df["high"].values if not use_body else np.maximum(df["open"].values, df["close"].values)
     lows = df["low"].values if not use_body else np.minimum(df["open"].values, df["close"].values)
     closes = df["close"].values
-    opens = df["open"].values
 
     bullish_obs = []
     bearish_obs = []
 
-    # Bullish OB: Fiyat swing top'un üzerine çıktığında
+    # Bullish OB
     for idx, top_price in swing_tops:
         if idx >= len(df) - 1:
             continue
         if closes[idx + 1] > top_price:
-            # OB oluşumu: swing top'tan önceki minimum noktayı bul
             minima = highs[idx - 1]
             maxima = lows[idx - 1]
             loc = idx - 1
@@ -163,12 +140,11 @@ def find_order_blocks(df, swing_tops, swing_btms, use_body=False):
                 "break_price": None
             })
 
-    # Bearish OB: Fiyat swing bottom'un altına düştüğünde
+    # Bearish OB
     for idx, btm_price in swing_btms:
         if idx >= len(df) - 1:
             continue
         if closes[idx + 1] < btm_price:
-            # OB oluşumu
             maxima = lows[idx - 1]
             minima = highs[idx - 1]
             loc = idx - 1
@@ -192,9 +168,6 @@ def find_order_blocks(df, swing_tops, swing_btms, use_body=False):
 
 
 def update_breaker_status(df, bullish_obs, bearish_obs):
-    """
-    OB'lerin kırılıp kırılmadığını kontrol et → Breaker Block'a dönüştür
-    """
     if df is None or len(df) < 2:
         return bullish_obs, bearish_obs
 
@@ -203,7 +176,6 @@ def update_breaker_status(df, bullish_obs, bearish_obs):
     highs = df["high"].values
     lows = df["low"].values
 
-    # Bullish OB'ler: Low < OB.btm → breaker
     for ob in bullish_obs:
         if not ob["breaker"]:
             if np.min(lows[max(0, ob["loc"]):]) < ob["btm"]:
@@ -211,11 +183,9 @@ def update_breaker_status(df, bullish_obs, bearish_obs):
                 ob["break_loc"] = len(df) - 1
                 ob["break_price"] = float(lows[-1])
         else:
-            # Breaker sonrası fiyat OB top'un üzerine çıktıysa sil
             if closes[-1] > ob["top"]:
                 ob["active"] = False
 
-    # Bearish OB'ler: High > OB.top → breaker
     for ob in bearish_obs:
         if not ob["breaker"]:
             if np.max(highs[max(0, ob["loc"]):]) > ob["top"]:
@@ -223,11 +193,9 @@ def update_breaker_status(df, bullish_obs, bearish_obs):
                 ob["break_loc"] = len(df) - 1
                 ob["break_price"] = float(highs[-1])
         else:
-            # Breaker sonrası fiyat OB btm'nin altına düştüyse sil
             if closes[-1] < ob["btm"]:
                 ob["active"] = False
 
-    # Aktif olmayanları filtrele
     bullish_obs = [ob for ob in bullish_obs if ob.get("active", True)]
     bearish_obs = [ob for ob in bearish_obs if ob.get("active", True)]
 
@@ -235,7 +203,6 @@ def update_breaker_status(df, bullish_obs, bearish_obs):
 
 
 def calc_overlap(top1, btm1, top2, btm2):
-    """İki zone arasındaki overlap yüzdesini hesapla"""
     overlap_top = min(top1, top2)
     overlap_btm = max(btm1, btm2)
     overlap_size = max(0, overlap_top - overlap_btm)
@@ -250,11 +217,6 @@ def calc_overlap(top1, btm1, top2, btm2):
 
 
 def find_confluences(bullish_obs, bearish_obs, min_overlap_pct=30.0):
-    """
-    Confluence tespiti:
-    - Bull OB + Bear Breaker overlap
-    - Bear OB + Bull Breaker overlap
-    """
     bull_confluences = []
     bear_confluences = []
 
@@ -296,9 +258,6 @@ def find_confluences(bullish_obs, bearish_obs, min_overlap_pct=30.0):
 
 
 def check_breaks(df, bull_confluences, bear_confluences, min_break_pct=3.0):
-    """
-    Confluence zone'larının min %3 mum boyu ile kırılıp kırılmadığını kontrol et
-    """
     if df is None or len(df) < 1:
         return [], []
 
@@ -312,14 +271,13 @@ def check_breaks(df, bull_confluences, bear_confluences, min_break_pct=3.0):
     bull_breaks = []
     bear_breaks = []
 
-    # Bull Confluence: Aşağı kırılım = BEARISH signal
+    # Bull Confluence: Asagi kirilim = BEARISH signal
     for conf in bull_confluences:
         if not conf["broken"]:
             zone_height = conf["top"] - conf["btm"]
             if zone_height <= 0:
                 continue
 
-            # Min %3 kontrolü
             body_pct = (candle_body / zone_height) * 100
             range_pct = (candle_range / zone_height) * 100
 
@@ -329,7 +287,7 @@ def check_breaks(df, bull_confluences, bear_confluences, min_break_pct=3.0):
                 conf["break_price"] = low
                 bull_breaks.append(conf)
 
-    # Bear Confluence: Yukarı kırılım = BULLISH signal
+    # Bear Confluence: Yukari kirilim = BULLISH signal
     for conf in bear_confluences:
         if not conf["broken"]:
             zone_height = conf["top"] - conf["btm"]
@@ -349,7 +307,6 @@ def check_breaks(df, bull_confluences, bear_confluences, min_break_pct=3.0):
 
 
 def should_send(symbol, direction):
-    """Cooldown kontrolü"""
     key = f"{symbol}_{direction}"
     now = time.time()
     if now - last_signal.get(key, 0) < SIGNAL_COOLDOWN:
@@ -359,7 +316,6 @@ def should_send(symbol, direction):
 
 
 def send_telegram(text):
-    """Telegram mesajı gönder"""
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -372,8 +328,7 @@ def send_telegram(text):
         return False
 
 
-def format_message(symbol, direction, price, conf, ob_info):
-    """Telegram mesaj formatı"""
+def format_message(symbol, direction, price, conf):
     emoji = "🔴 OB+BEAR BREAKER CONFLUENCE SAT" if direction == "SAT" else "🟢 OB+BULL BREAKER CONFLUENCE AL"
     coin = symbol.replace("USDT", "/USDT")
     sep = "═" * 20
@@ -397,40 +352,28 @@ def format_message(symbol, direction, price, conf, ob_info):
 
 
 def check_ob_confluence(symbol):
-    """
-    Ana fonksiyon: Bir coin için OB & Breaker Confluence kontrolü yap
-    """
     df = get_klines(symbol, TIMEFRAME, limit=KLINES_LIMIT)
     if df is None or len(df) < SWING_LOOKBACK * 3:
         return None
 
-    # 1. Swing noktalarını tespit et
     swing_tops, swing_btms = detect_swings(df, SWING_LOOKBACK, USE_BODY)
     if not swing_tops or not swing_btms:
         return None
 
-    # 2. Order Block'ları bul
     bullish_obs, bearish_obs = find_order_blocks(df, swing_tops, swing_btms, USE_BODY)
     if not bullish_obs and not bearish_obs:
         return None
 
-    # 3. Breaker durumunu güncelle
     bullish_obs, bearish_obs = update_breaker_status(df, bullish_obs, bearish_obs)
-
-    # 4. Confluence'ları bul
     bull_confs, bear_confs = find_confluences(bullish_obs, bearish_obs, MIN_OVERLAP_PCT)
-
-    # 5. Kırılım kontrolü
     bull_breaks, bear_breaks = check_breaks(df, bull_confs, bear_confs, MIN_BREAK_PCT)
 
     close = float(df["close"].iloc[-1])
-
-    # Sinyal üret
     signals = []
 
     for conf in bull_breaks:
         if should_send(symbol, "SAT"):
-            msg = format_message(symbol, "SAT", close, conf, bullish_obs)
+            msg = format_message(symbol, "SAT", close, conf)
             signals.append({
                 "direction": "SAT",
                 "symbol": symbol,
@@ -441,7 +384,7 @@ def check_ob_confluence(symbol):
 
     for conf in bear_breaks:
         if should_send(symbol, "AL"):
-            msg = format_message(symbol, "AL", close, conf, bearish_obs)
+            msg = format_message(symbol, "AL", close, conf)
             signals.append({
                 "direction": "AL",
                 "symbol": symbol,
@@ -454,7 +397,6 @@ def check_ob_confluence(symbol):
 
 
 def run_scan():
-    """Tüm coinleri tara"""
     symbols = get_symbols()
     log.info(f"OB & BREAKER CONFLUENCE TARAMA basladi | Coin: {len(symbols)} | TF: {TIMEFRAME} | MinBreak: %{MIN_BREAK_PCT}")
     found = 0
@@ -499,8 +441,8 @@ def main():
         f"⏰ Tarama Araligi: {SCAN_INTERVAL}sn\n"
         f"🪙 Max Coin: {MAX_COINS}\n"
         f"\n"
-        f"🔴 SAT: Bull OB + Bear Breaker confluence aşağı kırılır\n"
-        f"🟢 AL: Bear OB + Bull Breaker confluence yukarı kırılır"
+        f"🔴 SAT: Bull OB + Bear Breaker confluence asagi kirilir\n"
+        f"🟢 AL: Bear OB + Bull Breaker confluence yukari kirilir"
     )
 
     while True:
