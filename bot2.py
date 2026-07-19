@@ -7,8 +7,9 @@ TREND KIRILIM BOT (15dk) - LuxAlgo "Trendlines with Breaks" portu
 - AL  = yukari kirilim (asagi yonlu trendi yukari kirdi)
 - SAT = asagi kirilim (yukari yonlu trendi asagi kirdi)
 """
-import os, time, logging
+import os, time, logging, threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import pandas as pd
 import numpy as np
@@ -31,12 +32,33 @@ TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 LENGTH = int(os.getenv("LENGTH", "14"))          # Pine: 'Swing Detection Lookback'
 SLOPE_MULT = float(os.getenv("SLOPE_MULT", "1.0"))  # Pine: 'Slope'
 MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "5.0"))  # min kirilim uzakligi %
-RECENT_BARS = int(os.getenv("RECENT_BARS", "8"))  # kirilim en fazla kac bar once olmus olabilir (8x15dk=2sa)
+RECENT_BARS = int(os.getenv("RECENT_BARS", "3"))  # kirilim en fazla kac bar once olmus olabilir (3x15dk=45dk)
 KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "200"))
+SCAN_WORKERS = int(os.getenv("SCAN_WORKERS", "10"))  # ayni anda kac coin paralel taransin
+# Binance Futures IP limiti: 2400 request-weight/dk. klines(limit=200) = weight 2.
+# REQUESTS_PER_SEC=10 -> 20 weight/sn -> 1200 weight/dk (guvenli marj, limitin yarisi)
+REQUESTS_PER_SEC = float(os.getenv("REQUESTS_PER_SEC", "10"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=SCAN_WORKERS, pool_maxsize=SCAN_WORKERS * 2)
+SESSION.mount("https://", _adapter)
 last_signal = {}
+
+# ---- Binance rate limit korumasi: thread'ler arasi paylasilan basit token-bucket ----
+_rate_lock = threading.Lock()
+_next_slot = [0.0]
+
+
+def _rate_limit_wait():
+    """Toplam istek hizini REQUESTS_PER_SEC ile sinirlar (thread sayisindan bagimsiz)."""
+    with _rate_lock:
+        now = time.time()
+        wait = _next_slot[0] - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        _next_slot[0] = max(now, _next_slot[0]) + 1.0 / REQUESTS_PER_SEC
 
 
 def get_symbols():
@@ -52,10 +74,14 @@ def get_symbols():
 
 
 def get_klines(symbol, interval, limit=500):
+    _rate_limit_wait()
     try:
         r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/klines",
                         params={"symbol": symbol, "interval": interval, "limit": limit},
                         timeout=10)
+        if r.status_code == 429 or r.status_code == 418:
+            log.warning(f"Rate limit uyarisi ({r.status_code}) {symbol} - bu tur atlaniyor")
+            return None
         raw = r.json()
         df = pd.DataFrame(raw, columns=[
             "open_time","open","high","low","close","volume","close_time",
@@ -231,31 +257,46 @@ def format_message(symbol, sig):
     return "\n".join(lines)
 
 
+def _scan_one(symbol):
+    """Tek bir coin icin veri cek + sinyal kontrol et. Thread havuzunda calisir."""
+    try:
+        df = get_klines(symbol, TIMEFRAME, limit=KLINES_LIMIT)
+        sig = check_trend_break(df)
+        return symbol, sig
+    except Exception as e:
+        log.error(f"{symbol} hata: {e}")
+        return symbol, None
+
+
 def run_scan():
     symbols = get_symbols()
-    log.info(f"TREND KIRILIM TARAMA basladi Coin:{len(symbols)}")
+    log.info(f"TREND KIRILIM TARAMA basladi Coin:{len(symbols)} (paralel: {SCAN_WORKERS})")
     found = 0
+    scanned = 0
+    t0 = time.time()
 
-    for idx, symbol in enumerate(symbols):
-        try:
-            df = get_klines(symbol, TIMEFRAME, limit=KLINES_LIMIT)
-            sig = check_trend_break(df)
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        futures = {pool.submit(_scan_one, sym): sym for sym in symbols}
+
+        for future in as_completed(futures):
+            symbol = futures[future]
+            scanned += 1
+            try:
+                _, sig = future.result()
+            except Exception as e:
+                log.error(f"{symbol} beklenmeyen hata: {e}")
+                continue
 
             if sig and should_send(symbol, sig["direction"]):
                 if send_telegram(format_message(symbol, sig)):
                     found += 1
                     log.info(f"SINYAL {symbol} {sig['direction']} Fiyat:{sig['price']} Kirilim:%{sig['break_pct']}")
 
-            time.sleep(0.2)
+            if scanned % 50 == 0:
+                log.info(f"[{scanned}/{len(symbols)}] tarandi {found} sinyal")
 
-        except Exception as e:
-            log.error(f"{symbol} hata: {e}")
-            continue
-
-        if (idx + 1) % 50 == 0:
-            log.info(f"[{idx+1}/{len(symbols)}] tarandi {found} sinyal")
-
-    log.info(f"Tarama tamamlandi {found} sinyal gonderildi")
+    elapsed = time.time() - t0
+    log.info(f"Tarama tamamlandi {found} sinyal gonderildi ({elapsed:.1f}sn)")
 
 
 def main():
@@ -270,7 +311,8 @@ def main():
         f"Zaman Dilimi: {TIMEFRAME}\n"
         f"Swing Lookback: {LENGTH} | Slope Carpani: {SLOPE_MULT}\n"
         f"Min Kirilim: %{MIN_BREAK_PCT}\n"
-        f"Tarama Araligi: {SCAN_INTERVAL}sn | Coin: {MAX_COINS}"
+        f"Tarama Araligi: {SCAN_INTERVAL}sn | Coin: {MAX_COINS} | Paralel: {SCAN_WORKERS}\n"
+        f"Rate Limit: {REQUESTS_PER_SEC} istek/sn (Binance IP limiti icin guvenli)"
     )
 
     while True:
