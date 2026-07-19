@@ -31,6 +31,7 @@ TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 LENGTH = int(os.getenv("LENGTH", "14"))          # Pine: 'Swing Detection Lookback'
 SLOPE_MULT = float(os.getenv("SLOPE_MULT", "1.0"))  # Pine: 'Slope'
 MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "5.0"))  # min kirilim uzakligi %
+RECENT_BARS = int(os.getenv("RECENT_BARS", "8"))  # kirilim en fazla kac bar once olmus olabilir (8x15dk=2sa)
 KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "200"))
 
 BINANCE_BASE = "https://fapi.binance.com"
@@ -99,9 +100,10 @@ def _find_pivots(high, low, length):
 
 
 def check_trend_break(df):
-    """15dk CANLI mum uzerinden TAZE trend kirilim sinyali ara (Pine 'Trendlines with Breaks' portu).
-    Sadece kirilimin OLUSTUGU barda (0->1 gecisi) sinyal uretir - suregelen/eski kirilim durumlarini
-    tekrar tekrar sinyal olarak vermez."""
+    """15dk CANLI mum uzerinden trend kirilim sinyali ara (Pine 'Trendlines with Breaks' portu).
+    Kirilim (upos/dnos 0->1 gecisi) son RECENT_BARS bar icinde olmus olmali VE fiyat su an
+    cizgiden en az MIN_BREAK_PCT uzakta olmali. Bu ikisi ayni barda olmak zorunda degil -
+    kirilim once kucuk marjla baslar, %5'e birkac barda ulasabilir."""
     min_len = LENGTH * 3 + 5
     if df is None or len(df) < min_len:
         return None
@@ -121,10 +123,10 @@ def check_trend_break(df):
     upos = 0
     dnos = 0
 
-    fresh_up = False    # son barda TAM O ANDA olusan yukari kirilim (upos 0->1 gecisi)
-    fresh_dn = False    # son barda TAM O ANDA olusan asagi kirilim (dnos 0->1 gecisi)
-    break_line_up = np.nan
-    break_line_dn = np.nan
+    last_up_transition = None   # upos'un en son 0->1 oldugu bar index'i
+    last_dn_transition = None   # dnos'un en son 0->1 oldugu bar index'i
+    line_up_final = np.nan
+    line_dn_final = np.nan
 
     for i in range(n):
         is_ph = not np.isnan(ph_signal[i])
@@ -146,35 +148,44 @@ def check_trend_break(df):
         upos = 0 if is_ph else (1 if close[i] > line_up else upos)
         dnos = 0 if is_pl else (1 if close[i] < line_dn else dnos)
 
+        if prev_upos == 0 and upos == 1:
+            last_up_transition = i
+        if prev_dnos == 0 and dnos == 1:
+            last_dn_transition = i
+
         if i == n - 1:
-            # SADECE bu barda 0->1 gecisi oldiyse "taze kirilim" say
-            fresh_up = (prev_upos == 0 and upos == 1)
-            fresh_dn = (prev_dnos == 0 and dnos == 1)
-            break_line_up = line_up
-            break_line_dn = line_dn
+            line_up_final = line_up
+            line_dn_final = line_dn
 
     price = float(close[-1])
+    last_idx = n - 1
 
-    # AL: TAM BU BARDA taze yukari kirilim olustu VE cizgiden en az MIN_BREAK_PCT uzakta
-    if fresh_up and not np.isnan(break_line_up) and break_line_up > 0:
-        break_pct = (price - break_line_up) / break_line_up * 100
+    # AL: son RECENT_BARS bar icinde yukari kirilim oldu VE su an cizgiden en az MIN_BREAK_PCT uzakta
+    if (last_up_transition is not None
+            and (last_idx - last_up_transition) <= RECENT_BARS
+            and not np.isnan(line_up_final) and line_up_final > 0):
+        break_pct = (price - line_up_final) / line_up_final * 100
         if break_pct >= MIN_BREAK_PCT:
             return {
                 "direction": "AL",
                 "price": round(price, 6),
                 "break_pct": round(break_pct, 2),
-                "trend_line": round(float(break_line_up), 6),
+                "trend_line": round(float(line_up_final), 6),
+                "bars_ago": last_idx - last_up_transition,
             }
 
-    # SAT: TAM BU BARDA taze asagi kirilim olustu VE cizgiden en az MIN_BREAK_PCT uzakta
-    if fresh_dn and not np.isnan(break_line_dn) and break_line_dn > 0:
-        break_pct = (break_line_dn - price) / break_line_dn * 100
+    # SAT: son RECENT_BARS bar icinde asagi kirilim oldu VE su an cizgiden en az MIN_BREAK_PCT uzakta
+    if (last_dn_transition is not None
+            and (last_idx - last_dn_transition) <= RECENT_BARS
+            and not np.isnan(line_dn_final) and line_dn_final > 0):
+        break_pct = (line_dn_final - price) / line_dn_final * 100
         if break_pct >= MIN_BREAK_PCT:
             return {
                 "direction": "SAT",
                 "price": round(price, 6),
                 "break_pct": round(break_pct, 2),
-                "trend_line": round(float(break_line_dn), 6),
+                "trend_line": round(float(line_dn_final), 6),
+                "bars_ago": last_idx - last_dn_transition,
             }
 
     return None
@@ -212,6 +223,7 @@ def format_message(symbol, sig):
         f"Fiyat: {sig['price']}",
         f"Trend Cizgisi: {sig['trend_line']}",
         f"Kirilim: %{sig['break_pct']}",
+        f"Kirilim Zamani: {sig['bars_ago']} bar once",
         sep,
         f"{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
