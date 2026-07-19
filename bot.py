@@ -40,7 +40,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))  # 5 dakika
 TIMEFRAME = os.environ.get("SCAN_TIMEFRAME", "1h")  # 1 saat
-MAX_COINS = int(os.environ.get("MAX_COINS", "200"))
+MAX_COINS = int(os.environ.get("MAX_COINS", "600"))
 MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "1000000"))
 
 # Strateji parametreleri
