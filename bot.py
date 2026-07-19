@@ -7,11 +7,16 @@ kirmizi mum asagi kesiste SAT sinyali uretir.
 Zaman dilimi: 1 saat
 Tarama araligi: 5 dakika (ayarlanabilir)
 Borsa: Binance Futures (USDT-M Perpetual)
+
+Tarama artik PARALEL (ThreadPoolExecutor) + Binance IP limitine (2400 weight/dk)
+karsi thread sayisindan bagimsiz calisan bir rate limiter ile korunuyor.
 """
 import os
 import time
 import logging
+import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
@@ -48,12 +53,50 @@ BODY_PCT_MIN = float(os.environ.get("BODY_PCT_MIN", "4.0"))   # Kesisim mumunun 
 MAX_LINE_GAP_PCT = float(os.environ.get("MAX_LINE_GAP_PCT", "1.0"))  # SMA100 ile Span B arasi max mesafe %
 SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "3600"))  # 1 saat bekleme
 
+# Paralel tarama + Binance IP limit korumasi
+SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "10"))          # ayni anda kac coin paralel taransin
+REQUESTS_PER_SEC = float(os.environ.get("REQUESTS_PER_SEC", "10"))  # Binance'e saniyede max istek (thread sayisindan bagimsiz)
+TELEGRAM_MSGS_PER_SEC = float(os.environ.get("TELEGRAM_MSGS_PER_SEC", "1.0"))  # Telegram flood korumasi
+
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "MajorKirilimBot/1.0"})
+_adapter = requests.adapters.HTTPAdapter(pool_connections=SCAN_WORKERS, pool_maxsize=SCAN_WORKERS * 2)
+SESSION.mount("https://", _adapter)
 
 # Gonderilen sinyalleri takip et
 sent_signals: dict = {}
+
+# ---- Binance rate limit korumasi: thread'ler arasi paylasilan token-bucket ----
+_rate_lock = threading.Lock()
+_next_slot = [0.0]
+
+
+def _rate_limit_wait():
+    """Toplam Binance istek hizini REQUESTS_PER_SEC ile sinirlar (thread sayisindan bagimsiz)."""
+    with _rate_lock:
+        now = time.time()
+        wait = _next_slot[0] - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        _next_slot[0] = max(now, _next_slot[0]) + 1.0 / REQUESTS_PER_SEC
+
+
+# ---- Telegram flood korumasi: ayni sekilde thread'ler arasi paylasilan pacing ----
+_tg_lock = threading.Lock()
+_tg_next_slot = [0.0]
+
+
+def _telegram_rate_wait():
+    with _tg_lock:
+        now = time.time()
+        wait = _tg_next_slot[0] - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.time()
+        _tg_next_slot[0] = max(now, _tg_next_slot[0]) + 1.0 / TELEGRAM_MSGS_PER_SEC
+
 
 # ============================================================
 # TEKNIK GOSTERGELER (Pine Script ile birebir)
@@ -103,12 +146,16 @@ def get_symbols(min_volume: float = 0) -> list:
 
 
 def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
+    _rate_limit_wait()
     try:
         r = SESSION.get(
             f"{BINANCE_BASE}/fapi/v1/klines",
             params={"symbol": symbol, "interval": interval, "limit": limit},
             timeout=15, verify=False
         )
+        if r.status_code == 429 or r.status_code == 418:
+            log.warning(f"Rate limit uyarisi ({r.status_code}) {symbol} - bu tur atlaniyor")
+            return None
         if r.status_code != 200:
             return None
         data = r.json()
@@ -239,6 +286,7 @@ def send_telegram(message: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram token veya chat_id eksik!")
         return False
+    _telegram_rate_wait()
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -286,10 +334,23 @@ def should_send(symbol: str, sig_type: str) -> bool:
     return True
 
 # ============================================================
-# ANA TARAMA DONGUSU
+# ANA TARAMA DONGUSU (PARALEL)
 # ============================================================
+def _scan_one(coin):
+    """Tek bir coin icin veri cek + sinyal kontrol et. Thread havuzunda calisir."""
+    symbol = coin["symbol"]
+    try:
+        limit = max(MAJOR_LEN, SPANB_LEN) + 20
+        df = get_klines(symbol, TIMEFRAME, limit=limit)
+        sigs = check_signal(df, symbol)
+        return symbol, sigs
+    except Exception as e:
+        log.error(f"{symbol} hata: {e}")
+        return symbol, []
+
+
 def run_scan():
-    log.info(f"Tarama basladi TF:{TIMEFRAME} GovdeMin:%{BODY_PCT_MIN} Max:{MAX_COINS}")
+    log.info(f"Tarama basladi TF:{TIMEFRAME} GovdeMin:%{BODY_PCT_MIN} Max:{MAX_COINS} Paralel:{SCAN_WORKERS}")
 
     symbols = get_symbols(min_volume=MIN_VOLUME)
     if not symbols:
@@ -299,13 +360,20 @@ def run_scan():
     symbols = symbols[:MAX_COINS]
     total = len(symbols)
     found = 0
+    scanned = 0
+    t0 = time.time()
 
-    for idx, coin in enumerate(symbols):
-        symbol = coin["symbol"]
-        try:
-            limit = max(MAJOR_LEN, SPANB_LEN) + 20
-            df = get_klines(symbol, TIMEFRAME, limit=limit)
-            sigs = check_signal(df, symbol)
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        futures = {pool.submit(_scan_one, coin): coin["symbol"] for coin in symbols}
+
+        for future in as_completed(futures):
+            symbol = futures[future]
+            scanned += 1
+            try:
+                _, sigs = future.result()
+            except Exception as e:
+                log.error(f"{symbol} beklenmeyen hata: {e}")
+                continue
 
             for sig in sigs:
                 if should_send(symbol, sig["type"]):
@@ -313,18 +381,12 @@ def run_scan():
                     if send_telegram(msg):
                         log.info(f"OK {symbol} {sig['type']} govde %{sig['govde_yuzde']}")
                         found += 1
-                    time.sleep(0.3)
 
-            time.sleep(0.1)
+            if scanned % 50 == 0:
+                log.info(f"[{scanned}/{total}] tarandi {found} sinyal")
 
-        except Exception as e:
-            log.error(f"{symbol} hata: {e}")
-            continue
-
-        if (idx + 1) % 50 == 0:
-            log.info(f"[{idx+1}/{total}] tarandi {found} sinyal")
-
-    log.info(f"Tarama tamamlandi {found} sinyal gonderildi")
+    elapsed = time.time() - t0
+    log.info(f"Tarama tamamlandi {found} sinyal gonderildi ({elapsed:.1f}sn)")
 
 
 def main():
@@ -334,6 +396,7 @@ def main():
     log.info(f"  Zaman    : {TIMEFRAME}")
     log.info(f"  Aralik   : her {SCAN_INTERVAL} saniye")
     log.info(f"  Max coin : {MAX_COINS}")
+    log.info(f"  Paralel  : {SCAN_WORKERS} worker, {REQUESTS_PER_SEC} istek/sn")
     log.info("=" * 55)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -345,7 +408,7 @@ def main():
         f"Strateji: SMA{MAJOR_LEN} kesisim + govde >= %{BODY_PCT_MIN}\n"
         f"Zaman dilimi: {TIMEFRAME}\n"
         f"Tarama araligi: her {SCAN_INTERVAL//60} dakika\n"
-        f"Max coin: {MAX_COINS}\n"
+        f"Max coin: {MAX_COINS} | Paralel: {SCAN_WORKERS}\n"
         f"{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
     )
 
