@@ -2,8 +2,8 @@
 """
 MAJOR ZONE BREAKOUT SCANNER BOT - PARALEL TARAMA
 - Binance Futures USDT ciftlerini PARALEL tarar (ThreadPool)
-- 500 mum geriye bakarak major bolgeyi bulur (histogram yontemi)
-- Temas sayisi >= 70 olan bolgeleri "GUCCLU MAJOR" olarak isaretler
+- 1000 mum geriye bakarak major bolgeyi bulur (histogram yontemi)
+- Temas sayisi >= 20 olan bolgeleri "GUCCLU MAJOR" olarak isaretler
 - Bu bolge min %3 mum boyu ile kirildiginda AL/SAT sinyali uretir
 - Hacim ve RSI onayi ile false signal azaltir
 """
@@ -30,16 +30,16 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "500"))
+KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "1000"))
 
 # PARALEL TARAMA AYARLARI
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 
 # MAJOR ZONE STRATEJI AYARLARI
-MIN_TOUCHES = int(os.getenv("MIN_TOUCHES", "70"))
-MAJOR_BINS = int(os.getenv("MAJOR_BINS", "10"))
-ZONE_LOOKBACK = int(os.getenv("ZONE_LOOKBACK", "500"))
+MIN_TOUCHES = int(os.getenv("MIN_TOUCHES", "20"))
+MAJOR_BINS = int(os.getenv("MAJOR_BINS", "50"))
+ZONE_LOOKBACK = int(os.getenv("ZONE_LOOKBACK", "1000"))
 MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "3.0"))
 VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "1.2"))
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
@@ -97,7 +97,7 @@ def calc_rsi(series, length=14):
     return 100 - (100 / (1 + rs))
 
 
-def find_major_zone(df, bins=10, lookback=500):
+def find_major_zone(df, bins=50, lookback=1000):
     """Histogram yontemi ile major bolge bulur"""
     if df is None or len(df) < lookback:
         return None, 0
@@ -116,6 +116,7 @@ def find_major_zone(df, bins=10, lookback=500):
 
     step = price_range / bins
 
+    # Histogram olustur
     bin_counts = np.zeros(bins, dtype=int)
     for p in closes:
         idx = min(bins - 1, max(0, int((p - auto_lowest) / step)))
@@ -126,10 +127,18 @@ def find_major_zone(df, bins=10, lookback=500):
     major_top = auto_lowest + step * (max_bin + 1)
     major_btm = auto_lowest + step * max_bin
 
+    # Temas sayisi - high/low zone sinirina dokunuyor mu (dar bant)
+    touch_margin = step * 0.5  # Kova yarisini margin olarak al
     touches = 0
     for i in range(len(df_hist)):
-        if (highs[i] >= major_btm and highs[i] <= major_top) or \
-           (lows[i] >= major_btm and lows[i] <= major_top):
+        # High ust sinira yakin mi
+        high_near_top = abs(highs[i] - major_top) <= touch_margin
+        # Low alt sinira yakin mi  
+        low_near_btm = abs(lows[i] - major_btm) <= touch_margin
+        # High/low zone icinde mi
+        in_zone = (highs[i] >= major_btm and highs[i] <= major_top) or (lows[i] >= major_btm and lows[i] <= major_top)
+
+        if high_near_top or low_near_btm or in_zone:
             touches += 1
 
     return {
@@ -237,13 +246,15 @@ def format_message(symbol, direction, details):
     coin = symbol.replace("USDT", "/USDT")
     sep = "═" * 22
 
+    zone_height_pct = ((details["zone_top"] - details["zone_btm"]) / details["zone_btm"]) * 100
+
     lines = [
         f"{emoji}",
         sep,
         f"💱 Coin: {coin}",
         f"💰 Fiyat: {details['price']:.6f}",
         f"📍 Major Zone: {details['zone_btm']:.6f} - {details['zone_top']:.6f}",
-        f"📊 Zone Yüksekliği: %{details['zone_height_pct']:.2f}",
+        f"📊 Zone Yüksekliği: %{zone_height_pct:.2f}",
         f"👆 Temas Sayısı: {details['touches']} kez",
         f"📈 Break Mum Boyu: %{details['candle_body_pct']:.1f}",
         f"📊 Hacim: {details['vol_ratio']:.2f}x (min {VOL_MULTIPLIER}x)",
@@ -260,7 +271,7 @@ def analyze_single_coin(symbol):
     try:
         df = get_klines(symbol, TIMEFRAME, limit=KLINES_LIMIT)
         if df is None or len(df) < ZONE_LOOKBACK:
-            return None, {"symbol": symbol, "status": "no_data"}
+            return None, {"symbol": symbol, "status": "no_data", "mum": len(df) if df is not None else 0}
 
         major_zone, touches = find_major_zone(df, MAJOR_BINS, ZONE_LOOKBACK)
 
@@ -275,7 +286,7 @@ def analyze_single_coin(symbol):
         )
 
         if not is_break or direction is None:
-            return None, {"symbol": symbol, "status": "no_break", "touches": touches}
+            return None, {"symbol": symbol, "status": "no_break", "touches": touches, "zone": f"{major_zone['btm']:.2f}-{major_zone['top']:.2f}"}
 
         if not should_send(symbol, direction):
             return None, {"symbol": symbol, "status": "cooldown", "touches": touches}
@@ -300,13 +311,13 @@ def run_scan_parallel():
     """PARALEL TARAMA - ThreadPool ile"""
     symbols = get_symbols()
     total = len(symbols)
-    log.info(f"MAJOR ZONE PARALEL TARAMA | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | MinTouches: {MIN_TOUCHES}")
+    log.info(f"MAJOR ZONE PARALEL TARAMA | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | MinTouches: {MIN_TOUCHES} | Bins: {MAJOR_BINS}")
 
     stats = {
         "total": total,
         "processed": 0,
         "has_major": 0,
-        "major_70plus": 0,
+        "major_ok": 0,
         "break_signals": 0,
         "signals_sent": 0,
         "errors": 0,
@@ -332,12 +343,12 @@ def run_scan_parallel():
 
                 if info["status"] == "signal":
                     stats["break_signals"] += 1
-                    stats["major_70plus"] += 1
+                    stats["major_ok"] += 1
                     signals_found.append(signal)
                 elif info["status"] == "weak_major":
                     stats["has_major"] += 1
                 elif info["status"] == "no_break":
-                    stats["major_70plus"] += 1
+                    stats["major_ok"] += 1
                 elif info["status"] == "no_data":
                     stats["no_data"] += 1
                 elif info["status"] == "error":
@@ -348,7 +359,7 @@ def run_scan_parallel():
                 stats["errors"] += 1
 
             if completed % 100 == 0 or completed == total:
-                log.info(f"[{completed}/{total}] | Sinyal: {stats['break_signals']} | 70+Major: {stats['major_70plus']} | Hata: {stats['errors']}")
+                log.info(f"[{completed}/{total}] | Sinyal: {stats['break_signals']} | MajorOK: {stats['major_ok']} | Weak: {stats['has_major']} | Hata: {stats['errors']}")
 
     for sig in signals_found:
         try:
@@ -375,7 +386,8 @@ def main():
         f"🎯 MAJOR ZONE BREAKOUT BOT BASLADI\n"
         f"═" * 28 + "\n"
         f"💱 TF: {TIMEFRAME} | Lookback: {ZONE_LOOKBACK}\n"
-        f"👆 Min Temas: {MIN_TOUCHES} | Min Break: %{MIN_BREAK_PCT}\n"
+        f"👆 Min Temas: {MIN_TOUCHES} | Bins: {MAJOR_BINS}\n"
+        f"📈 Min Break Mum: %{MIN_BREAK_PCT}\n"
         f"📊 Hacim: {VOL_MULTIPLIER}x | RSI: {RSI_LEVEL}\n"
         f"⚡ Workers: {MAX_WORKERS} (PARALEL)\n"
         f"⏰ Interval: {SCAN_INTERVAL}sn | Coins: {MAX_COINS}\n"
