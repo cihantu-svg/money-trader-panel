@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-MAJOR ZONE BREAKOUT SCANNER BOT - PARALEL TARAMA
+MAJOR LEVEL VOLUME SPIKE SCANNER BOT - PARALEL TARAMA
 - Binance Futures USDT ciftlerini PARALEL tarar (ThreadPool)
-- 1000 mum geriye bakarak major bolgeyi bulur (histogram yontemi)
-- Temas sayisi >= 20 olan bolgeleri "GUCCLU MAJOR" olarak isaretler
-- Bu bolge min %3 mum boyu ile kirildiginda AL/SAT sinyali uretir
-- Hacim ve RSI onayi ile false signal azaltir
+- 1H grafikte SMA100 (Major Level / Turuncu Cizgi) yakininda
+- Hacim >= 5x ortalama olan coinleri bulur
+- Sadece AL sinyali uretir
 """
 import os, time, logging
 from datetime import datetime
@@ -22,28 +21,24 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════
-# AYARLAR (Mevcut sistemle uyumlu - .env'den okunur)
+# AYARLAR (.env'den okunur)
 # ═══════════════════════════════════════════════════════════════
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
-SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "1000"))
+SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "7200"))
+TIMEFRAME = os.getenv("TIMEFRAME", "1h")
+KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "200"))
 
-# PARALEL TARAMA AYARLARI
+# PARALEL TARAMA
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 
-# MAJOR ZONE STRATEJI AYARLARI
-MIN_TOUCHES = int(os.getenv("MIN_TOUCHES", "20"))
-MAJOR_BINS = int(os.getenv("MAJOR_BINS", "50"))
-ZONE_LOOKBACK = int(os.getenv("ZONE_LOOKBACK", "1000"))
-MIN_BREAK_PCT = float(os.getenv("MIN_BREAK_PCT", "3.0"))
-VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "1.2"))
-RSI_LEN = int(os.getenv("RSI_LEN", "14"))
-RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50.0"))
+# STRATEJI AYARLARI
+MAJOR_LINE_LEN = int(os.getenv("MAJOR_LINE_LEN", "100"))
+VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "5.0"))
+MIN_DISTANCE_PCT = float(os.getenv("MIN_DISTANCE_PCT", "2.0"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 last_signal = {}
@@ -53,7 +48,6 @@ last_signal = {}
 # ═══════════════════════════════════════════════════════════════
 
 def get_symbols():
-    """Binance Futures USDT ciftlerini cek"""
     try:
         session = requests.Session()
         r = session.get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo", timeout=10)
@@ -66,8 +60,7 @@ def get_symbols():
         return []
 
 
-def get_klines(symbol, interval, limit=500):
-    """Binance'den kline verisi cek - her thread kendi session'ini kullanir"""
+def get_klines(symbol, interval, limit=200):
     try:
         session = requests.Session()
         r = session.get(
@@ -86,148 +79,65 @@ def get_klines(symbol, interval, limit=500):
         return None
 
 
-def calc_rsi(series, length=14):
-    """RSI hesapla"""
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/length, min_periods=length, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+def check_signal(symbol):
+    """Tek coini kontrol et - ThreadPool icin"""
+    try:
+        df = get_klines(symbol, TIMEFRAME, limit=KLINES_LIMIT)
+        if df is None or len(df) < MAJOR_LINE_LEN + 5:
+            return None, {"symbol": symbol, "status": "no_data"}
 
+        # SMA100 hesapla (Major Level / Turuncu Cizgi)
+        sma100 = df["close"].rolling(MAJOR_LINE_LEN).mean().iloc[-1]
+        if pd.isna(sma100):
+            return None, {"symbol": symbol, "status": "no_sma"}
 
-def find_major_zone(df, bins=50, lookback=1000):
-    """Histogram yontemi ile major bolge bulur"""
-    if df is None or len(df) < lookback:
-        return None, 0
+        # Son mum verileri
+        close = float(df["close"].iloc[-1])
+        high = float(df["high"].iloc[-1])
+        low = float(df["low"].iloc[-1])
+        volume = float(df["volume"].iloc[-1])
 
-    df_hist = df.iloc[-lookback:].copy()
-    highs = df_hist["high"].values
-    lows = df_hist["low"].values
-    closes = df_hist["close"].values
+        # Fiyat SMA100'e %2 yakınında mı?
+        sma_upper = sma100 * (1 + MIN_DISTANCE_PCT / 100)
+        sma_lower = sma100 * (1 - MIN_DISTANCE_PCT / 100)
 
-    auto_highest = np.max(highs)
-    auto_lowest = np.min(lows)
-    price_range = auto_highest - auto_lowest
+        near_sma = (low <= sma_upper and high >= sma_lower)
 
-    if price_range <= 0 or bins <= 0:
-        return None, 0
+        if not near_sma:
+            return None, {"symbol": symbol, "status": "far_from_sma", "dist_pct": abs(close - sma100) / sma100 * 100}
 
-    step = price_range / bins
+        # Hacim >= 5x ortalama?
+        vol_sma20 = df["volume"].rolling(20).mean().iloc[-1]
+        vol_ratio = volume / vol_sma20 if vol_sma20 > 0 else 1.0
 
-    # Histogram olustur
-    bin_counts = np.zeros(bins, dtype=int)
-    for p in closes:
-        idx = min(bins - 1, max(0, int((p - auto_lowest) / step)))
-        bin_counts[idx] += 1
+        if vol_ratio < VOL_MULTIPLIER:
+            return None, {"symbol": symbol, "status": "low_volume", "vol_ratio": vol_ratio}
 
-    max_bin = int(np.argmax(bin_counts))
+        # Cooldown kontrolu
+        key = f"{symbol}_AL"
+        now = time.time()
+        if now - last_signal.get(key, 0) < SIGNAL_COOLDOWN:
+            return None, {"symbol": symbol, "status": "cooldown"}
 
-    major_top = auto_lowest + step * (max_bin + 1)
-    major_btm = auto_lowest + step * max_bin
+        last_signal[key] = now
 
-    # Temas sayisi - high/low zone sinirina dokunuyor mu (dar bant)
-    touch_margin = step * 0.5  # Kova yarisini margin olarak al
-    touches = 0
-    for i in range(len(df_hist)):
-        # High ust sinira yakin mi
-        high_near_top = abs(highs[i] - major_top) <= touch_margin
-        # Low alt sinira yakin mi  
-        low_near_btm = abs(lows[i] - major_btm) <= touch_margin
-        # High/low zone icinde mi
-        in_zone = (highs[i] >= major_btm and highs[i] <= major_top) or (lows[i] >= major_btm and lows[i] <= major_top)
+        # Sinyal olustur
+        details = {
+            "price": close,
+            "sma100": float(sma100),
+            "dist_pct": (close - sma100) / sma100 * 100,
+            "vol_ratio": vol_ratio,
+            "high": high,
+            "low": low
+        }
 
-        if high_near_top or low_near_btm or in_zone:
-            touches += 1
+        return details, {"symbol": symbol, "status": "signal", "vol_ratio": vol_ratio}
 
-    return {
-        "top": float(major_top),
-        "btm": float(major_btm),
-        "touches": touches,
-        "highest": float(auto_highest),
-        "lowest": float(auto_lowest),
-        "center": float((major_top + major_btm) / 2)
-    }, touches
-
-
-def check_major_break(df, major_zone, min_break_pct=3.0, vol_mult=1.2, rsi_len=14, rsi_level=50):
-    """Major bolgenin kirilip kirilmadigini kontrol et"""
-    if df is None or len(df) < 2 or major_zone is None:
-        return False, None, {}
-
-    if major_zone["touches"] < MIN_TOUCHES:
-        return False, None, {}
-
-    high = float(df["high"].iloc[-1])
-    low = float(df["low"].iloc[-1])
-    open_ = float(df["open"].iloc[-1])
-    close = float(df["close"].iloc[-1])
-    volume = float(df["volume"].iloc[-1])
-
-    zone_top = major_zone["top"]
-    zone_btm = major_zone["btm"]
-    zone_height = zone_top - zone_btm
-
-    if zone_height <= 0:
-        return False, None, {}
-
-    candle_body = abs(close - open_)
-    candle_range = high - low
-    body_pct = (candle_body / zone_height) * 100
-    range_pct = (candle_range / zone_height) * 100
-
-    vol_sma20 = df["volume"].rolling(20).mean().iloc[-1]
-    vol_ratio = volume / vol_sma20 if vol_sma20 > 0 else 1.0
-    vol_ok = vol_ratio >= vol_mult
-
-    rsi_series = calc_rsi(df["close"], rsi_len)
-    rsi_now = float(rsi_series.iloc[-1]) if not pd.isna(rsi_series.iloc[-1]) else 50.0
-
-    break_up = high > zone_top and (body_pct >= min_break_pct or range_pct >= min_break_pct)
-    rsi_up_ok = rsi_now > rsi_level
-
-    break_down = low < zone_btm and (body_pct >= min_break_pct or range_pct >= min_break_pct)
-    rsi_down_ok = rsi_now < rsi_level
-
-    details = {
-        "price": close,
-        "high": high,
-        "low": low,
-        "zone_top": zone_top,
-        "zone_btm": zone_btm,
-        "zone_height": zone_height,
-        "zone_height_pct": (zone_height / zone_btm) * 100,
-        "touches": major_zone["touches"],
-        "candle_body_pct": body_pct,
-        "candle_range_pct": range_pct,
-        "vol_ratio": vol_ratio,
-        "vol_ok": vol_ok,
-        "rsi": rsi_now,
-        "center": major_zone["center"]
-    }
-
-    if break_up and vol_ok and rsi_up_ok:
-        return True, "AL", details
-
-    if break_down and vol_ok and rsi_down_ok:
-        return True, "SAT", details
-
-    return False, None, details
-
-
-def should_send(symbol, direction):
-    """Cooldown kontrolu"""
-    key = f"{symbol}_{direction}"
-    now = time.time()
-    if now - last_signal.get(key, 0) < SIGNAL_COOLDOWN:
-        return False
-    last_signal[key] = now
-    return True
+    except Exception as e:
+        return None, {"symbol": symbol, "status": "error", "error": str(e)}
 
 
 def send_telegram(text):
-    """Telegram mesaji gonder"""
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
@@ -240,25 +150,18 @@ def send_telegram(text):
         return False
 
 
-def format_message(symbol, direction, details):
-    """Telegram mesaj formati"""
-    emoji = "🟢 MAJOR ZONE BREAKOUT AL" if direction == "AL" else "🔴 MAJOR ZONE BREAKOUT SAT"
+def format_message(symbol, details):
     coin = symbol.replace("USDT", "/USDT")
     sep = "═" * 22
 
-    zone_height_pct = ((details["zone_top"] - details["zone_btm"]) / details["zone_btm"]) * 100
-
     lines = [
-        f"{emoji}",
+        f"🟢 SMA100 VOLUME SPIKE AL",
         sep,
         f"💱 Coin: {coin}",
         f"💰 Fiyat: {details['price']:.6f}",
-        f"📍 Major Zone: {details['zone_btm']:.6f} - {details['zone_top']:.6f}",
-        f"📊 Zone Yüksekliği: %{zone_height_pct:.2f}",
-        f"👆 Temas Sayısı: {details['touches']} kez",
-        f"📈 Break Mum Boyu: %{details['candle_body_pct']:.1f}",
-        f"📊 Hacim: {details['vol_ratio']:.2f}x (min {VOL_MULTIPLIER}x)",
-        f"📈 RSI: {details['rsi']:.1f}",
+        f"📍 SMA100: {details['sma100']:.6f}",
+        f"📊 SMA Mesafe: %{details['dist_pct']:.2f}",
+        f"📈 Hacim: {details['vol_ratio']:.2f}x (min {VOL_MULTIPLIER}x)",
         sep,
         f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
@@ -266,134 +169,88 @@ def format_message(symbol, direction, details):
     return "\n".join(lines)
 
 
-def analyze_single_coin(symbol):
-    """Tek bir coini analiz et - ThreadPool icin"""
-    try:
-        df = get_klines(symbol, TIMEFRAME, limit=KLINES_LIMIT)
-        if df is None or len(df) < ZONE_LOOKBACK:
-            return None, {"symbol": symbol, "status": "no_data", "mum": len(df) if df is not None else 0}
-
-        major_zone, touches = find_major_zone(df, MAJOR_BINS, ZONE_LOOKBACK)
-
-        if major_zone is None:
-            return None, {"symbol": symbol, "status": "no_major"}
-
-        if touches < MIN_TOUCHES:
-            return None, {"symbol": symbol, "status": "weak_major", "touches": touches}
-
-        is_break, direction, details = check_major_break(
-            df, major_zone, MIN_BREAK_PCT, VOL_MULTIPLIER, RSI_LEN, RSI_LEVEL
-        )
-
-        if not is_break or direction is None:
-            return None, {"symbol": symbol, "status": "no_break", "touches": touches, "zone": f"{major_zone['btm']:.2f}-{major_zone['top']:.2f}"}
-
-        if not should_send(symbol, direction):
-            return None, {"symbol": symbol, "status": "cooldown", "touches": touches}
-
-        msg = format_message(symbol, direction, details)
-
-        signal = {
-            "direction": direction,
-            "symbol": symbol,
-            "price": details["price"],
-            "message": msg,
-            "details": details
-        }
-
-        return signal, {"symbol": symbol, "status": "signal", "touches": touches, "direction": direction}
-
-    except Exception as e:
-        return None, {"symbol": symbol, "status": "error", "error": str(e)}
-
-
 def run_scan_parallel():
-    """PARALEL TARAMA - ThreadPool ile"""
     symbols = get_symbols()
     total = len(symbols)
-    log.info(f"MAJOR ZONE PARALEL TARAMA | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | MinTouches: {MIN_TOUCHES} | Bins: {MAJOR_BINS}")
+    log.info(f"SMA100 VOLUME SPIKE TARAMA | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | VolMin: {VOL_MULTIPLIER}x")
 
     stats = {
         "total": total,
-        "processed": 0,
-        "has_major": 0,
-        "major_ok": 0,
-        "break_signals": 0,
-        "signals_sent": 0,
-        "errors": 0,
-        "no_data": 0
+        "signal": 0,
+        "far": 0,
+        "low_vol": 0,
+        "cooldown": 0,
+        "error": 0
     }
 
     signals_found = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_symbol = {
-            executor.submit(analyze_single_coin, sym): sym 
+            executor.submit(check_signal, sym): sym 
             for sym in symbols
         }
 
         completed = 0
         for future in as_completed(future_to_symbol):
             completed += 1
-            symbol = future_to_symbol[future]
 
             try:
                 signal, info = future.result()
-                stats["processed"] += 1
 
                 if info["status"] == "signal":
-                    stats["break_signals"] += 1
-                    stats["major_ok"] += 1
-                    signals_found.append(signal)
-                elif info["status"] == "weak_major":
-                    stats["has_major"] += 1
-                elif info["status"] == "no_break":
-                    stats["major_ok"] += 1
-                elif info["status"] == "no_data":
-                    stats["no_data"] += 1
+                    stats["signal"] += 1
+                    signals_found.append((info["symbol"], signal))
+                elif info["status"] == "far_from_sma":
+                    stats["far"] += 1
+                elif info["status"] == "low_volume":
+                    stats["low_vol"] += 1
+                elif info["status"] == "cooldown":
+                    stats["cooldown"] += 1
                 elif info["status"] == "error":
-                    stats["errors"] += 1
+                    stats["error"] += 1
 
             except Exception as e:
-                log.error(f"{symbol} future hata: {e}")
-                stats["errors"] += 1
+                log.error(f"Future hata: {e}")
+                stats["error"] += 1
 
             if completed % 100 == 0 or completed == total:
-                log.info(f"[{completed}/{total}] | Sinyal: {stats['break_signals']} | MajorOK: {stats['major_ok']} | Weak: {stats['has_major']} | Hata: {stats['errors']}")
+                log.info(f"[{completed}/{total}] | Sinyal: {stats['signal']} | Uzak: {stats['far']} | DusukVol: {stats['low_vol']} | Hata: {stats['error']}")
 
-    for sig in signals_found:
+    # Sinyalleri gonder
+    for symbol, details in signals_found:
         try:
-            if send_telegram(sig["message"]):
-                stats["signals_sent"] += 1
-                log.info(f"SINYAL {sig['symbol']} {sig['direction']} Fiyat:{sig['price']:.6f} Temas:{sig['details']['touches']}")
+            msg = format_message(symbol, details)
+            if send_telegram(msg):
+                log.info(f"SINYAL {symbol} Fiyat:{details['price']:.6f} Vol:{details['vol_ratio']:.2f}x")
             else:
-                log.error(f"Telegram gonderilemedi: {sig['symbol']}")
+                log.error(f"Telegram gonderilemedi: {symbol}")
         except Exception as e:
-            log.error(f"Sinyal gonderim hatasi {sig['symbol']}: {e}")
+            log.error(f"Sinyal gonderim hatasi {symbol}: {e}")
 
-    log.info(f"Tarama tamamlandi | {stats['signals_sent']} sinyal | Stats: {stats}")
-    return stats['signals_sent'], stats
+    log.info(f"Tarama tamamlandi | {stats['signal']} sinyal | Stats: {stats}")
+    return stats['signal']
 
 
 def main():
-    log.info("MAJOR ZONE BREAKOUT BOT baslatildi (PARALEL)")
+    log.info("SMA100 VOLUME SPIKE BOT baslatildi")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID eksik!")
         return
 
     send_telegram(
-        f"🎯 MAJOR ZONE BREAKOUT BOT BASLADI\n"
+        f"🎯 SMA100 VOLUME SPIKE BOT BASLADI\n"
         f"═" * 28 + "\n"
-        f"💱 TF: {TIMEFRAME} | Lookback: {ZONE_LOOKBACK}\n"
-        f"👆 Min Temas: {MIN_TOUCHES} | Bins: {MAJOR_BINS}\n"
-        f"📈 Min Break Mum: %{MIN_BREAK_PCT}\n"
-        f"📊 Hacim: {VOL_MULTIPLIER}x | RSI: {RSI_LEVEL}\n"
+        f"💱 TF: {TIMEFRAME}\n"
+        f"📊 SMA{MAJOR_LINE_LEN} (Major Level)\n"
+        f"📈 Min Hacim: {VOL_MULTIPLIER}x\n"
+        f"📍 SMA Mesafe: %{MIN_DISTANCE_PCT}\n"
+        f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn\n"
         f"⚡ Workers: {MAX_WORKERS} (PARALEL)\n"
         f"⏰ Interval: {SCAN_INTERVAL}sn | Coins: {MAX_COINS}\n"
         f"\n"
-        f"🟢 AL: Major zone YUKARI kirilir\n"
-        f"🔴 SAT: Major zone ASAGI kirilir"
+        f"🟢 AL: Fiyat SMA{MAJOR_LINE_LEN}'e %2 yakın + Hacim >= {VOL_MULTIPLIER}x"
     )
 
     while True:
