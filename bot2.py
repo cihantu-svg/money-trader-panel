@@ -199,7 +199,7 @@ def send_telegram(text):
 def format_message(symbol, direction, details):
     emoji = "🟢 PEAK BREAKOUT AL" if direction == "AL" else "🔴 DIP BREAKOUT SAT"
     coin = symbol.replace("USDT", "/USDT")
-    sep = "═" * 24
+    sep = "=" * 24
 
     if direction == "AL":
         extra = f"📈 Peak: {details['peak']:.6f}"
@@ -218,7 +218,8 @@ def format_message(symbol, direction, details):
         f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
 
-    return "\n".join(lines)
+    return "
+".join(lines)
 
 
 def check_signal(symbol):
@@ -305,17 +306,27 @@ def main():
         return
 
     send_telegram(
-        f"🚀 PEAK BREAKOUT SCANNER BASLADI\n"
-        f"═" * 30 + "\n"
-        f"💱 TF: {TIMEFRAME}\n"
-        f"📊 SMA{MAJOR_LINE_LEN}\n"
-        f"👆 Son {BREAK_LOOKBACK} mumda kirma\n"
-        f"📈 Hacim: >={VOL_MULTIPLIER}x\n"
-        f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn\n"
-        f"⚡ Workers: {MAX_WORKERS}\n"
-        f"\n"
-        f"🟢 AL: SMA100 yukari kir -> retest -> peak kir + hacim\n"
-        f"🔴 SAT: SMA100 asagi kir -> retest -> dip kir + hacim"
+        "🚀 PEAK BREAKOUT SCANNER BASLADI
+"
+        "=" * 30 + "
+"
+        f"💱 TF: {TIMEFRAME}
+"
+        f"📊 SMA{MAJOR_LINE_LEN}
+"
+        f"👆 Son {BREAK_LOOKBACK} mumda kirma
+"
+        f"📈 Hacim: >={VOL_MULTIPLIER}x
+"
+        f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn
+"
+        f"⚡ Workers: {MAX_WORKERS}
+"
+        "
+"
+        "🟢 AL: SMA100 yukari kir -> retest -> peak kir + hacim
+"
+        "🔴 SAT: SMA100 asagi kir -> retest -> dip kir + hacim"
     )
 
     while True:
