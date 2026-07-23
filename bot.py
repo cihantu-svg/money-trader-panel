@@ -4,8 +4,8 @@ MAJOR KIRILIM BOT
 Strateji: SMA100 (Major/turuncu cizgi) kesisimi + kesen mumun govde
 buyuklugu (BODY_PCT_MIN yuzde ve uzeri) - yesil mum yukari kesiste AL,
 kirmizi mum asagi kesiste SAT sinyali uretir.
-EK: Mumun dibi (low) SMA100'un uzerinde veya body range'inin max %25'i kadar altinda olmali (AL)
-    Mumun tepesi (high) SMA100'un altinda veya body range'inin max %25'i kadar ustunde olmali (SAT)
+EK: Mumun dibi (low) SMA100'un uzerinde veya body range'inin en fazla %25'i kadar altinda olmali (AL)
+    Mumun tepesi (high) SMA100'un altinda veya body range'inin en fazla %25'i kadar ustunde olmali (SAT)
 Zaman dilimi: 1 saat
 Tarama araligi: 5 dakika (ayarlanabilir)
 Borsa: Binance Futures (USDT-M Perpetual)
@@ -284,7 +284,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "AL",
             "type": "KIRILIM_AL",
-            "kirilim": "SMA100 Dip Kırılım + Govde%",
+            "kirilim": "SMA100 Dip Kirilim + Govde%",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -302,7 +302,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "SAT",
             "type": "KIRILIM_SAT",
-            "kirilim": "SMA100 Dip Kırılım + Govde%",
+            "kirilim": "SMA100 Dip Kirilim + Govde%",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -341,29 +341,30 @@ def send_telegram(message: str) -> bool:
 def format_message(symbol: str, sig: dict) -> str:
     yon = sig["direction"]
     if yon == "AL":
-        bas = "\U0001F7E2 <b>AL SINYALI</b> \U0001F4C8"
-        dip_info = f"\U0001F53D Low→SMA100: <b>%{sig.get('low_gap_pct', 0)}</b> (body range)"
+        bas = "🟢 <b>AL SINYALI</b> 📈"
+        dip_info = f"🔽 Low->SMA100: <b>%{sig.get('low_gap_pct', 0)}</b> (body range)"
     else:
-        bas = "\U0001F534 <b>SAT SINYALI</b> \U0001F4C9"
-        dip_info = f"\U0001F53C High→SMA100: <b>%{sig.get('high_gap_pct', 0)}</b> (body range)"
+        bas = "🔴 <b>SAT SINYALI</b> 📉"
+        dip_info = f"🔼 High->SMA100: <b>%{sig.get('high_gap_pct', 0)}</b> (body range)"
 
     coin = symbol.replace("USDT", "/USDT")
+    sep = "=" * 12
 
     return (
         f"{bas}\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001F4CD <b>{coin}</b>\n"
-        f"\u23F1 Zaman Dilimi: <b>{TIMEFRAME}</b>\n"
-        f"\U0001F3AF Kirilim: <b>{sig.get('kirilim', '-')}</b>\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001F4B2 Fiyat: <b>{sig['price']}</b>\n"
-        f"\U0001F3C1 Hedef: <b>{sig['hedef']}</b>  (%{sig['beklenti']})\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001F4CA Govde Buyuklugu: <b>%{sig.get('govde_yuzde', 0)}</b>\n"
-        f"\U0001F4CF Cizgi Araligi: <b>%{sig.get('line_gap', 0)}</b> (SMA100 \u2194 Span B)\n"
+        f"{sep}\n"
+        f"📍 <b>{coin}</b>\n"
+        f"⏱ Zaman Dilimi: <b>{TIMEFRAME}</b>\n"
+        f"🎯 Kirilim: <b>{sig.get('kirilim', '-')}</b>\n"
+        f"{sep}\n"
+        f"💲 Fiyat: <b>{sig['price']}</b>\n"
+        f"🏁 Hedef: <b>{sig['hedef']}</b>  (%{sig['beklenti']})\n"
+        f"{sep}\n"
+        f"📊 Govde Buyuklugu: <b>%{sig.get('govde_yuzde', 0)}</b>\n"
+        f"📏 Cizgi Araligi: <b>%{sig.get('line_gap', 0)}</b> (SMA100 <-> Span B)\n"
         f"{dip_info}\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001F551 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}"
+        f"{sep}\n"
+        f"🕑 {datetime.now().strftime('%H:%M:%S  %d/%m/%Y')}"
     )
 
 
