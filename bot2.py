@@ -39,6 +39,9 @@ TIMEFRAME = os.getenv("TIMEFRAME", "15m")
 KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "200"))
 MAJOR_LINE_LEN = int(os.getenv("MAJOR_LINE_LEN", "100"))
 PEAK_BREAK_PCT = float(os.getenv("PEAK_BREAK_PCT", "0.5"))
+# Kirilim mumunun govde buyuklugu (|close-open|/open * 100) bu esigin
+# ALTINDAYSA sinyal SAYILMAZ - kucuk govdeli/kararsiz kirilimlari eler.
+MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "4.0"))
 
 # 4H bolge ayarlari (TEPE/DIP/MAJOR + PDH/PDL)
 ZONE_TIMEFRAME = os.getenv("ZONE_TIMEFRAME", "4h")
@@ -188,15 +191,20 @@ def analyze_symbol(symbol):
 
     price_now = float(close.iloc[-1])
     price_prev = float(close.iloc[-2])
+    open_now = float(df["open"].iloc[-1])
     bar_time = str(df["open_time"].iloc[-1])
 
     dist_pct = abs(price_now - sma_now) / sma_now * 100
 
+    # Kirilim mumunun govde buyuklugu - kucuk govdeli/kararsiz mumlari eler
+    body_pct = abs(price_now - open_now) / open_now * 100
+    body_ok = body_pct >= MIN_CANDLE_BODY_PCT
+
     crossed_up = price_prev <= sma_prev and price_now > sma_now
     crossed_down = price_prev >= sma_prev and price_now < sma_now
 
-    break_up = crossed_up and dist_pct >= PEAK_BREAK_PCT
-    break_down = crossed_down and dist_pct >= PEAK_BREAK_PCT
+    break_up = crossed_up and dist_pct >= PEAK_BREAK_PCT and body_ok
+    break_down = crossed_down and dist_pct >= PEAK_BREAK_PCT and body_ok
 
     if not break_up and not break_down:
         return None
@@ -208,7 +216,7 @@ def analyze_symbol(symbol):
 
     if break_up:
         side = "AL"
-        reasons.append(f"{TIMEFRAME} kapanis SMA{MAJOR_LINE_LEN}'u yukari kesti (mesafe %{dist_pct:.2f})")
+        reasons.append(f"{TIMEFRAME} kapanis SMA{MAJOR_LINE_LEN}'u yukari kesti (mesafe %{dist_pct:.2f}, govde %{body_pct:.2f})")
         if zones:
             if price_in_zone(price_now, zones.dip_top, zones.dip_bot) or \
                price_in_zone(price_now, zones.major_top, zones.major_bot):
@@ -219,7 +227,7 @@ def analyze_symbol(symbol):
                 reasons.append(f"Gunluk direnc (PDH: {zones.pdh:.6f}) kirildi")
     else:
         side = "SAT"
-        reasons.append(f"{TIMEFRAME} kapanis SMA{MAJOR_LINE_LEN}'u asagi kesti (mesafe %{dist_pct:.2f})")
+        reasons.append(f"{TIMEFRAME} kapanis SMA{MAJOR_LINE_LEN}'u asagi kesti (mesafe %{dist_pct:.2f}, govde %{body_pct:.2f})")
         if zones:
             if price_in_zone(price_now, zones.peak_top, zones.peak_bot) or \
                price_in_zone(price_now, zones.major_top, zones.major_bot):
