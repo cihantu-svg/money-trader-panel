@@ -1,8 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-MAJOR KIRILIM BOT
-Strateji: SMA100 kesisim + govde buyuklugu + kisa fitil
+MAJOR KIRILIM BOT (v2)
+Strateji: SMA100 + Senkou Span B AYNI MUMDA BIRLIKTE kesismeli
+          + govde buyuklugu (min %5) + kisa fitil
 Zaman: 1h | Tarama: 3dk | Borsa: Binance Futures
+Likidite: min 5M USDT (24s hacim)
+
+YENI (v1'e gore):
+  - Span B artik sadece bilgi amacli degil, sinyalin ZORUNLU parcasi:
+    SMA100 VE Span B ayni mumda ayni yonde kesismezse sinyal uretilmez.
+  - BODY_PCT_MIN varsayilani 4.0 -> 5.0
+  - MIN_VOLUME_USDT varsayilani 1.000.000 -> 5.000.000
 """
 import os
 import time
@@ -34,17 +42,20 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "180"))  # 3 dk
 TIMEFRAME = os.environ.get("SCAN_TIMEFRAME", "1h")
 MAX_COINS = int(os.environ.get("MAX_COINS", "600"))
-MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "1000000"))
+MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "5000000"))  # YENI: 5M USDT
 
 MAJOR_LEN = int(os.environ.get("MAJOR_LEN", "100"))
 SPANB_LEN = int(os.environ.get("SPANB_LEN", "52"))
-BODY_PCT_MIN = float(os.environ.get("BODY_PCT_MIN", "4.0"))
+BODY_PCT_MIN = float(os.environ.get("BODY_PCT_MIN", "5.0"))  # YENI: %5
 MAX_LINE_GAP_PCT = float(os.environ.get("MAX_LINE_GAP_PCT", "1.0"))
 SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "3600"))
 
-# YENI: Fitil onayi
+# Fitil onayi
 LOW_WICK_MAX = float(os.environ.get("LOW_WICK_MAX", "25.0"))
 HIGH_WICK_MAX = float(os.environ.get("HIGH_WICK_MAX", "25.0"))
+
+# YENI: Span B zorunlu kesisim ac/kapat (test icin kapatabilirsin)
+REQUIRE_SPANB_CROSS = os.environ.get("REQUIRE_SPANB_CROSS", "true").lower() == "true"
 
 SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "10"))
 REQUESTS_PER_SEC = float(os.environ.get("REQUESTS_PER_SEC", "8"))
@@ -52,7 +63,7 @@ TELEGRAM_MSGS_PER_SEC = float(os.environ.get("TELEGRAM_MSGS_PER_SEC", "1.0"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "MajorKirilimBot/1.0"})
+SESSION.headers.update({"User-Agent": "MajorKirilimBot/2.0"})
 _adapter = requests.adapters.HTTPAdapter(pool_connections=SCAN_WORKERS, pool_maxsize=SCAN_WORKERS * 2)
 SESSION.mount("https://", _adapter)
 
@@ -91,6 +102,7 @@ def calc_sma(series: pd.Series, period: int) -> pd.Series:
 
 
 def calc_spanb(high: pd.Series, low: pd.Series, period: int) -> pd.Series:
+    """Senkou Span B: (period suredeki en yuksek + en dusuk) / 2"""
     return (high.rolling(window=period).max() + low.rolling(window=period).min()) / 2
 
 
@@ -170,10 +182,12 @@ def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
 
 def check_signal(df: pd.DataFrame, symbol: str) -> list:
     """
-    AL : Govdesi >= BODY_PCT_MIN olan YESIL mum, SMA100 yukari keserse
-         VE alt fitili kisa (low, body_bottom'dan max LOW_WICK_MAX % asagida)
-    SAT: Govdesi >= BODY_PCT_MIN olan KIRMIZI mum, SMA100 asagi keserse
-         VE ust fitili kisa (high, body_top'dan max HIGH_WICK_MAX % yukarida)
+    AL : SMA100 YUKARI kesisir VE Span B YUKARI kesisir (AYNI MUMDA)
+         + govdesi >= BODY_PCT_MIN olan YESIL mum
+         + alt fitili kisa (low, body_bottom'dan max LOW_WICK_MAX % asagida)
+    SAT: SMA100 ASAGI kesisir VE Span B ASAGI kesisir (AYNI MUMDA)
+         + govdesi >= BODY_PCT_MIN olan KIRMIZI mum
+         + ust fitili kisa (high, body_top'dan max HIGH_WICK_MAX % yukarida)
     """
     if df is None or len(df) < MAJOR_LEN + 5:
         return []
@@ -187,7 +201,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     spanb = calc_spanb(high, low, SPANB_LEN)
     atr = calc_atr(df, 14)
 
-    i, ip = -2, -3
+    i, ip = -2, -3  # -2: son KAPANMIS mum, -3: bir onceki kapanmis mum
 
     def safe(s, idx, default=0.0):
         try:
@@ -214,7 +228,6 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     body_bottom = min(cur_close, cur_open)
     body_top = max(cur_close, cur_open)
 
-    # Fitil uzunlugu: body_size'a gore yuzde
     if cur_low < body_bottom and body_size > 0:
         low_wick_pct = (body_bottom - cur_low) / body_size * 100
     else:
@@ -229,20 +242,28 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
     dist_spanb = (cur_close - cur_spanb) / cur_spanb * 100
     line_gap_pct = abs(cur_major - cur_spanb) / cur_close * 100
 
+    # SMA100 kesisimi
     cross_major_up = (cur_close > cur_major) and (prev_close <= prev_major)
     cross_major_dn = (cur_close < cur_major) and (prev_close >= prev_major)
+
+    # YENI: Senkou Span B kesisimi (ayni mumda kontrol edilir)
+    cross_spanb_up = (cur_close > cur_spanb) and (prev_close <= prev_spanb)
+    cross_spanb_dn = (cur_close < cur_spanb) and (prev_close >= prev_spanb)
 
     body_pct = body_size / cur_open * 100
     candle_green = cur_close > cur_open
     candle_red = cur_close < cur_open
     body_ok = body_pct >= BODY_PCT_MIN
 
-    # Fitil onayi
     wick_ok_al = low_wick_pct <= LOW_WICK_MAX
     wick_ok_sat = high_wick_pct <= HIGH_WICK_MAX
 
-    signal_al = cross_major_up and candle_green and body_ok and wick_ok_al
-    signal_sat = cross_major_dn and candle_red and body_ok and wick_ok_sat
+    # YENI: SMA100 VE Span B ayni mumda ayni yonde kesismis olmali
+    both_cross_up = cross_major_up and (cross_spanb_up if REQUIRE_SPANB_CROSS else True)
+    both_cross_dn = cross_major_dn and (cross_spanb_dn if REQUIRE_SPANB_CROSS else True)
+
+    signal_al = both_cross_up and candle_green and body_ok and wick_ok_al
+    signal_sat = both_cross_dn and candle_red and body_ok and wick_ok_sat
 
     results = []
 
@@ -251,7 +272,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "AL",
             "type": "KIRILIM_AL",
-            "kirilim": "SMA100 Kesisim + Kisa Fitil",
+            "kirilim": "SMA100 + SpanB Kesisim + Kisa Fitil",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -269,7 +290,7 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         results.append({
             "direction": "SAT",
             "type": "KIRILIM_SAT",
-            "kirilim": "SMA100 Kesisim + Kisa Fitil",
+            "kirilim": "SMA100 + SpanB Kesisim + Kisa Fitil",
             "price": cur_close,
             "major": round(cur_major, 8),
             "spanb": round(cur_spanb, 8),
@@ -321,6 +342,7 @@ def format_message(symbol: str, sig: dict) -> str:
         f"Zaman: {TIMEFRAME} | Kirilim: {sig.get('kirilim', '-')}",
         sep,
         f"Fiyat: {sig['price']} | Hedef: {sig['hedef']} (%{sig['beklenti']})",
+        f"SMA100: {sig['major']} | SpanB: {sig['spanb']}",
         f"Govde: %{sig.get('govde_yuzde', 0)} | {wick_info}",
         f"Cizgi Araligi: %{sig.get('line_gap', 0)}",
         sep,
@@ -351,7 +373,8 @@ def _scan_one(coin):
 
 
 def run_scan():
-    log.info(f"Tarama basladi TF:{TIMEFRAME} GovdeMin:%{BODY_PCT_MIN} Max:{MAX_COINS} Paralel:{SCAN_WORKERS}")
+    log.info(f"Tarama basladi TF:{TIMEFRAME} GovdeMin:%{BODY_PCT_MIN} MinLikidite:{MIN_VOLUME/1e6:.1f}M "
+              f"SpanBZorunlu:{REQUIRE_SPANB_CROSS} Max:{MAX_COINS} Paralel:{SCAN_WORKERS}")
 
     symbols = get_symbols(min_volume=MIN_VOLUME)
     if not symbols:
@@ -392,10 +415,11 @@ def run_scan():
 
 def main():
     log.info("=" * 55)
-    log.info("MAJOR KIRILIM BOT baslatildi")
-    log.info(f"  Strateji : SMA{MAJOR_LEN} kesisim + govde >= %{BODY_PCT_MIN}")
+    log.info("MAJOR KIRILIM BOT v2 baslatildi")
+    log.info(f"  Strateji : SMA{MAJOR_LEN} + SpanB{SPANB_LEN} AYNI MUMDA kesisim + govde >= %{BODY_PCT_MIN}")
     log.info(f"  Fitil    : AL alt <= %{LOW_WICK_MAX} | SAT ust <= %{HIGH_WICK_MAX}")
     log.info(f"  Zaman    : {TIMEFRAME}")
+    log.info(f"  Likidite : min {MIN_VOLUME/1e6:.1f}M USDT (24s hacim)")
     log.info(f"  Aralik   : her {SCAN_INTERVAL} saniye")
     log.info(f"  Max coin : {MAX_COINS}")
     log.info(f"  Paralel  : {SCAN_WORKERS} worker, {REQUESTS_PER_SEC} istek/sn")
@@ -406,9 +430,10 @@ def main():
         return
 
     send_telegram(
-        f"MAJOR KIRILIM BOT BASLADI\n"
-        f"Strateji: SMA{MAJOR_LEN} kesisim + govde >= %{BODY_PCT_MIN}\n"
+        f"MAJOR KIRILIM BOT v2 BASLADI\n"
+        f"Strateji: SMA{MAJOR_LEN} + SpanB{SPANB_LEN} AYNI MUMDA kesisim + govde >= %{BODY_PCT_MIN}\n"
         f"Fitil: AL alt <= %{LOW_WICK_MAX} | SAT ust <= %{HIGH_WICK_MAX}\n"
+        f"Likidite: min {MIN_VOLUME/1e6:.1f}M USDT\n"
         f"Zaman: {TIMEFRAME} | Aralik: {SCAN_INTERVAL//60} dk\n"
         f"Max coin: {MAX_COINS} | Paralel: {SCAN_WORKERS}\n"
         f"{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
