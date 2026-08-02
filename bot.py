@@ -45,22 +45,22 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SEC", "300"))
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")
+TIMEFRAME = os.getenv("SCAN_TIMEFRAME", "5m")
 
-# --- MAJOR LEVEL (SMA100) STRATEJI AYARLARI ---
+# --- MAJOR LEVEL (SMA100) STRATEJI AYARLARI (YENI - panele eklenmesi gerekiyor) ---
 MAJOR_SMA_LEN = int(os.getenv("MAJOR_SMA_LEN", "100"))          # Pine'daki major_line_len
 MIN_BARS_BELOW = int(os.getenv("MIN_BARS_BELOW", "75"))         # en az kac bar altinda kalmis olmali
 MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "5.0"))    # major_break_pct - min kirilim yuzdesi
 
 # --- LIKIDITE / ISLEM GIRISI FILTRESI ---
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
-MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "3000000"))  # 3 milyon USDT
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_VOLUME_USDT", "3000000"))  # 3 milyon USDT
 
 BINANCE_BASE = "https://fapi.binance.com"
 last_signal = {}
