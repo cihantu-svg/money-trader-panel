@@ -1,16 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-15DK DIRENC KIRILIM SCANNER BOT
-- 15dk grafikte son N mumun en yuksegini (direnc) hesaplar (SADECE KAPANMIS mumlar - repaint yok)
-- Kirilim mumu direnci gecmis, YESIL olmali, govdesi (open-close farki) en az MIN_CANDLE_BODY_PCT olmali
-- Coin'in son 24s USDT hacmi MIN_QUOTE_VOLUME_24H altindaysa sinyal uretilmez (dusuk likidite elenir)
-- YENI: PARA TAKIBI (ORDER FLOW / MONEY FLOW) ONAYI
-    1) Kirilim mumunda taker-buy orani MIN_TAKER_BUY_RATIO ustunde olmali (agresif alici hacmi baskin mi?)
-    2) Kirilim ONCESI son AVG_TAKER_LOOKBACK mumun ortalama taker-buy orani MIN_AVG_TAKER_BUY_RATIO ustunde
-       olmali -> bu, kirilimdan once zaten para girisi basladigini (trend devaminin habercisi) dogrular.
-       Rastgele/anlik hacim patlamasiyla, biriken gercek alim baskisini bu sekilde ayirt ediyoruz.
-    3) (Opsiyonel, varsayilan kapali) MFI (Money Flow Index) filtresi - klasik ikinci onay katmani
-- Kosullar saglaninca Telegram'a bildirim atar
+5DK MAJOR LEVEL (SMA100) KIRILIM SCANNER BOT
+─────────────────────────────────────────────
+STRATEJI:
+  1) Major Level = SMA(close, 100)  → Pine Script'teki "MONEY TRADER - FULL PAKET"
+     indikatöründeki majorLevel = ta.sma(close, major_line_len) hesabının birebir
+     Python karşılığı (sadece bu hesap alındı, başka hiçbir şeye dokunulmadı).
+  2) Coin, kırılım mumundan hemen önceki en az MIN_BARS_BELOW (varsayılan 75) mum
+     boyunca KESINTISIZ olarak kendi Major Level'inin (SMA100) ALTINDA kalmış olmalı.
+  3) Kırılım mumu kapanışı Major Level'i en az MAJOR_BREAK_PCT (varsayılan %5) ile
+     YUKARI kırmış olmalı (close > majorLevel * (1 + %5)).
+  4) Likidite/işlem girişi filtresi: coin'in son 24s USDT hacmi
+     MIN_QUOTE_VOLUME_24H (varsayılan 3.000.000 USDT) altındaysa sinyal üretilmez.
+
+  Binance tarama altyapısı (get_symbols, get_klines, get_klines_closed,
+  get_all_24h_quote_volumes, ThreadPoolExecutor ile paralel tarama, cooldown
+  mekanizması) ve Telegram bildirim ayarları/fonksiyonları, mevcut GitHub
+  projenizdeki (15dk direnç kırılım scanner) yapıdan SADECE bu kısımlar
+  alınarak buraya taşındı. Direnç kırılımı / para takibi (taker-buy) mantığının
+  bu stratejiyle hiçbir bağlantısı yoktur, dahil edilmedi.
+
+NOT (varsayım): "min 3 milyon işlem girişi" koşulunu, mevcut projenizdeki
+likidite filtresiyle aynı mantıkta -> coin'in 24 saatlik USDT hacmi olarak
+yorumladım (eşik 3.000.000 USDT). Eğer kastınız kırılım mumunun kendi hacmi
+ise MIN_QUOTE_VOLUME_24H yerine "breakout mumu hacmi" kontrolüne kolayca
+çevrilebilir, tek satır değişir.
 """
 import os
 import time
@@ -21,7 +35,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
-import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -38,32 +51,23 @@ SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
-RES_LOOKBACK = int(os.getenv("RES_LOOKBACK", "50"))          # direnc kac mumdan hesaplansin
-RES_BREAK_PCT = float(os.getenv("RES_BREAK_PCT", "0.5"))     # direncten en az % kac yukarida kapanmali
-MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "10.0"))  # kirilim mumunun govdesi min %
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 
-# --- LIKIDITE FILTRESI ---
+# --- MAJOR LEVEL (SMA100) STRATEJI AYARLARI ---
+MAJOR_SMA_LEN = int(os.getenv("MAJOR_SMA_LEN", "100"))          # Pine'daki major_line_len
+MIN_BARS_BELOW = int(os.getenv("MIN_BARS_BELOW", "75"))         # en az kac bar altinda kalmis olmali
+MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "5.0"))    # major_break_pct - min kirilim yuzdesi
+
+# --- LIKIDITE / ISLEM GIRISI FILTRESI ---
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
-MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "5000000"))  # 5 milyon USDT
-
-# --- YENI: PARA TAKIBI (ORDER FLOW) FILTRESI ---
-USE_MONEY_FLOW_FILTER = os.getenv("USE_MONEY_FLOW_FILTER", "true").lower() == "true"
-MIN_TAKER_BUY_RATIO = float(os.getenv("MIN_TAKER_BUY_RATIO", "0.55"))          # kirilim mumunda min taker-buy orani
-AVG_TAKER_LOOKBACK = int(os.getenv("AVG_TAKER_LOOKBACK", "10"))                # kirilim ONCESI kac mumun ortalamasi
-MIN_AVG_TAKER_BUY_RATIO = float(os.getenv("MIN_AVG_TAKER_BUY_RATIO", "0.50"))  # o ortalamanin min degeri
-
-# --- YENI (opsiyonel, varsayilan kapali): MFI FILTRESI ---
-USE_MFI_FILTER = os.getenv("USE_MFI_FILTER", "false").lower() == "true"
-MFI_PERIOD = int(os.getenv("MFI_PERIOD", "14"))
-MFI_THRESHOLD = float(os.getenv("MFI_THRESHOLD", "50.0"))   # MFI bu degerin ustunde olmali (para girisi baskin)
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "3000000"))  # 3 milyon USDT
 
 BINANCE_BASE = "https://fapi.binance.com"
 last_signal = {}
 
 
 # ══════════════════════════════════════════════════════════════════
-# BINANCE VERI CEKME
+# BINANCE VERI CEKME (mevcut GitHub projesinden alinan tarama altyapisi)
 # ══════════════════════════════════════════════════════════════════
 def get_symbols():
     try:
@@ -90,8 +94,7 @@ def get_klines(symbol, interval, limit=200):
         df = pd.DataFrame(raw, columns=[
             "open_time", "open", "high", "low", "close", "volume", "close_time",
             "qav", "trades", "tbv", "tqv", "ignore"])
-        # tbv = taker buy base asset volume -> agresif ALICI tarafindan gerceklesen hacim (PARA TAKIBI icin kritik)
-        for c in ["open", "high", "low", "close", "volume", "tbv"]:
+        for c in ["open", "high", "low", "close", "volume"]:
             df[c] = df[c].astype(float)
         return df
     except Exception:
@@ -108,9 +111,7 @@ def get_klines_closed(symbol, interval, limit=200):
 
 def get_all_24h_quote_volumes():
     """
-    TUM sembollerin 24s USDT hacmini TEK istekte ceker (parametresiz cagrilirsa
-    Binance hepsini doner). Boylece her coin icin ayri istek atmaya gerek kalmaz,
-    tarama suresine ek yuk binmez.
+    Tum sembollerin 24s USDT hacmini TEK istekte ceker.
     Dondugu deger: {symbol: quoteVolume} sozlugu.
     """
     try:
@@ -124,113 +125,71 @@ def get_all_24h_quote_volumes():
 
 
 # ══════════════════════════════════════════════════════════════════
-# PARA TAKIBI (ORDER FLOW / MONEY FLOW) HESAPLARI
+# MAJOR LEVEL (SMA100) HESABI
+# Pine Script'teki: majorLevel = ta.sma(close, major_line_len)
 # ══════════════════════════════════════════════════════════════════
-def taker_buy_ratio(row):
-    """Bir mumun hacminin ne kadari agresif ALICIDAN geldi (0-1 arasi)."""
-    vol = float(row["volume"])
-    if vol <= 0:
-        return 0.5
-    return float(row["tbv"]) / vol
-
-
-def calc_mfi(df, period=14):
-    """
-    Klasik Money Flow Index. Fiyat + hacmi birlikte kullanir; 0-100 arasi doner.
-    50 uzeri = para girisi baskin, 50 alti = para cikisi baskin.
-    df: high/low/close/volume kolonlari olan, ESKIDEN YENIYE siralanmis DataFrame.
-    """
-    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
-    raw_money_flow = typical_price * df["volume"]
-
-    tp_diff = typical_price.diff()
-    positive_flow = raw_money_flow.where(tp_diff > 0, 0.0)
-    negative_flow = raw_money_flow.where(tp_diff < 0, 0.0)
-
-    pos_sum = positive_flow.rolling(period).sum()
-    neg_sum = negative_flow.rolling(period).sum()
-
-    money_ratio = pos_sum / neg_sum.replace(0, np.nan)
-    mfi = 100 - (100 / (1 + money_ratio))
-    return mfi
+def add_major_level(df, length=MAJOR_SMA_LEN):
+    df = df.copy()
+    df["majorLevel"] = df["close"].rolling(length).mean()
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════
-# SINYAL: DIRENC KIRILIMI + PARA TAKIBI ONAYI
+# SINYAL: 75+ BAR MAJOR ALTINDA KALIP MIN %5 ILE KIRILIM
 # ══════════════════════════════════════════════════════════════════
 @dataclass
 class Signal:
     symbol: str
     price: float
-    resistance: float
+    major_level: float
     break_pct: float
-    body_pct: float
+    bars_below: int
     bar_time: str
-    taker_buy_ratio_breakout: float
-    avg_taker_buy_ratio_pre: float
-    mfi_value: float = None
+    quote_volume_24h: float
 
 
 def analyze_symbol(symbol, quote_volumes=None):
-    # --- likidite kontrolu once yapilir, dusukse hic kline cekmeye gerek yok ---
-    if USE_LIQUIDITY_FILTER:
-        qv = (quote_volumes or {}).get(symbol, 0.0)
-        if qv < MIN_QUOTE_VOLUME_24H:
-            return None
-
-    # RES_LOOKBACK (direnc icin gecmis mum) + AVG_TAKER_LOOKBACK icin de yeterli pay + kirilim mumu
-    needed = max(RES_LOOKBACK, MFI_PERIOD if USE_MFI_FILTER else 0) + AVG_TAKER_LOOKBACK + 5
-    df = get_klines_closed(symbol, TIMEFRAME, limit=needed)
-    if df is None or len(df) < RES_LOOKBACK + AVG_TAKER_LOOKBACK + 1:
+    # --- likidite / islem girisi kontrolu once yapilir ---
+    qv = (quote_volumes or {}).get(symbol, 0.0)
+    if USE_LIQUIDITY_FILTER and qv < MIN_QUOTE_VOLUME_24H:
         return None
 
-    breakout = df.iloc[-1]                              # kirilim adayi mum
-    history = df.iloc[-(RES_LOOKBACK + 1):-1]            # direnc SADECE bu mumlardan hesaplanir (kirilim mumu HARIC)
+    needed = MAJOR_SMA_LEN + MIN_BARS_BELOW + 5
+    df = get_klines_closed(symbol, TIMEFRAME, limit=needed)
+    if df is None or len(df) < needed:
+        return None
 
-    resistance = float(history["high"].max())
-    open_now = float(breakout["open"])
+    df = add_major_level(df, MAJOR_SMA_LEN)
+    df = df.dropna(subset=["majorLevel"]).reset_index(drop=True)
+    if len(df) < MIN_BARS_BELOW + 1:
+        return None
+
+    breakout = df.iloc[-1]           # kirilim adayi (son kapanmis) mum
     close_now = float(breakout["close"])
+    major_now = float(breakout["majorLevel"])
     bar_time = str(breakout["open_time"])
 
-    if close_now <= open_now:
-        return None  # yesil mum degil -> kirilim sayilmaz
+    if major_now <= 0 or close_now <= major_now:
+        return None  # major level'in ustunde kapanmamis -> kirilim yok
 
-    if close_now <= resistance:
-        return None  # direnc kirilmamis
+    break_pct = (close_now - major_now) / major_now * 100
+    if break_pct < MAJOR_BREAK_PCT:
+        return None  # min %5 kirilim sarti saglanmadi
 
-    break_pct = (close_now - resistance) / resistance * 100
-    body_pct = (close_now - open_now) / open_now * 100
-
-    if break_pct < RES_BREAK_PCT:
-        return None
-    if body_pct < MIN_CANDLE_BODY_PCT:
-        return None
-
-    # --- YENI: PARA TAKIBI ONAYI ---
-    tbr_breakout = taker_buy_ratio(breakout)
-    pre_window = df.iloc[-(AVG_TAKER_LOOKBACK + 1):-1]   # kirilim mumu HARIC, hemen oncesindeki mumlar
-    avg_tbr_pre = float(pre_window.apply(taker_buy_ratio, axis=1).mean())
-
-    mfi_value = None
-    if USE_MFI_FILTER:
-        mfi_series = calc_mfi(df, period=MFI_PERIOD)
-        mfi_value = float(mfi_series.iloc[-1]) if not pd.isna(mfi_series.iloc[-1]) else None
-
-    if USE_MONEY_FLOW_FILTER:
-        if tbr_breakout < MIN_TAKER_BUY_RATIO:
-            return None  # kirilim mumunda alici baskinligi yeterli degil
-        if avg_tbr_pre < MIN_AVG_TAKER_BUY_RATIO:
-            return None  # kirilim ONCESINDE surdurulebilir para girisi yok -> muhtemelen ani/rastgele spike
-
-    if USE_MFI_FILTER:
-        if mfi_value is None or mfi_value < MFI_THRESHOLD:
-            return None
+    # kirilim mumu HARIC, hemen oncesindeki MIN_BARS_BELOW mum
+    history = df.iloc[-(MIN_BARS_BELOW + 1):-1]
+    below_mask = history["close"] < history["majorLevel"]
+    if not below_mask.all():
+        return None  # kesintisiz "altinda kalmis" sarti bozulmus
 
     return Signal(
-        symbol=symbol, price=close_now, resistance=resistance,
-        break_pct=break_pct, body_pct=body_pct, bar_time=bar_time,
-        taker_buy_ratio_breakout=tbr_breakout, avg_taker_buy_ratio_pre=avg_tbr_pre,
-        mfi_value=mfi_value,
+        symbol=symbol,
+        price=close_now,
+        major_level=major_now,
+        break_pct=break_pct,
+        bars_below=len(history),
+        bar_time=bar_time,
+        quote_volume_24h=qv,
     )
 
 
@@ -246,7 +205,7 @@ def should_send(symbol):
 
 
 # ══════════════════════════════════════════════════════════════════
-# TELEGRAM
+# TELEGRAM (mevcut GitHub projesinden alinan bildirim yapisi)
 # ══════════════════════════════════════════════════════════════════
 def send_telegram(text):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -268,18 +227,15 @@ def format_signal_message(signal: Signal):
     coin = signal.symbol.replace("USDT", "/USDT")
     sep = "=" * 24
     lines = [
-        "🟢 <b>DİRENÇ KIRILIMI + PARA GİRİŞİ</b>",
+        "🟠 <b>MAJOR LEVEL (SMA100) KIRILIMI</b>",
         sep,
         f"💱 <b>Coin:</b> {coin}",
         f"💰 <b>Fiyat:</b> {signal.price:.6f}",
-        f"📍 <b>Kırılan Direnç ({TIMEFRAME}, son {RES_LOOKBACK} mum):</b> {signal.resistance:.6f}",
+        f"📈 <b>Major Level (SMA{MAJOR_SMA_LEN}, {TIMEFRAME}):</b> {signal.major_level:.6f}",
         f"📏 <b>Kırılım Mesafesi:</b> %{signal.break_pct:.2f}",
-        f"🕯️ <b>Mum Gövdesi:</b> %{signal.body_pct:.2f}",
-        f"💸 <b>Kırılım Mumu Alıcı Oranı:</b> %{signal.taker_buy_ratio_breakout*100:.1f}",
-        f"📈 <b>Kırılım Öncesi Ort. Alıcı Oranı ({AVG_TAKER_LOOKBACK} mum):</b> %{signal.avg_taker_buy_ratio_pre*100:.1f}",
+        f"⏳ <b>Öncesinde Altında Kaldığı Bar:</b> {signal.bars_below} (min {MIN_BARS_BELOW})",
+        f"💧 <b>24s Hacim:</b> {signal.quote_volume_24h:,.0f} USDT (min {MIN_QUOTE_VOLUME_24H:,.0f})",
     ]
-    if signal.mfi_value is not None:
-        lines.append(f"🧭 <b>MFI:</b> {signal.mfi_value:.1f}")
     lines += [sep, f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"]
     return "\n".join(lines)
 
@@ -302,9 +258,9 @@ def check_signal(symbol, quote_volumes=None):
 def run_scan_parallel():
     symbols = get_symbols()
     total = len(symbols)
-    log.info(f"TARAMA BASLADI | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | Direnc lookback: {RES_LOOKBACK}")
+    log.info(f"TARAMA BASLADI | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | "
+              f"SMA{MAJOR_SMA_LEN} | min {MIN_BARS_BELOW} bar altinda | min %{MAJOR_BREAK_PCT} kirilim")
 
-    # likidite verisi TEK istekte, tarama basinda bir kez cekilir (600 ayri istek yerine 1 istek)
     quote_volumes = get_all_24h_quote_volumes() if USE_LIQUIDITY_FILTER else {}
 
     stats = {"total": total, "signal": 0, "no_signal": 0, "cooldown": 0, "error": 0}
@@ -332,7 +288,7 @@ def run_scan_parallel():
         try:
             msg = format_signal_message(signal)
             if send_telegram(msg):
-                log.info(f"SINYAL GONDERILDI: {signal.symbol} fiyat={signal.price:.6f} direnc={signal.resistance:.6f}")
+                log.info(f"SINYAL GONDERILDI: {signal.symbol} fiyat={signal.price:.6f} major={signal.major_level:.6f}")
             else:
                 log.error(f"Telegram gonderilemedi: {signal.symbol}")
         except Exception as e:
@@ -347,19 +303,16 @@ def run_scan_parallel():
 # ══════════════════════════════════════════════════════════════════
 def main():
     log.info("=" * 60)
-    log.info("15DK DIRENC KIRILIM SCANNER baslatildi")
-    log.info(f"Max coin       : {MAX_COINS}")
-    log.info(f"Workers        : {MAX_WORKERS}")
-    log.info(f"TF             : {TIMEFRAME}")
-    log.info(f"Direnc lookback: {RES_LOOKBACK} mum")
-    log.info(f"Min kirilim    : %{RES_BREAK_PCT}")
-    log.info(f"Min mum govdesi: %{MIN_CANDLE_BODY_PCT}")
-    log.info(f"Likidite filtre: {USE_LIQUIDITY_FILTER} (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)")
-    log.info(f"Para takibi filtre: {USE_MONEY_FLOW_FILTER} (kirilim min %{MIN_TAKER_BUY_RATIO*100:.0f} alici, "
-              f"onceki {AVG_TAKER_LOOKBACK} mum ort. min %{MIN_AVG_TAKER_BUY_RATIO*100:.0f} alici)")
-    log.info(f"MFI filtre     : {USE_MFI_FILTER} (period={MFI_PERIOD}, esik={MFI_THRESHOLD})")
-    log.info(f"Tarama araligi : {SCAN_INTERVAL} sn")
-    log.info(f"Cooldown       : {SIGNAL_COOLDOWN} sn")
+    log.info("5DK MAJOR LEVEL (SMA100) KIRILIM SCANNER baslatildi")
+    log.info(f"Max coin        : {MAX_COINS}")
+    log.info(f"Workers         : {MAX_WORKERS}")
+    log.info(f"TF              : {TIMEFRAME}")
+    log.info(f"Major SMA       : {MAJOR_SMA_LEN}")
+    log.info(f"Min alt bar     : {MIN_BARS_BELOW}")
+    log.info(f"Min kirilim     : %{MAJOR_BREAK_PCT}")
+    log.info(f"Likidite filtre : {USE_LIQUIDITY_FILTER} (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)")
+    log.info(f"Tarama araligi  : {SCAN_INTERVAL} sn")
+    log.info(f"Cooldown        : {SIGNAL_COOLDOWN} sn")
     log.info("=" * 60)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -367,15 +320,13 @@ def main():
         return
 
     send_telegram(
-        "🚀 DIRENC KIRILIM SCANNER BASLADI\n"
+        "🚀 MAJOR LEVEL (SMA100) KIRILIM SCANNER BASLADI\n"
         + "=" * 30 + "\n"
         f"💱 TF: {TIMEFRAME}\n"
-        f"📍 Direnc: son {RES_LOOKBACK} mumun en yuksegi\n"
-        f"📏 Min kirilim: %{RES_BREAK_PCT}\n"
-        f"🕯️ Min mum govdesi: %{MIN_CANDLE_BODY_PCT}\n"
-        f"💧 Min likidite: {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT\n"
-        f"💸 Para takibi: {USE_MONEY_FLOW_FILTER} (min %{MIN_TAKER_BUY_RATIO*100:.0f} alici / kirilim, "
-        f"onceki {AVG_TAKER_LOOKBACK} mum ort. min %{MIN_AVG_TAKER_BUY_RATIO*100:.0f})\n"
+        f"📈 Major Level: SMA{MAJOR_SMA_LEN}\n"
+        f"⏳ Min altinda kalma: {MIN_BARS_BELOW} bar\n"
+        f"📏 Min kirilim: %{MAJOR_BREAK_PCT}\n"
+        f"💧 Min islem girisi (24s hacim): {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT\n"
         f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn\n"
         f"⚡ Workers: {MAX_WORKERS}"
     )
