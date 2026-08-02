@@ -1,321 +1,262 @@
 # -*- coding: utf-8 -*-
 """
-MAJOR KIRILIM BOT (v2)
-Strateji: SMA100 + Senkou Span B AYNI MUMDA BIRLIKTE kesismeli
-          + govde buyuklugu (min %5) + kisa fitil
-Zaman: 1h | Tarama: 3dk | Borsa: Binance Futures
-Likidite: min 5M USDT (24s hacim)
-
-YENI (v1'e gore):
-  - Span B artik sadece bilgi amacli degil, sinyalin ZORUNLU parcasi:
-    SMA100 VE Span B ayni mumda ayni yonde kesismezse sinyal uretilmez.
-  - BODY_PCT_MIN varsayilani 4.0 -> 5.0
-  - MIN_VOLUME_USDT varsayilani 1.000.000 -> 5.000.000
+15DK DIRENC KIRILIM SCANNER BOT
+- 15dk grafikte son N mumun en yuksegini (direnc) hesaplar (SADECE KAPANMIS mumlar - repaint yok)
+- Kirilim mumu direnci gecmis, YESIL olmali, govdesi (open-close farki) en az MIN_CANDLE_BODY_PCT olmali
+- Coin'in son 24s USDT hacmi MIN_QUOTE_VOLUME_24H altindaysa sinyal uretilmez (dusuk likidite elenir)
+- YENI: PARA TAKIBI (ORDER FLOW / MONEY FLOW) ONAYI
+    1) Kirilim mumunda taker-buy orani MIN_TAKER_BUY_RATIO ustunde olmali (agresif alici hacmi baskin mi?)
+    2) Kirilim ONCESI son AVG_TAKER_LOOKBACK mumun ortalama taker-buy orani MIN_AVG_TAKER_BUY_RATIO ustunde
+       olmali -> bu, kirilimdan once zaten para girisi basladigini (trend devaminin habercisi) dogrular.
+       Rastgele/anlik hacim patlamasiyla, biriken gercek alim baskisini bu sekilde ayirt ediyoruz.
+    3) (Opsiyonel, varsayilan kapali) MFI (Money Flow Index) filtresi - klasik ikinci onay katmani
+- Kosullar saglaninca Telegram'a bildirim atar
 """
 import os
 import time
 import logging
-import threading
 from datetime import datetime
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
 import numpy as np
-import urllib3
-import warnings
 
-urllib3.disable_warnings()
-warnings.filterwarnings('ignore')
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-# ============================================================
-# AYARLAR (Render Environment Variables)
-# ============================================================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "180"))  # 3 dk
-TIMEFRAME = os.environ.get("SCAN_TIMEFRAME", "1h")
-MAX_COINS = int(os.environ.get("MAX_COINS", "600"))
-MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "5000000"))  # YENI: 5M USDT
+# ══════════════════════════════════════════════════════════════════
+# AYARLAR
+# ══════════════════════════════════════════════════════════════════
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-MAJOR_LEN = int(os.environ.get("MAJOR_LEN", "100"))
-SPANB_LEN = int(os.environ.get("SPANB_LEN", "52"))
-BODY_PCT_MIN = float(os.environ.get("BODY_PCT_MIN", "5.0"))  # YENI: %5
-MAX_LINE_GAP_PCT = float(os.environ.get("MAX_LINE_GAP_PCT", "1.0"))
-SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "3600"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
+MAX_COINS = int(os.getenv("MAX_COINS", "600"))
+SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 
-# Fitil onayi
-LOW_WICK_MAX = float(os.environ.get("LOW_WICK_MAX", "25.0"))
-HIGH_WICK_MAX = float(os.environ.get("HIGH_WICK_MAX", "25.0"))
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+RES_LOOKBACK = int(os.getenv("RES_LOOKBACK", "50"))          # direnc kac mumdan hesaplansin
+RES_BREAK_PCT = float(os.getenv("RES_BREAK_PCT", "0.5"))     # direncten en az % kac yukarida kapanmali
+MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "10.0"))  # kirilim mumunun govdesi min %
 
-# YENI: Span B zorunlu kesisim ac/kapat (test icin kapatabilirsin)
-REQUIRE_SPANB_CROSS = os.environ.get("REQUIRE_SPANB_CROSS", "true").lower() == "true"
+# --- LIKIDITE FILTRESI ---
+USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "5000000"))  # 5 milyon USDT
 
-SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "10"))
-REQUESTS_PER_SEC = float(os.environ.get("REQUESTS_PER_SEC", "8"))
-TELEGRAM_MSGS_PER_SEC = float(os.environ.get("TELEGRAM_MSGS_PER_SEC", "1.0"))
+# --- YENI: PARA TAKIBI (ORDER FLOW) FILTRESI ---
+USE_MONEY_FLOW_FILTER = os.getenv("USE_MONEY_FLOW_FILTER", "true").lower() == "true"
+MIN_TAKER_BUY_RATIO = float(os.getenv("MIN_TAKER_BUY_RATIO", "0.55"))          # kirilim mumunda min taker-buy orani
+AVG_TAKER_LOOKBACK = int(os.getenv("AVG_TAKER_LOOKBACK", "10"))                # kirilim ONCESI kac mumun ortalamasi
+MIN_AVG_TAKER_BUY_RATIO = float(os.getenv("MIN_AVG_TAKER_BUY_RATIO", "0.50"))  # o ortalamanin min degeri
+
+# --- YENI (opsiyonel, varsayilan kapali): MFI FILTRESI ---
+USE_MFI_FILTER = os.getenv("USE_MFI_FILTER", "false").lower() == "true"
+MFI_PERIOD = int(os.getenv("MFI_PERIOD", "14"))
+MFI_THRESHOLD = float(os.getenv("MFI_THRESHOLD", "50.0"))   # MFI bu degerin ustunde olmali (para girisi baskin)
 
 BINANCE_BASE = "https://fapi.binance.com"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "MajorKirilimBot/2.0"})
-_adapter = requests.adapters.HTTPAdapter(pool_connections=SCAN_WORKERS, pool_maxsize=SCAN_WORKERS * 2)
-SESSION.mount("https://", _adapter)
-
-sent_signals: dict = {}
-
-_rate_lock = threading.Lock()
-_next_slot = [0.0]
+last_signal = {}
 
 
-def _rate_limit_wait():
-    with _rate_lock:
-        now = time.time()
-        wait = _next_slot[0] - now
-        if wait > 0:
-            time.sleep(wait)
-            now = time.time()
-        _next_slot[0] = max(now, _next_slot[0]) + 1.0 / REQUESTS_PER_SEC
-
-
-_tg_lock = threading.Lock()
-_tg_next_slot = [0.0]
-
-
-def _telegram_rate_wait():
-    with _tg_lock:
-        now = time.time()
-        wait = _tg_next_slot[0] - now
-        if wait > 0:
-            time.sleep(wait)
-            now = time.time()
-        _tg_next_slot[0] = max(now, _tg_next_slot[0]) + 1.0 / TELEGRAM_MSGS_PER_SEC
-
-
-def calc_sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period).mean()
-
-
-def calc_spanb(high: pd.Series, low: pd.Series, period: int) -> pd.Series:
-    """Senkou Span B: (period suredeki en yuksek + en dusuk) / 2"""
-    return (high.rolling(window=period).max() + low.rolling(window=period).min()) / 2
-
-
-def calc_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    h, l, c = df['High'], df['Low'], df['Close']
-    tr = pd.concat([h - l, abs(h - c.shift()), abs(l - c.shift())], axis=1).max(axis=1)
-    return tr.rolling(window=period).mean()
-
-
-def get_symbols(min_volume: float = 0) -> list:
+# ══════════════════════════════════════════════════════════════════
+# BINANCE VERI CEKME
+# ══════════════════════════════════════════════════════════════════
+def get_symbols():
     try:
-        r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=30, verify=False)
-        if r.status_code != 200:
-            log.error(f"Sembol listesi alinamadi: HTTP {r.status_code}")
-            return []
+        session = requests.Session()
+        r = session.get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo", timeout=10)
         data = r.json()
-        exclude = ("3L", "3S", "5L", "5S", "UP", "DOWN", "BULL", "BEAR")
-        symbols = []
-        for t in data:
-            sym = str(t.get("symbol", "")).upper()
-            if not sym.endswith("USDT") or "_" in sym:
-                continue
-            if any(sym[:-4].endswith(x) for x in exclude):
-                continue
-            qv = float(t.get("quoteVolume") or 0)
-            if qv < min_volume:
-                continue
-            symbols.append({
-                "symbol": sym,
-                "volume_24h": qv,
-                "price": float(t.get("lastPrice") or 0),
-                "change_24h": float(t.get("priceChangePercent") or 0),
-            })
-        symbols.sort(key=lambda x: x["volume_24h"], reverse=True)
-        return symbols
+        syms = [s["symbol"] for s in data["symbols"]
+                if s["symbol"].endswith("USDT") and s["status"] == "TRADING"]
+        return syms[:MAX_COINS]
     except Exception as e:
         log.error(f"get_symbols hata: {e}")
         return []
 
 
-def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
-    _rate_limit_wait()
+def get_klines(symbol, interval, limit=200):
     try:
-        r = SESSION.get(
+        session = requests.Session()
+        r = session.get(
             f"{BINANCE_BASE}/fapi/v1/klines",
             params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=15, verify=False
+            timeout=REQUEST_TIMEOUT,
         )
-        if r.status_code == 429 or r.status_code == 418:
-            log.warning(f"Rate limit uyarisi ({r.status_code}) {symbol} - bu tur atlaniyor")
-            return None
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not isinstance(data, list) or len(data) < max(MAJOR_LEN, SPANB_LEN) + 5:
-            return None
-        rows = []
-        for k in data:
-            try:
-                rows.append({
-                    "ts": pd.to_datetime(int(k[0]), unit="ms"),
-                    "Open": float(k[1]),
-                    "High": float(k[2]),
-                    "Low": float(k[3]),
-                    "Close": float(k[4]),
-                    "Volume": float(k[5]),
-                })
-            except Exception:
-                continue
-        if len(rows) < 50:
-            return None
-        df = pd.DataFrame(rows).set_index("ts")
-        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        raw = r.json()
+        df = pd.DataFrame(raw, columns=[
+            "open_time", "open", "high", "low", "close", "volume", "close_time",
+            "qav", "trades", "tbv", "tqv", "ignore"])
+        # tbv = taker buy base asset volume -> agresif ALICI tarafindan gerceklesen hacim (PARA TAKIBI icin kritik)
+        for c in ["open", "high", "low", "close", "volume", "tbv"]:
+            df[c] = df[c].astype(float)
+        return df
     except Exception:
         return None
 
 
-def check_signal(df: pd.DataFrame, symbol: str) -> list:
+def get_klines_closed(symbol, interval, limit=200):
+    """Sadece KAPANMIS mumlari doner - repaint/titresim onlenir."""
+    df = get_klines(symbol, interval, limit=limit + 1)
+    if df is None or len(df) < 2:
+        return None
+    return df.iloc[:-1].reset_index(drop=True)
+
+
+def get_all_24h_quote_volumes():
     """
-    AL : SMA100 YUKARI kesisir VE Span B YUKARI kesisir (AYNI MUMDA)
-         + govdesi >= BODY_PCT_MIN olan YESIL mum
-         + alt fitili kisa (low, body_bottom'dan max LOW_WICK_MAX % asagida)
-    SAT: SMA100 ASAGI kesisir VE Span B ASAGI kesisir (AYNI MUMDA)
-         + govdesi >= BODY_PCT_MIN olan KIRMIZI mum
-         + ust fitili kisa (high, body_top'dan max HIGH_WICK_MAX % yukarida)
+    TUM sembollerin 24s USDT hacmini TEK istekte ceker (parametresiz cagrilirsa
+    Binance hepsini doner). Boylece her coin icin ayri istek atmaya gerek kalmaz,
+    tarama suresine ek yuk binmez.
+    Dondugu deger: {symbol: quoteVolume} sozlugu.
     """
-    if df is None or len(df) < MAJOR_LEN + 5:
-        return []
-
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
-    opn = df["Open"]
-
-    major = calc_sma(close, MAJOR_LEN)
-    spanb = calc_spanb(high, low, SPANB_LEN)
-    atr = calc_atr(df, 14)
-
-    i, ip = -2, -3  # -2: son KAPANMIS mum, -3: bir onceki kapanmis mum
-
-    def safe(s, idx, default=0.0):
-        try:
-            v = s.iloc[idx]
-            return float(v) if not pd.isna(v) else default
-        except Exception:
-            return default
-
-    cur_close = safe(close, i)
-    prev_close = safe(close, ip)
-    cur_open = safe(opn, i)
-    cur_high = safe(high, i)
-    cur_low = safe(low, i)
-    cur_major = safe(major, i)
-    prev_major = safe(major, ip)
-    cur_spanb = safe(spanb, i)
-    prev_spanb = safe(spanb, ip)
-    cur_atr = safe(atr, i, cur_close * 0.01)
-
-    if cur_major <= 0 or cur_spanb <= 0 or cur_open <= 0:
-        return []
-
-    body_size = abs(cur_close - cur_open)
-    body_bottom = min(cur_close, cur_open)
-    body_top = max(cur_close, cur_open)
-
-    if cur_low < body_bottom and body_size > 0:
-        low_wick_pct = (body_bottom - cur_low) / body_size * 100
-    else:
-        low_wick_pct = 0.0
-
-    if cur_high > body_top and body_size > 0:
-        high_wick_pct = (cur_high - body_top) / body_size * 100
-    else:
-        high_wick_pct = 0.0
-
-    dist_major = (cur_close - cur_major) / cur_major * 100
-    dist_spanb = (cur_close - cur_spanb) / cur_spanb * 100
-    line_gap_pct = abs(cur_major - cur_spanb) / cur_close * 100
-
-    # SMA100 kesisimi
-    cross_major_up = (cur_close > cur_major) and (prev_close <= prev_major)
-    cross_major_dn = (cur_close < cur_major) and (prev_close >= prev_major)
-
-    # YENI: Senkou Span B kesisimi (ayni mumda kontrol edilir)
-    cross_spanb_up = (cur_close > cur_spanb) and (prev_close <= prev_spanb)
-    cross_spanb_dn = (cur_close < cur_spanb) and (prev_close >= prev_spanb)
-
-    body_pct = body_size / cur_open * 100
-    candle_green = cur_close > cur_open
-    candle_red = cur_close < cur_open
-    body_ok = body_pct >= BODY_PCT_MIN
-
-    wick_ok_al = low_wick_pct <= LOW_WICK_MAX
-    wick_ok_sat = high_wick_pct <= HIGH_WICK_MAX
-
-    # YENI: SMA100 VE Span B ayni mumda ayni yonde kesismis olmali
-    both_cross_up = cross_major_up and (cross_spanb_up if REQUIRE_SPANB_CROSS else True)
-    both_cross_dn = cross_major_dn and (cross_spanb_dn if REQUIRE_SPANB_CROSS else True)
-
-    signal_al = both_cross_up and candle_green and body_ok and wick_ok_al
-    signal_sat = both_cross_dn and candle_red and body_ok and wick_ok_sat
-
-    results = []
-
-    if signal_al:
-        hedef = cur_close + cur_atr * 2
-        results.append({
-            "direction": "AL",
-            "type": "KIRILIM_AL",
-            "kirilim": "SMA100 + SpanB Kesisim + Kisa Fitil",
-            "price": cur_close,
-            "major": round(cur_major, 8),
-            "spanb": round(cur_spanb, 8),
-            "dist_major": round(dist_major, 2),
-            "dist_spanb": round(dist_spanb, 2),
-            "hedef": round(hedef, 8),
-            "beklenti": round((hedef - cur_close) / cur_close * 100, 2),
-            "govde_yuzde": round(body_pct, 2),
-            "line_gap": round(line_gap_pct, 2),
-            "wick_pct": round(low_wick_pct, 2),
-        })
-
-    if signal_sat:
-        hedef = cur_close - cur_atr * 2
-        results.append({
-            "direction": "SAT",
-            "type": "KIRILIM_SAT",
-            "kirilim": "SMA100 + SpanB Kesisim + Kisa Fitil",
-            "price": cur_close,
-            "major": round(cur_major, 8),
-            "spanb": round(cur_spanb, 8),
-            "dist_major": round(dist_major, 2),
-            "dist_spanb": round(dist_spanb, 2),
-            "hedef": round(hedef, 8),
-            "beklenti": round((cur_close - hedef) / cur_close * 100, 2),
-            "govde_yuzde": round(body_pct, 2),
-            "line_gap": round(line_gap_pct, 2),
-            "wick_pct": round(high_wick_pct, 2),
-        })
-
-    return results
+    try:
+        session = requests.Session()
+        r = session.get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=15)
+        data = r.json()
+        return {d["symbol"]: float(d.get("quoteVolume", 0)) for d in data}
+    except Exception as e:
+        log.error(f"get_all_24h_quote_volumes hata: {e}")
+        return {}
 
 
-def send_telegram(message: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram token veya chat_id eksik!")
+# ══════════════════════════════════════════════════════════════════
+# PARA TAKIBI (ORDER FLOW / MONEY FLOW) HESAPLARI
+# ══════════════════════════════════════════════════════════════════
+def taker_buy_ratio(row):
+    """Bir mumun hacminin ne kadari agresif ALICIDAN geldi (0-1 arasi)."""
+    vol = float(row["volume"])
+    if vol <= 0:
+        return 0.5
+    return float(row["tbv"]) / vol
+
+
+def calc_mfi(df, period=14):
+    """
+    Klasik Money Flow Index. Fiyat + hacmi birlikte kullanir; 0-100 arasi doner.
+    50 uzeri = para girisi baskin, 50 alti = para cikisi baskin.
+    df: high/low/close/volume kolonlari olan, ESKIDEN YENIYE siralanmis DataFrame.
+    """
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
+    raw_money_flow = typical_price * df["volume"]
+
+    tp_diff = typical_price.diff()
+    positive_flow = raw_money_flow.where(tp_diff > 0, 0.0)
+    negative_flow = raw_money_flow.where(tp_diff < 0, 0.0)
+
+    pos_sum = positive_flow.rolling(period).sum()
+    neg_sum = negative_flow.rolling(period).sum()
+
+    money_ratio = pos_sum / neg_sum.replace(0, np.nan)
+    mfi = 100 - (100 / (1 + money_ratio))
+    return mfi
+
+
+# ══════════════════════════════════════════════════════════════════
+# SINYAL: DIRENC KIRILIMI + PARA TAKIBI ONAYI
+# ══════════════════════════════════════════════════════════════════
+@dataclass
+class Signal:
+    symbol: str
+    price: float
+    resistance: float
+    break_pct: float
+    body_pct: float
+    bar_time: str
+    taker_buy_ratio_breakout: float
+    avg_taker_buy_ratio_pre: float
+    mfi_value: float = None
+
+
+def analyze_symbol(symbol, quote_volumes=None):
+    # --- likidite kontrolu once yapilir, dusukse hic kline cekmeye gerek yok ---
+    if USE_LIQUIDITY_FILTER:
+        qv = (quote_volumes or {}).get(symbol, 0.0)
+        if qv < MIN_QUOTE_VOLUME_24H:
+            return None
+
+    # RES_LOOKBACK (direnc icin gecmis mum) + AVG_TAKER_LOOKBACK icin de yeterli pay + kirilim mumu
+    needed = max(RES_LOOKBACK, MFI_PERIOD if USE_MFI_FILTER else 0) + AVG_TAKER_LOOKBACK + 5
+    df = get_klines_closed(symbol, TIMEFRAME, limit=needed)
+    if df is None or len(df) < RES_LOOKBACK + AVG_TAKER_LOOKBACK + 1:
+        return None
+
+    breakout = df.iloc[-1]                              # kirilim adayi mum
+    history = df.iloc[-(RES_LOOKBACK + 1):-1]            # direnc SADECE bu mumlardan hesaplanir (kirilim mumu HARIC)
+
+    resistance = float(history["high"].max())
+    open_now = float(breakout["open"])
+    close_now = float(breakout["close"])
+    bar_time = str(breakout["open_time"])
+
+    if close_now <= open_now:
+        return None  # yesil mum degil -> kirilim sayilmaz
+
+    if close_now <= resistance:
+        return None  # direnc kirilmamis
+
+    break_pct = (close_now - resistance) / resistance * 100
+    body_pct = (close_now - open_now) / open_now * 100
+
+    if break_pct < RES_BREAK_PCT:
+        return None
+    if body_pct < MIN_CANDLE_BODY_PCT:
+        return None
+
+    # --- YENI: PARA TAKIBI ONAYI ---
+    tbr_breakout = taker_buy_ratio(breakout)
+    pre_window = df.iloc[-(AVG_TAKER_LOOKBACK + 1):-1]   # kirilim mumu HARIC, hemen oncesindeki mumlar
+    avg_tbr_pre = float(pre_window.apply(taker_buy_ratio, axis=1).mean())
+
+    mfi_value = None
+    if USE_MFI_FILTER:
+        mfi_series = calc_mfi(df, period=MFI_PERIOD)
+        mfi_value = float(mfi_series.iloc[-1]) if not pd.isna(mfi_series.iloc[-1]) else None
+
+    if USE_MONEY_FLOW_FILTER:
+        if tbr_breakout < MIN_TAKER_BUY_RATIO:
+            return None  # kirilim mumunda alici baskinligi yeterli degil
+        if avg_tbr_pre < MIN_AVG_TAKER_BUY_RATIO:
+            return None  # kirilim ONCESINDE surdurulebilir para girisi yok -> muhtemelen ani/rastgele spike
+
+    if USE_MFI_FILTER:
+        if mfi_value is None or mfi_value < MFI_THRESHOLD:
+            return None
+
+    return Signal(
+        symbol=symbol, price=close_now, resistance=resistance,
+        break_pct=break_pct, body_pct=body_pct, bar_time=bar_time,
+        taker_buy_ratio_breakout=tbr_breakout, avg_taker_buy_ratio_pre=avg_tbr_pre,
+        mfi_value=mfi_value,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# COOLDOWN
+# ══════════════════════════════════════════════════════════════════
+def should_send(symbol):
+    now = time.time()
+    if now - last_signal.get(symbol, 0) < SIGNAL_COOLDOWN:
         return False
-    _telegram_rate_wait()
+    last_signal[symbol] = now
+    return True
+
+
+# ══════════════════════════════════════════════════════════════════
+# TELEGRAM
+# ══════════════════════════════════════════════════════════════════
+def send_telegram(text):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("TELEGRAM_TOKEN/TELEGRAM_CHAT_ID eksik, konsola yaziliyor:\n" + text)
+        return False
     try:
         r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10,
         )
         return r.status_code == 200
     except Exception as e:
@@ -323,130 +264,129 @@ def send_telegram(message: str) -> bool:
         return False
 
 
-def format_message(symbol: str, sig: dict) -> str:
-    yon = sig["direction"]
-    if yon == "AL":
-        bas = "AL SINYALI (YUKARI)"
-        wick_info = f"Alt Fitil: %{sig.get('wick_pct', 0)} (body)"
-    else:
-        bas = "SAT SINYALI (ASAGI)"
-        wick_info = f"Ust Fitil: %{sig.get('wick_pct', 0)} (body)"
-
-    coin = symbol.replace("USDT", "/USDT")
-    sep = "-" * 20
-
+def format_signal_message(signal: Signal):
+    coin = signal.symbol.replace("USDT", "/USDT")
+    sep = "=" * 24
     lines = [
-        bas,
+        "🟢 <b>DİRENÇ KIRILIMI + PARA GİRİŞİ</b>",
         sep,
-        f"Coin: {coin}",
-        f"Zaman: {TIMEFRAME} | Kirilim: {sig.get('kirilim', '-')}",
-        sep,
-        f"Fiyat: {sig['price']} | Hedef: {sig['hedef']} (%{sig['beklenti']})",
-        f"SMA100: {sig['major']} | SpanB: {sig['spanb']}",
-        f"Govde: %{sig.get('govde_yuzde', 0)} | {wick_info}",
-        f"Cizgi Araligi: %{sig.get('line_gap', 0)}",
-        sep,
-        datetime.now().strftime('%H:%M:%S %d/%m/%Y')
+        f"💱 <b>Coin:</b> {coin}",
+        f"💰 <b>Fiyat:</b> {signal.price:.6f}",
+        f"📍 <b>Kırılan Direnç ({TIMEFRAME}, son {RES_LOOKBACK} mum):</b> {signal.resistance:.6f}",
+        f"📏 <b>Kırılım Mesafesi:</b> %{signal.break_pct:.2f}",
+        f"🕯️ <b>Mum Gövdesi:</b> %{signal.body_pct:.2f}",
+        f"💸 <b>Kırılım Mumu Alıcı Oranı:</b> %{signal.taker_buy_ratio_breakout*100:.1f}",
+        f"📈 <b>Kırılım Öncesi Ort. Alıcı Oranı ({AVG_TAKER_LOOKBACK} mum):</b> %{signal.avg_taker_buy_ratio_pre*100:.1f}",
     ]
+    if signal.mfi_value is not None:
+        lines.append(f"🧭 <b>MFI:</b> {signal.mfi_value:.1f}")
+    lines += [sep, f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"]
     return "\n".join(lines)
 
 
-def should_send(symbol: str, sig_type: str) -> bool:
-    key = f"{symbol}_{sig_type}"
-    now = time.time()
-    if key in sent_signals and (now - sent_signals[key]) < SIGNAL_COOLDOWN:
-        return False
-    sent_signals[key] = now
-    return True
-
-
-def _scan_one(coin):
-    symbol = coin["symbol"]
+# ══════════════════════════════════════════════════════════════════
+# TARAMA DONGUSU (paralel, tum coinler)
+# ══════════════════════════════════════════════════════════════════
+def check_signal(symbol, quote_volumes=None):
     try:
-        limit = max(MAJOR_LEN, SPANB_LEN) + 20
-        df = get_klines(symbol, TIMEFRAME, limit=limit)
-        sigs = check_signal(df, symbol)
-        return symbol, sigs
+        signal = analyze_symbol(symbol, quote_volumes=quote_volumes)
+        if signal is None:
+            return None, {"symbol": symbol, "status": "no_signal"}
+        if not should_send(symbol):
+            return None, {"symbol": symbol, "status": "cooldown"}
+        return signal, {"symbol": symbol, "status": "signal"}
     except Exception as e:
-        log.error(f"{symbol} hata: {e}")
-        return symbol, []
+        return None, {"symbol": symbol, "status": "error", "error": str(e)}
 
 
-def run_scan():
-    log.info(f"Tarama basladi TF:{TIMEFRAME} GovdeMin:%{BODY_PCT_MIN} MinLikidite:{MIN_VOLUME/1e6:.1f}M "
-              f"SpanBZorunlu:{REQUIRE_SPANB_CROSS} Max:{MAX_COINS} Paralel:{SCAN_WORKERS}")
-
-    symbols = get_symbols(min_volume=MIN_VOLUME)
-    if not symbols:
-        log.error("Coin listesi alinamadi!")
-        return
-
-    symbols = symbols[:MAX_COINS]
+def run_scan_parallel():
+    symbols = get_symbols()
     total = len(symbols)
-    found = 0
-    scanned = 0
-    t0 = time.time()
+    log.info(f"TARAMA BASLADI | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | Direnc lookback: {RES_LOOKBACK}")
 
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        futures = {pool.submit(_scan_one, coin): coin["symbol"] for coin in symbols}
+    # likidite verisi TEK istekte, tarama basinda bir kez cekilir (600 ayri istek yerine 1 istek)
+    quote_volumes = get_all_24h_quote_volumes() if USE_LIQUIDITY_FILTER else {}
 
+    stats = {"total": total, "signal": 0, "no_signal": 0, "cooldown": 0, "error": 0}
+    found = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(check_signal, s, quote_volumes): s for s in symbols}
+        completed = 0
         for future in as_completed(futures):
-            symbol = futures[future]
-            scanned += 1
+            completed += 1
             try:
-                _, sigs = future.result()
+                signal, info = future.result()
+                status = info["status"]
+                stats[status] = stats.get(status, 0) + 1
+                if status == "signal":
+                    found.append(signal)
             except Exception as e:
-                log.error(f"{symbol} beklenmeyen hata: {e}")
-                continue
+                log.error(f"Future hata: {e}")
+                stats["error"] += 1
 
-            for sig in sigs:
-                if should_send(symbol, sig["type"]):
-                    msg = format_message(symbol, sig)
-                    if send_telegram(msg):
-                        log.info(f"OK {symbol} {sig['type']} govde %{sig['govde_yuzde']}")
-                        found += 1
+            if completed % 100 == 0 or completed == total:
+                log.info(f"[{completed}/{total}] Sinyal:{stats['signal']} NoSignal:{stats['no_signal']} Hata:{stats['error']}")
 
-            if scanned % 50 == 0:
-                log.info(f"[{scanned}/{total}] tarandi {found} sinyal")
+    for signal in found:
+        try:
+            msg = format_signal_message(signal)
+            if send_telegram(msg):
+                log.info(f"SINYAL GONDERILDI: {signal.symbol} fiyat={signal.price:.6f} direnc={signal.resistance:.6f}")
+            else:
+                log.error(f"Telegram gonderilemedi: {signal.symbol}")
+        except Exception as e:
+            log.error(f"Gonderim hatasi {signal.symbol}: {e}")
 
-    elapsed = time.time() - t0
-    log.info(f"Tarama tamamlandi {found} sinyal gonderildi ({elapsed:.1f}sn)")
+    log.info(f"Tarama tamamlandi | {stats['signal']} sinyal | {stats}")
+    return stats["signal"]
 
 
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
 def main():
-    log.info("=" * 55)
-    log.info("MAJOR KIRILIM BOT v2 baslatildi")
-    log.info(f"  Strateji : SMA{MAJOR_LEN} + SpanB{SPANB_LEN} AYNI MUMDA kesisim + govde >= %{BODY_PCT_MIN}")
-    log.info(f"  Fitil    : AL alt <= %{LOW_WICK_MAX} | SAT ust <= %{HIGH_WICK_MAX}")
-    log.info(f"  Zaman    : {TIMEFRAME}")
-    log.info(f"  Likidite : min {MIN_VOLUME/1e6:.1f}M USDT (24s hacim)")
-    log.info(f"  Aralik   : her {SCAN_INTERVAL} saniye")
-    log.info(f"  Max coin : {MAX_COINS}")
-    log.info(f"  Paralel  : {SCAN_WORKERS} worker, {REQUESTS_PER_SEC} istek/sn")
-    log.info("=" * 55)
+    log.info("=" * 60)
+    log.info("15DK DIRENC KIRILIM SCANNER baslatildi")
+    log.info(f"Max coin       : {MAX_COINS}")
+    log.info(f"Workers        : {MAX_WORKERS}")
+    log.info(f"TF             : {TIMEFRAME}")
+    log.info(f"Direnc lookback: {RES_LOOKBACK} mum")
+    log.info(f"Min kirilim    : %{RES_BREAK_PCT}")
+    log.info(f"Min mum govdesi: %{MIN_CANDLE_BODY_PCT}")
+    log.info(f"Likidite filtre: {USE_LIQUIDITY_FILTER} (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)")
+    log.info(f"Para takibi filtre: {USE_MONEY_FLOW_FILTER} (kirilim min %{MIN_TAKER_BUY_RATIO*100:.0f} alici, "
+              f"onceki {AVG_TAKER_LOOKBACK} mum ort. min %{MIN_AVG_TAKER_BUY_RATIO*100:.0f} alici)")
+    log.info(f"MFI filtre     : {USE_MFI_FILTER} (period={MFI_PERIOD}, esik={MFI_THRESHOLD})")
+    log.info(f"Tarama araligi : {SCAN_INTERVAL} sn")
+    log.info(f"Cooldown       : {SIGNAL_COOLDOWN} sn")
+    log.info("=" * 60)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID eksik!")
         return
 
     send_telegram(
-        f"MAJOR KIRILIM BOT v2 BASLADI\n"
-        f"Strateji: SMA{MAJOR_LEN} + SpanB{SPANB_LEN} AYNI MUMDA kesisim + govde >= %{BODY_PCT_MIN}\n"
-        f"Fitil: AL alt <= %{LOW_WICK_MAX} | SAT ust <= %{HIGH_WICK_MAX}\n"
-        f"Likidite: min {MIN_VOLUME/1e6:.1f}M USDT\n"
-        f"Zaman: {TIMEFRAME} | Aralik: {SCAN_INTERVAL//60} dk\n"
-        f"Max coin: {MAX_COINS} | Paralel: {SCAN_WORKERS}\n"
-        f"{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
+        "🚀 DIRENC KIRILIM SCANNER BASLADI\n"
+        + "=" * 30 + "\n"
+        f"💱 TF: {TIMEFRAME}\n"
+        f"📍 Direnc: son {RES_LOOKBACK} mumun en yuksegi\n"
+        f"📏 Min kirilim: %{RES_BREAK_PCT}\n"
+        f"🕯️ Min mum govdesi: %{MIN_CANDLE_BODY_PCT}\n"
+        f"💧 Min likidite: {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT\n"
+        f"💸 Para takibi: {USE_MONEY_FLOW_FILTER} (min %{MIN_TAKER_BUY_RATIO*100:.0f} alici / kirilim, "
+        f"onceki {AVG_TAKER_LOOKBACK} mum ort. min %{MIN_AVG_TAKER_BUY_RATIO*100:.0f})\n"
+        f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn\n"
+        f"⚡ Workers: {MAX_WORKERS}"
     )
 
     while True:
         try:
-            run_scan()
+            run_scan_parallel()
         except Exception as e:
-            log.error(f"Dongu hatasi: {e}")
-            send_telegram(f"Bot Hatasi: {e}")
+            log.error(f"run_scan genel hata: {e}")
 
-        log.info(f"Sonraki tarama {SCAN_INTERVAL} saniye sonra...")
+        log.info(f"{SCAN_INTERVAL}sn bekleniyor...")
         time.sleep(SCAN_INTERVAL)
 
 
