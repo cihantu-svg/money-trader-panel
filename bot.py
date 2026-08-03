@@ -62,6 +62,10 @@ MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "5.0"))    # major_break_pc
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_VOLUME_USDT", "3000000"))  # 3 milyon USDT
 
+# Kirilimin kac bar once olduguna bakmaksizin geriye dogru arayabilmek icin
+# cekilecek toplam mum sayisi. Binance limiti max 1500'dur.
+FETCH_LIMIT = int(os.getenv("FETCH_LIMIT", "500"))
+
 BINANCE_BASE = "https://fapi.binance.com"
 last_signal = {}
 
@@ -154,40 +158,59 @@ def analyze_symbol(symbol, quote_volumes=None):
     if USE_LIQUIDITY_FILTER and qv < MIN_QUOTE_VOLUME_24H:
         return None
 
-    needed = MAJOR_SMA_LEN + MIN_BARS_BELOW + 5
-    df = get_klines_closed(symbol, TIMEFRAME, limit=needed)
-    if df is None or len(df) < needed:
+    # Genis bir pencere cekiyoruz: SMA100'un oturmasi + gercek "75 bar altinda
+    # kalma" streak'ini geriye dogru arayabilmek icin FETCH_LIMIT kadar mum lazim.
+    df = get_klines_closed(symbol, TIMEFRAME, limit=FETCH_LIMIT)
+    if df is None or len(df) < MAJOR_SMA_LEN + MIN_BARS_BELOW + 10:
         return None
 
     df = add_major_level(df, MAJOR_SMA_LEN)
     df = df.dropna(subset=["majorLevel"]).reset_index(drop=True)
-    if len(df) < MIN_BARS_BELOW + 1:
+    if len(df) < MIN_BARS_BELOW + 2:
         return None
 
-    breakout = df.iloc[-1]           # kirilim adayi (son kapanmis) mum
-    close_now = float(breakout["close"])
-    major_now = float(breakout["majorLevel"])
-    bar_time = str(breakout["open_time"])
+    idx = len(df) - 1
+    current = df.iloc[idx]
+    close_now = float(current["close"])
+    major_now = float(current["majorLevel"])
+    bar_time = str(current["open_time"])
 
     if major_now <= 0 or close_now <= major_now:
-        return None  # major level'in ustunde kapanmamis -> kirilim yok
+        return None  # su an major level'in ustunde degil -> aday degil
 
     break_pct = (close_now - major_now) / major_now * 100
     if break_pct < MAJOR_BREAK_PCT:
-        return None  # min %5 kirilim sarti saglanmadi
+        return None  # su an min %5 mesafe yok
 
-    # kirilim mumu HARIC, hemen oncesindeki MIN_BARS_BELOW mum
-    history = df.iloc[-(MIN_BARS_BELOW + 1):-1]
-    below_mask = history["close"] < history["majorLevel"]
-    if not below_mask.all():
-        return None  # kesintisiz "altinda kalmis" sarti bozulmus
+    closes = df["close"].values
+    majors = df["majorLevel"].values
+
+    # Su anki "ustunde" durumun basladigi en son kirilim noktasini geriye
+    # dogru arayarak buluyoruz (kirilim kac bar once olmus fark etmez).
+    i = idx - 1
+    while i >= 0 and closes[i] >= majors[i]:
+        i -= 1
+    if i < 0:
+        return None  # elimizdeki tum veri boyunca zaten ustundeymis, gercek bir kirilim yok
+
+    crossover_index = i  # kirilimdan hemen onceki (altta olan) son bar
+
+    # O kirilim noktasina kadar kesintisiz kac bar altinda kalmis, sayiyoruz
+    below_streak = 0
+    j = crossover_index
+    while j >= 0 and closes[j] < majors[j]:
+        below_streak += 1
+        j -= 1
+
+    if below_streak < MIN_BARS_BELOW:
+        return None  # kirilimdan once yeterince uzun sure altinda kalmamis
 
     return Signal(
         symbol=symbol,
         price=close_now,
         major_level=major_now,
         break_pct=break_pct,
-        bars_below=len(history),
+        bars_below=below_streak,
         bar_time=bar_time,
         quote_volume_24h=qv,
     )
