@@ -56,7 +56,7 @@ TIMEFRAME = os.getenv("SCAN_TIMEFRAME", "5m")
 # --- MAJOR LEVEL (SMA100) STRATEJI AYARLARI (YENI - panele eklenmesi gerekiyor) ---
 MAJOR_SMA_LEN = int(os.getenv("MAJOR_SMA_LEN", "100"))          # Pine'daki major_line_len
 MIN_BARS_BELOW = int(os.getenv("MIN_BARS_BELOW", "75"))         # en az kac bar altinda kalmis olmali
-MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "5.0"))    # major_break_pct - min kirilim yuzdesi
+MAJOR_BREAK_PCT = float(os.getenv("MAJOR_BREAK_PCT", "3.0"))    # major_break_pct - min kirilim yuzdesi
 
 # --- LIKIDITE / ISLEM GIRISI FILTRESI ---
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
@@ -159,7 +159,7 @@ def analyze_symbol(symbol, quote_volumes=None):
         return None
 
     # Genis bir pencere cekiyoruz: SMA100'un oturmasi + gercek "75 bar altinda
-    # kalma" streak'ini geriye dogru arayabilmek icin FETCH_LIMIT kadar mum lazim.
+    # kalma" streak'ini geriye dogru dogrulayabilmek icin FETCH_LIMIT kadar mum lazim.
     df = get_klines_closed(symbol, TIMEFRAME, limit=FETCH_LIMIT)
     if df is None or len(df) < MAJOR_SMA_LEN + MIN_BARS_BELOW + 10:
         return None
@@ -169,35 +169,32 @@ def analyze_symbol(symbol, quote_volumes=None):
     if len(df) < MIN_BARS_BELOW + 2:
         return None
 
-    idx = len(df) - 1
+    idx = len(df) - 1              # SON KAPANMIS mum -> kirilim adayi TAM BU MUM olmali
     current = df.iloc[idx]
     close_now = float(current["close"])
     major_now = float(current["majorLevel"])
     bar_time = str(current["open_time"])
 
-    if major_now <= 0 or close_now <= major_now:
-        return None  # su an major level'in ustunde degil -> aday degil
-
-    break_pct = (close_now - major_now) / major_now * 100
-    if break_pct < MAJOR_BREAK_PCT:
-        return None  # su an min %5 mesafe yok
+    if major_now <= 0:
+        return None
 
     closes = df["close"].values
     majors = df["majorLevel"].values
 
-    # Su anki "ustunde" durumun basladigi en son kirilim noktasini geriye
-    # dogru arayarak buluyoruz (kirilim kac bar once olmus fark etmez).
-    i = idx - 1
-    while i >= 0 and closes[i] >= majors[i]:
-        i -= 1
-    if i < 0:
-        return None  # elimizdeki tum veri boyunca zaten ustundeymis, gercek bir kirilim yok
+    # ── SART 1: bir onceki mum SMA100'un ALTINDA olmali (henuz kirilmamis) ──
+    if closes[idx - 1] >= majors[idx - 1]:
+        return None  # onceki mum zaten ustundeydi -> bu, kirilim mumu degil (eski kirilim)
 
-    crossover_index = i  # kirilimdan hemen onceki (altta olan) son bar
+    # ── SART 2: bu mum (kirilim mumu) kapanista SMA100'u en az %3 ile kirmis olmali ──
+    if close_now <= major_now:
+        return None
+    break_pct = (close_now - major_now) / major_now * 100
+    if break_pct < MAJOR_BREAK_PCT:
+        return None  # kirilim var ama tek mumda yeterli mesafe (%3) yok
 
-    # O kirilim noktasina kadar kesintisiz kac bar altinda kalmis, sayiyoruz
+    # ── SART 3: kirilimdan hemen once en az MIN_BARS_BELOW bar kesintisiz altinda kalmis olmali ──
     below_streak = 0
-    j = crossover_index
+    j = idx - 1
     while j >= 0 and closes[j] < majors[j]:
         below_streak += 1
         j -= 1
