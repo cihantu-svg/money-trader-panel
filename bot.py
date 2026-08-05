@@ -2,6 +2,7 @@
 """
 PURPLE ROSE BOT
 Strateji: Pivot High/Low breakout + Govde kırılımı + Fitil filtresi + Hacim onayı
+- Pivot seviyeleri kırılınca resetlenir (Pine Script 'var' mantığı)
 Zaman: 15m | Borsa: Binance Futures (USDT-M)
 """
 import os
@@ -32,19 +33,19 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "180"))  # 3 dk
-TIMEFRAME = os.environ.get("SCAN_TIMEFRAME", "15m")  # 5 dakika
+TIMEFRAME = os.environ.get("SCAN_TIMEFRAME", "15m")
 MAX_COINS = int(os.environ.get("MAX_COINS", "600"))
-MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "5000000"))  # Min 5M USDT hacim
+MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "5000000"))
 
 # Strateji parametreleri
-PIVOT_LEN = int(os.environ.get("PIVOT_LEN", "5"))        # Pivot uzunluğu
-REQUIRE_BODY = os.environ.get("REQUIRE_BODY", "true").lower() == "true"  # Sadece govde kırılımı
+PIVOT_LEN = int(os.environ.get("PIVOT_LEN", "5"))
+REQUIRE_BODY = os.environ.get("REQUIRE_BODY", "true").lower() == "true"
 USE_WICK_FILTER = os.environ.get("USE_WICK_FILTER", "true").lower() == "true"
-MAX_WICK_RATIO = float(os.environ.get("MAX_WICK_RATIO", "2.0"))  # Max fitil/govde oranı
+MAX_WICK_RATIO = float(os.environ.get("MAX_WICK_RATIO", "2.0"))
 USE_VOLUME_FILTER = os.environ.get("USE_VOLUME_FILTER", "true").lower() == "true"
-VOL_PERIOD = int(os.environ.get("VOL_PERIOD", "20"))     # Hacim ortalama periyodu
-MIN_VOL_MULT = float(os.environ.get("MIN_VOL_MULT", "0.8"))  # Min hacim çarpanı
-SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "1800"))  # 30 dk bekleme
+VOL_PERIOD = int(os.environ.get("VOL_PERIOD", "20"))
+MIN_VOL_MULT = float(os.environ.get("MIN_VOL_MULT", "0.8"))
+SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "1800"))  # 30 dk
 
 # Paralel tarama
 SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "10"))
@@ -57,8 +58,25 @@ SESSION.headers.update({"User-Agent": "PurpleRoseBot/1.0"})
 _adapter = requests.adapters.HTTPAdapter(pool_connections=SCAN_WORKERS, pool_maxsize=SCAN_WORKERS * 2)
 SESSION.mount("https://", _adapter)
 
+# Sinyal takip
 sent_signals: dict = {}
 
+# ============================================================
+# PINE SCRIPT 'VAR' EŞDEĞERİ - COIN BAŞINA DURUM
+# Her coin için: lockedPH, lockedPL, trend (son kırılan pivot)
+# ============================================================
+coin_states: dict = {}  # { "BTCUSDT": {"locked_ph": float|None, "locked_pl": float|None, "trend": int} }
+
+def get_coin_state(symbol: str):
+    if symbol not in coin_states:
+        coin_states[symbol] = {
+            "locked_ph": None,   # Son bulunan pivot high (direnç)
+            "locked_pl": None,   # Son bulunan pivot low (destek)
+            "trend": 0,          # 1=Long, -1=Short, 0=Nötr
+        }
+    return coin_states[symbol]
+
+# Rate limiter
 _rate_lock = threading.Lock()
 _next_slot = [0.0]
 
@@ -156,43 +174,45 @@ def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
 
 
 def find_pivot_highs(high: pd.Series, left: int, right: int):
-    """Pine Script ta.pivothigh birebir implementasyonu"""
+    """Pine Script ta.pivothigh birebir"""
     pivots = []
     for i in range(left, len(high) - right):
         window = high.iloc[i - left:i + right + 1]
         if high.iloc[i] == window.max() and high.iloc[i] > high.iloc[i - 1]:
-            pivots.append((i, high.iloc[i]))
+            pivots.append((i, float(high.iloc[i])))
     return pivots
 
 
 def find_pivot_lows(low: pd.Series, left: int, right: int):
-    """Pine Script ta.pivotlow birebir implementasyonu"""
+    """Pine Script ta.pivotlow birebir"""
     pivots = []
     for i in range(left, len(low) - right):
         window = low.iloc[i - left:i + right + 1]
         if low.iloc[i] == window.min() and low.iloc[i] < low.iloc[i - 1]:
-            pivots.append((i, low.iloc[i]))
+            pivots.append((i, float(low.iloc[i])))
     return pivots
 
 
-def check_signal(df: pd.DataFrame, symbol: str, locked_state: dict) -> list:
+def check_signal(df: pd.DataFrame, symbol: str) -> list:
     """
-    PURPLE ROSE Stratejisi:
-    - Pivot High/Low tespiti
-    - Govde ile kırılım
-    - Fitil filtresi (spike rejection)
-    - Hacim filtresi
+    PURPLE ROSE Stratejisi - PINE SCRIPT 'VAR' MANTIĞI:
+
+    1. Her coin için lockedPH/lockedPL/trend DURUMU saklanır
+    2. Yeni pivot bulunursa -> DURUM güncellenir
+    3. Pivot KIRILINCA -> DURUM resetlenir (Pine: lockedPH := na)
+    4. Sadece kapanmış mumda (-2) değerlendirilir
     """
     if df is None or len(df) < PIVOT_LEN * 4 + 10:
         return []
 
+    state = get_coin_state(symbol)
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
     opn = df["Open"]
     volume = df["Volume"]
 
-    i = -2  # Son kapanmis mum (repaint yok)
+    i = -2  # Son kapanmış mum (repaint yok)
 
     def safe(s, idx, default=0.0):
         try:
@@ -206,24 +226,39 @@ def check_signal(df: pd.DataFrame, symbol: str, locked_state: dict) -> list:
     cur_high = safe(high, i)
     cur_low = safe(low, i)
     cur_vol = safe(volume, i)
+    prev_close = safe(close, i - 1)
 
     if cur_close <= 0 or cur_open <= 0:
         return []
 
-    # === PİVOT TESPİTİ ===
-    # Son N mumda pivot high/low ara
+    # ============================================================
+    # 1. YENİ PİVOT ARA (Pine: if not na(ph) / if not na(pl))
+    # ============================================================
     lookback = min(100, len(df) - PIVOT_LEN * 2)
     ph_list = find_pivot_highs(high.iloc[-lookback:], PIVOT_LEN, PIVOT_LEN)
     pl_list = find_pivot_lows(low.iloc[-lookback:], PIVOT_LEN, PIVOT_LEN)
 
-    # Son pivot seviyeleri
-    locked_ph = ph_list[-1][1] if ph_list else None
-    locked_pl = pl_list[-1][1] if pl_list else None
+    # Yeni pivot bulunduysa DURUM'a kaydet (eski kırılmadıysa güncelle)
+    if ph_list:
+        latest_ph = ph_list[-1][1]
+        # Sadece mevcut lockedPH yoksa veya yeni pivot daha yüksekse güncelle
+        if state["locked_ph"] is None or latest_ph > state["locked_ph"]:
+            state["locked_ph"] = latest_ph
+            log.debug(f"{symbol} Yeni PH: {latest_ph}")
 
-    if locked_ph is None and locked_pl is None:
-        return []
+    if pl_list:
+        latest_pl = pl_list[-1][1]
+        # Sadece mevcut lockedPL yoksa veya yeni pivot daha düşükse güncelle
+        if state["locked_pl"] is None or latest_pl < state["locked_pl"]:
+            state["locked_pl"] = latest_pl
+            log.debug(f"{symbol} Yeni PL: {latest_pl}")
 
-    # === FİTİL FİLTRESİ ===
+    # ============================================================
+    # 2. SİNYAL KOŞULLARI (Pine: barstate.isconfirmed)
+    # ============================================================
+    results = []
+
+    # --- FİTİL FİLTRESİ ---
     candle_body = abs(cur_close - cur_open)
     upper_wick = cur_high - max(cur_close, cur_open)
     lower_wick = min(cur_close, cur_open) - cur_low
@@ -231,57 +266,67 @@ def check_signal(df: pd.DataFrame, symbol: str, locked_state: dict) -> list:
     is_spike_long = USE_WICK_FILTER and candle_body > 0 and (upper_wick > candle_body * MAX_WICK_RATIO)
     is_spike_short = USE_WICK_FILTER and candle_body > 0 and (lower_wick > candle_body * MAX_WICK_RATIO)
 
-    # === HACİM FİLTRESİ ===
+    # --- HACİM FİLTRESİ ---
     vol_sma = volume.rolling(window=VOL_PERIOD).mean().iloc[i]
-    volume_ok = not USE_VOLUME_FILTER or (cur_vol >= vol_sma * MIN_VOL_MULT)
+    volume_ok = not USE_VOLUME_FILTER or (vol_sma > 0 and cur_vol >= vol_sma * MIN_VOL_MULT)
 
-    # === SİNYAL KOŞULLARI ===
-    results = []
-
-    # LONG: Direnç gövde ile yukarı kırıldı
-    if locked_ph is not None:
+    # ============================================================
+    # 3. LONG SİNYALİ (Pine: lockedPH gövde ile kırılınca)
+    # ============================================================
+    if state["locked_ph"] is not None:
+        # Gövde kırılımı kontrolü
         if REQUIRE_BODY:
-            body_break_long = min(cur_close, cur_open) > locked_ph
+            body_break_long = min(cur_close, cur_open) > state["locked_ph"]
         else:
-            body_break_long = cur_close > locked_ph
+            body_break_long = cur_close > state["locked_ph"]
 
-        # Önceki mum seviyenin altında mıydı? (crossover kontrolü)
-        prev_close = safe(close, i - 1)
-        prev_below = prev_close <= locked_ph
+        # Önceki mum pivotun altında/bitişiğinde miydi?
+        prev_below = prev_close <= state["locked_ph"]
 
-        if body_break_long and prev_below and not is_spike_long and volume_ok:
+        if body_break_long and prev_below and not is_spike_long and volume_ok and state["trend"] != 1:
             results.append({
                 "direction": "AL",
                 "type": "PURPLE_ROSE_AL",
                 "price": cur_close,
-                "pivot_level": round(locked_ph, 8),
+                "pivot_level": round(state["locked_ph"], 8),
                 "body": round(candle_body, 8),
                 "upper_wick": round(upper_wick, 8),
                 "lower_wick": round(lower_wick, 8),
                 "volume_ratio": round(cur_vol / vol_sma, 2) if vol_sma > 0 else 0,
             })
+            # PINE: lockedPH := na  -> RESET!
+            state["trend"] = 1
+            state["locked_ph"] = None
+            log.info(f"{symbol} AL SINYALI! PH kırıldı: {cur_close} > {state.get('locked_ph', 'NA')}")
 
-    # SHORT: Destek gövde ile aşağı kırıldı
-    if locked_pl is not None:
+    # ============================================================
+    # 4. SHORT SİNYALİ (Pine: lockedPL gövde ile kırılınca)
+    # ============================================================
+    if state["locked_pl"] is not None:
+        # Gövde kırılımı kontrolü
         if REQUIRE_BODY:
-            body_break_short = max(cur_close, cur_open) < locked_pl
+            body_break_short = max(cur_close, cur_open) < state["locked_pl"]
         else:
-            body_break_short = cur_close < locked_pl
+            body_break_short = cur_close < state["locked_pl"]
 
-        prev_close = safe(close, i - 1)
-        prev_above = prev_close >= locked_pl
+        # Önceki mum pivotun üstünde/bitişiğinde miydi?
+        prev_above = prev_close >= state["locked_pl"]
 
-        if body_break_short and prev_above and not is_spike_short and volume_ok:
+        if body_break_short and prev_above and not is_spike_short and volume_ok and state["trend"] != -1:
             results.append({
                 "direction": "SAT",
                 "type": "PURPLE_ROSE_SAT",
                 "price": cur_close,
-                "pivot_level": round(locked_pl, 8),
+                "pivot_level": round(state["locked_pl"], 8),
                 "body": round(candle_body, 8),
                 "upper_wick": round(upper_wick, 8),
                 "lower_wick": round(lower_wick, 8),
                 "volume_ratio": round(cur_vol / vol_sma, 2) if vol_sma > 0 else 0,
             })
+            # PINE: lockedPL := na  -> RESET!
+            state["trend"] = -1
+            state["locked_pl"] = None
+            log.info(f"{symbol} SAT SINYALI! PL kırıldı: {cur_close} < {state.get('locked_pl', 'NA')}")
 
     return results
 
@@ -345,7 +390,7 @@ def _scan_one(coin):
     try:
         limit = max(PIVOT_LEN * 4 + 20, 100)
         df = get_klines(symbol, TIMEFRAME, limit=limit)
-        sigs = check_signal(df, symbol, {})
+        sigs = check_signal(df, symbol)
         return symbol, sigs
     except Exception as e:
         log.error(f"{symbol} hata: {e}")
