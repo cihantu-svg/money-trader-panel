@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-PURPLE ROSE BOT
-Strateji: Pivot High/Low breakout + Govde kırılımı + Fitil filtresi + Hacim onayı
-- Pivot seviyeleri kırılınca resetlenir (Pine Script 'var' mantığı)
+SPIKE TOUCH BOT
+Strateji: Yatay direnç/destek çizgisi + Min 5 fitil(spike) teması + Gövde kırılımı
 Zaman: 15m | Borsa: Binance Futures (USDT-M)
 """
 import os
@@ -38,14 +37,14 @@ MAX_COINS = int(os.environ.get("MAX_COINS", "600"))
 MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "5000000"))
 
 # Strateji parametreleri
-PIVOT_LEN = int(os.environ.get("PIVOT_LEN", "5"))
+LEVEL_LOOKBACK = int(os.environ.get("LEVEL_LOOKBACK", "100"))      # Kaç mum geriye bakılacak
+LEVEL_TOLERANCE_PCT = float(os.environ.get("LEVEL_TOLERANCE_PCT", "0.002"))  # %0.2 tolerans
+MIN_TOUCHES = int(os.environ.get("MIN_TOUCHES", "5"))              # Min fitil teması
 REQUIRE_BODY = os.environ.get("REQUIRE_BODY", "true").lower() == "true"
-USE_WICK_FILTER = os.environ.get("USE_WICK_FILTER", "true").lower() == "true"
-MAX_WICK_RATIO = float(os.environ.get("MAX_WICK_RATIO", "2.0"))
 USE_VOLUME_FILTER = os.environ.get("USE_VOLUME_FILTER", "true").lower() == "true"
 VOL_PERIOD = int(os.environ.get("VOL_PERIOD", "20"))
-MIN_VOL_MULT = float(os.environ.get("MIN_VOL_MULT", "0.8"))
-SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "1800"))  # 30 dk
+MIN_VOL_MULT = float(os.environ.get("MIN_VOL_MULT", "1.0"))
+SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "1800"))   # 30 dk
 
 # Paralel tarama
 SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "10"))
@@ -54,7 +53,7 @@ TELEGRAM_MSGS_PER_SEC = float(os.environ.get("TELEGRAM_MSGS_PER_SEC", "1.0"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "PurpleRoseBot/1.0"})
+SESSION.headers.update({"User-Agent": "SpikeTouchBot/1.0"})
 _adapter = requests.adapters.HTTPAdapter(pool_connections=SCAN_WORKERS, pool_maxsize=SCAN_WORKERS * 2)
 SESSION.mount("https://", _adapter)
 
@@ -62,24 +61,22 @@ SESSION.mount("https://", _adapter)
 sent_signals: dict = {}
 
 # ============================================================
-# PINE SCRIPT 'VAR' EŞDEĞERİ - COIN BAŞINA DURUM
-# Her coin için: lockedPH, lockedPL, trend (son kırılan pivot)
+# COIN BAŞINA DURUM (Her coin için aktif direnç/destek seviyesi)
 # ============================================================
-coin_states: dict = {}  # { "BTCUSDT": {"locked_ph": float|None, "locked_pl": float|None, "trend": int} }
+coin_states: dict = {}
 
 def get_coin_state(symbol: str):
     if symbol not in coin_states:
         coin_states[symbol] = {
-            "locked_ph": None,   # Son bulunan pivot high (direnç)
-            "locked_pl": None,   # Son bulunan pivot low (destek)
-            "trend": 0,          # 1=Long, -1=Short, 0=Nötr
+            "resistance_level": None,   # Aktif direnç çizgisi
+            "support_level": None,      # Aktif destek çizgisi
+            "trend": 0,                 # 1=Long, -1=Short, 0=Nötr
         }
     return coin_states[symbol]
 
 # Rate limiter
 _rate_lock = threading.Lock()
 _next_slot = [0.0]
-
 
 def _rate_limit_wait():
     with _rate_lock:
@@ -90,10 +87,8 @@ def _rate_limit_wait():
             now = time.time()
         _next_slot[0] = max(now, _next_slot[0]) + 1.0 / REQUESTS_PER_SEC
 
-
 _tg_lock = threading.Lock()
 _tg_next_slot = [0.0]
-
 
 def _telegram_rate_wait():
     with _tg_lock:
@@ -104,7 +99,9 @@ def _telegram_rate_wait():
             now = time.time()
         _tg_next_slot[0] = max(now, _tg_next_slot[0]) + 1.0 / TELEGRAM_MSGS_PER_SEC
 
-
+# ============================================================
+# VERİ ÇEKME
+# ============================================================
 def get_symbols(min_volume: float = 0) -> list:
     try:
         r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=30, verify=False)
@@ -135,7 +132,6 @@ def get_symbols(min_volume: float = 0) -> list:
         log.error(f"get_symbols hata: {e}")
         return []
 
-
 def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
     _rate_limit_wait()
     try:
@@ -144,13 +140,13 @@ def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
             params={"symbol": symbol, "interval": interval, "limit": limit},
             timeout=15, verify=False
         )
-        if r.status_code == 429 or r.status_code == 418:
+        if r.status_code in (429, 418):
             log.warning(f"Rate limit uyarisi ({r.status_code}) {symbol}")
             return None
         if r.status_code != 200:
             return None
         data = r.json()
-        if not isinstance(data, list) or len(data) < PIVOT_LEN * 4 + 10:
+        if not isinstance(data, list) or len(data) < 50:
             return None
         rows = []
         for k in data:
@@ -172,47 +168,120 @@ def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
     except Exception:
         return None
 
+# ============================================================
+# STRATEJI - SEVIYE BULMA & TEMAS SAYMA
+# ============================================================
+def find_level(df: pd.DataFrame, side: str = "resistance", lookback: int = 100,
+               tolerance_pct: float = 0.002, min_touches: int = 5):
+    """
+    Son 'lookback' mumda yatay direnç/destek seviyesi bulur.
+    side='resistance' -> High'lar, side='support' -> Low'lar
+    
+    Donus: (level, touches) veya (None, 0)
+    """
+    if len(df) < lookback + 10:
+        return None, 0
 
-def find_pivot_highs(high: pd.Series, left: int, right: int):
-    """Pine Script ta.pivothigh birebir"""
-    pivots = []
-    for i in range(left, len(high) - right):
-        window = high.iloc[i - left:i + right + 1]
-        if high.iloc[i] == window.max() and high.iloc[i] > high.iloc[i - 1]:
-            pivots.append((i, float(high.iloc[i])))
-    return pivots
+    sub = df.iloc[-lookback:].copy()
+    
+    if side == "resistance":
+        prices = sub["High"].values
+    else:
+        prices = sub["Low"].values
+    
+    prices = [p for p in prices if p > 0]
+    if len(prices) < min_touches:
+        return None, 0
+    
+    # Basit clustering: sirala, yakin fiyatlari grupla
+    sorted_prices = sorted(prices)
+    clusters = []
+    current = [sorted_prices[0]]
+    
+    for p in sorted_prices[1:]:
+        ref = current[0] if current[0] != 0 else 0.0001
+        if abs(p - ref) / ref <= tolerance_pct:
+            current.append(p)
+        else:
+            clusters.append(current)
+            current = [p]
+    clusters.append(current)
+    
+    best_level = None
+    best_touches = 0
+    
+    for cluster in clusters:
+        if len(cluster) < min_touches:
+            continue
+            
+        level = sum(cluster) / len(cluster)
+        touches = 0
+        
+        for idx in range(len(sub)):
+            row = sub.iloc[idx]
+            
+            if side == "resistance":
+                wick_tip = row["High"]
+                body_top = max(row["Open"], row["Close"])
+                # Fitil ucu seviyeye yakin mi?
+                near = abs(wick_tip - level) / level <= tolerance_pct if level > 0 else False
+                # Govde seviyenin ALTINDA mi? (fitil var, govde asmamis)
+                body_below = body_top <= level * (1 + tolerance_pct * 0.3)
+                
+                if near and body_below:
+                    touches += 1
+                    
+            else:  # support
+                wick_tip = row["Low"]
+                body_bottom = min(row["Open"], row["Close"])
+                near = abs(wick_tip - level) / level <= tolerance_pct if level > 0 else False
+                # Govde seviyenin USTUNDE mi?
+                body_above = body_bottom >= level * (1 - tolerance_pct * 0.3)
+                
+                if near and body_above:
+                    touches += 1
+        
+        if touches >= min_touches and touches > best_touches:
+            best_level = level
+            best_touches = touches
+    
+    return best_level, best_touches
 
 
-def find_pivot_lows(low: pd.Series, left: int, right: int):
-    """Pine Script ta.pivotlow birebir"""
-    pivots = []
-    for i in range(left, len(low) - right):
-        window = low.iloc[i - left:i + right + 1]
-        if low.iloc[i] == window.min() and low.iloc[i] < low.iloc[i - 1]:
-            pivots.append((i, float(low.iloc[i])))
-    return pivots
+def count_touches(df: pd.DataFrame, level: float, side: str, lookback: int, tolerance_pct: float):
+    """Belirli bir seviye icin fitil temas sayisini hesaplar"""
+    if len(df) < lookback or level <= 0:
+        return 0
+    sub = df.iloc[-lookback:]
+    touches = 0
+    for idx in range(len(sub)):
+        row = sub.iloc[idx]
+        if side == "resistance":
+            near = abs(row["High"] - level) / level <= tolerance_pct
+            below = max(row["Open"], row["Close"]) <= level * (1 + tolerance_pct * 0.3)
+            if near and below:
+                touches += 1
+        else:
+            near = abs(row["Low"] - level) / level <= tolerance_pct
+            above = min(row["Open"], row["Close"]) >= level * (1 - tolerance_pct * 0.3)
+            if near and above:
+                touches += 1
+    return touches
 
 
 def check_signal(df: pd.DataFrame, symbol: str) -> list:
     """
-    PURPLE ROSE Stratejisi - PINE SCRIPT 'VAR' MANTIĞI:
-
-    1. Her coin için lockedPH/lockedPL/trend DURUMU saklanır
-    2. Yeni pivot bulunursa -> DURUM güncellenir
-    3. Pivot KIRILINCA -> DURUM resetlenir (Pine: lockedPH := na)
-    4. Sadece kapanmış mumda (-2) değerlendirilir
+    Strateji:
+    1. Son N mumda en cok fitil temasi olan yatay seviyeyi bul
+    2. Min 5 temas varsa seviyeyi "aktif" olarak kaydet
+    3. Son kapanmis mumda GOVDE ile kirilim varsa sinyal ver
+    4. Kirilim sonrasi seviyeyi resetle
     """
-    if df is None or len(df) < PIVOT_LEN * 4 + 10:
+    if df is None or len(df) < LEVEL_LOOKBACK + 20:
         return []
 
     state = get_coin_state(symbol)
-    close = df["Close"]
-    high = df["High"]
-    low = df["Low"]
-    opn = df["Open"]
-    volume = df["Volume"]
-
-    i = -2  # Son kapanmış mum (repaint yok)
+    i = -2  # Son kapanmis mum (repaint yok)
 
     def safe(s, idx, default=0.0):
         try:
@@ -221,116 +290,111 @@ def check_signal(df: pd.DataFrame, symbol: str) -> list:
         except Exception:
             return default
 
-    cur_close = safe(close, i)
-    cur_open = safe(opn, i)
-    cur_high = safe(high, i)
-    cur_low = safe(low, i)
-    cur_vol = safe(volume, i)
-    prev_close = safe(close, i - 1)
+    cur_close = safe(df["Close"], i)
+    cur_open = safe(df["Open"], i)
+    prev_close = safe(df["Close"], i - 1)
+    cur_vol = safe(df["Volume"], i)
 
     if cur_close <= 0 or cur_open <= 0:
         return []
 
-    # ============================================================
-    # 1. YENİ PİVOT ARA (Pine: if not na(ph) / if not na(pl))
-    # ============================================================
-    lookback = min(100, len(df) - PIVOT_LEN * 2)
-    ph_list = find_pivot_highs(high.iloc[-lookback:], PIVOT_LEN, PIVOT_LEN)
-    pl_list = find_pivot_lows(low.iloc[-lookback:], PIVOT_LEN, PIVOT_LEN)
-
-    # Yeni pivot bulunduysa DURUM'a kaydet (eski kırılmadıysa güncelle)
-    if ph_list:
-        latest_ph = ph_list[-1][1]
-        # Sadece mevcut lockedPH yoksa veya yeni pivot daha yüksekse güncelle
-        if state["locked_ph"] is None or latest_ph > state["locked_ph"]:
-            state["locked_ph"] = latest_ph
-            log.debug(f"{symbol} Yeni PH: {latest_ph}")
-
-    if pl_list:
-        latest_pl = pl_list[-1][1]
-        # Sadece mevcut lockedPL yoksa veya yeni pivot daha düşükse güncelle
-        if state["locked_pl"] is None or latest_pl < state["locked_pl"]:
-            state["locked_pl"] = latest_pl
-            log.debug(f"{symbol} Yeni PL: {latest_pl}")
-
-    # ============================================================
-    # 2. SİNYAL KOŞULLARI (Pine: barstate.isconfirmed)
-    # ============================================================
     results = []
 
-    # --- FİTİL FİLTRESİ ---
-    candle_body = abs(cur_close - cur_open)
-    upper_wick = cur_high - max(cur_close, cur_open)
-    lower_wick = min(cur_close, cur_open) - cur_low
-
-    is_spike_long = USE_WICK_FILTER and candle_body > 0 and (upper_wick > candle_body * MAX_WICK_RATIO)
-    is_spike_short = USE_WICK_FILTER and candle_body > 0 and (lower_wick > candle_body * MAX_WICK_RATIO)
-
-    # --- HACİM FİLTRESİ ---
-    vol_sma = volume.rolling(window=VOL_PERIOD).mean().iloc[i]
+    # Hacim filtresi
+    vol_sma = df["Volume"].rolling(window=VOL_PERIOD).mean().iloc[i]
     volume_ok = not USE_VOLUME_FILTER or (vol_sma > 0 and cur_vol >= vol_sma * MIN_VOL_MULT)
 
     # ============================================================
-    # 3. LONG SİNYALİ (Pine: lockedPH gövde ile kırılınca)
+    # LONG - DIRENC KIRILIMI
     # ============================================================
-    if state["locked_ph"] is not None:
-        # Gövde kırılımı kontrolü
-        if REQUIRE_BODY:
-            body_break_long = min(cur_close, cur_open) > state["locked_ph"]
+    res_level, _ = find_level(df, "resistance", LEVEL_LOOKBACK, LEVEL_TOLERANCE_PCT, MIN_TOUCHES)
+    
+    if res_level is not None:
+        # Eski direncle ayni zone'da mi? (sallanmaları yumusat)
+        if state["resistance_level"] is not None and state["resistance_level"] > 0:
+            if abs(res_level - state["resistance_level"]) / state["resistance_level"] <= LEVEL_TOLERANCE_PCT:
+                state["resistance_level"] = (state["resistance_level"] + res_level) / 2
+            else:
+                state["resistance_level"] = res_level
         else:
-            body_break_long = cur_close > state["locked_ph"]
+            state["resistance_level"] = res_level
 
-        # Önceki mum pivotun altında/bitişiğinde miydi?
-        prev_below = prev_close <= state["locked_ph"]
-
-        if body_break_long and prev_below and not is_spike_long and volume_ok and state["trend"] != 1:
+    if state["resistance_level"] is not None:
+        # Govde kirilimi kontrolu
+        if REQUIRE_BODY:
+            body_break = min(cur_close, cur_open) > state["resistance_level"]
+        else:
+            body_break = cur_close > state["resistance_level"]
+        
+        # Onceki mum direncin altinda/bitisiginde miydi?
+        prev_below = prev_close <= state["resistance_level"]
+        
+        # Mevcut seviye icin guncel temas sayisi
+        actual_touches = count_touches(df, state["resistance_level"], "resistance", 
+                                       LEVEL_LOOKBACK, LEVEL_TOLERANCE_PCT)
+        
+        if (body_break and prev_below and actual_touches >= MIN_TOUCHES and 
+            volume_ok and state["trend"] != 1):
+            
             results.append({
                 "direction": "AL",
-                "type": "PURPLE_ROSE_AL",
+                "type": "SPIKE_TOUCH_AL",
                 "price": cur_close,
-                "pivot_level": round(state["locked_ph"], 8),
-                "body": round(candle_body, 8),
-                "upper_wick": round(upper_wick, 8),
-                "lower_wick": round(lower_wick, 8),
+                "level": round(state["resistance_level"], 8),
+                "touches": actual_touches,
                 "volume_ratio": round(cur_vol / vol_sma, 2) if vol_sma > 0 else 0,
             })
-            # PINE: lockedPH := na  -> RESET!
             state["trend"] = 1
-            state["locked_ph"] = None
-            log.info(f"{symbol} AL SINYALI! PH kırıldı: {cur_close} > {state.get('locked_ph', 'NA')}")
+            log.info(f"{symbol} AL SINYALI! Direnc {actual_touches}x temas sonrasi kirildi: "
+                     f"{cur_close} > {state['resistance_level']}")
+            state["resistance_level"] = None  # RESET
 
     # ============================================================
-    # 4. SHORT SİNYALİ (Pine: lockedPL gövde ile kırılınca)
+    # SHORT - DESTEK KIRILIMI
     # ============================================================
-    if state["locked_pl"] is not None:
-        # Gövde kırılımı kontrolü
-        if REQUIRE_BODY:
-            body_break_short = max(cur_close, cur_open) < state["locked_pl"]
+    sup_level, _ = find_level(df, "support", LEVEL_LOOKBACK, LEVEL_TOLERANCE_PCT, MIN_TOUCHES)
+    
+    if sup_level is not None:
+        if state["support_level"] is not None and state["support_level"] > 0:
+            if abs(sup_level - state["support_level"]) / state["support_level"] <= LEVEL_TOLERANCE_PCT:
+                state["support_level"] = (state["support_level"] + sup_level) / 2
+            else:
+                state["support_level"] = sup_level
         else:
-            body_break_short = cur_close < state["locked_pl"]
+            state["support_level"] = sup_level
 
-        # Önceki mum pivotun üstünde/bitişiğinde miydi?
-        prev_above = prev_close >= state["locked_pl"]
-
-        if body_break_short and prev_above and not is_spike_short and volume_ok and state["trend"] != -1:
+    if state["support_level"] is not None:
+        if REQUIRE_BODY:
+            body_break = max(cur_close, cur_open) < state["support_level"]
+        else:
+            body_break = cur_close < state["support_level"]
+        
+        prev_above = prev_close >= state["support_level"]
+        
+        actual_touches = count_touches(df, state["support_level"], "support",
+                                       LEVEL_LOOKBACK, LEVEL_TOLERANCE_PCT)
+        
+        if (body_break and prev_above and actual_touches >= MIN_TOUCHES and
+            volume_ok and state["trend"] != -1):
+            
             results.append({
                 "direction": "SAT",
-                "type": "PURPLE_ROSE_SAT",
+                "type": "SPIKE_TOUCH_SAT",
                 "price": cur_close,
-                "pivot_level": round(state["locked_pl"], 8),
-                "body": round(candle_body, 8),
-                "upper_wick": round(upper_wick, 8),
-                "lower_wick": round(lower_wick, 8),
+                "level": round(state["support_level"], 8),
+                "touches": actual_touches,
                 "volume_ratio": round(cur_vol / vol_sma, 2) if vol_sma > 0 else 0,
             })
-            # PINE: lockedPL := na  -> RESET!
             state["trend"] = -1
-            state["locked_pl"] = None
-            log.info(f"{symbol} SAT SINYALI! PL kırıldı: {cur_close} < {state.get('locked_pl', 'NA')}")
+            log.info(f"{symbol} SAT SINYALI! Destek {actual_touches}x temas sonrasi kirildi: "
+                     f"{cur_close} < {state['support_level']}")
+            state["support_level"] = None  # RESET
 
     return results
 
-
+# ============================================================
+# TELEGRAM & FORMAT
+# ============================================================
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram token veya chat_id eksik!")
@@ -347,34 +411,32 @@ def send_telegram(message: str) -> bool:
         log.error(f"Telegram hata: {e}")
         return False
 
-
 def format_message(symbol: str, sig: dict) -> str:
     yon = sig["direction"]
     if yon == "AL":
-        bas = "AL SINYALI (YUKARI KIRILIM)"
+        bas = "AL SINYALI (DIRENC KIRILIMI)"
+        emoji = "🟢"
     else:
-        bas = "SAT SINYALI (ASAGI KIRILIM)"
+        bas = "SAT SINYALI (DESTEK KIRILIMI)"
+        emoji = "🔴"
 
     coin = symbol.replace("USDT", "/USDT")
 
     lines = [
-        bas,
-        "-" * 20,
+        f"{emoji} {bas}",
+        "-" * 24,
         f"Coin: {coin}",
         f"Zaman: {TIMEFRAME}",
-        f"Pivot Kırılım: {sig['type']}",
-        "-" * 20,
+        f"Strateji: {sig['touches']}x Fitil Temas + Govde Kırılımı",
+        "-" * 24,
         f"Fiyat: {sig['price']}",
-        f"Pivot Seviyesi: {sig['pivot_level']}",
-        f"Govde: {sig['body']}",
-        f"Ust Fitil: {sig['upper_wick']}",
-        f"Alt Fitil: {sig['lower_wick']}",
+        f"Seviye: {sig['level']}",
+        f"Temas Sayisi: {sig['touches']}",
         f"Hacim Orani: {sig['volume_ratio']}x",
-        "-" * 20,
+        "-" * 24,
         datetime.now().strftime('%H:%M:%S %d/%m/%Y')
     ]
     return "\n".join(lines)
-
 
 def should_send(symbol: str, sig_type: str) -> bool:
     key = f"{symbol}_{sig_type}"
@@ -384,11 +446,13 @@ def should_send(symbol: str, sig_type: str) -> bool:
     sent_signals[key] = now
     return True
 
-
+# ============================================================
+# TARAMA & MAIN
+# ============================================================
 def _scan_one(coin):
     symbol = coin["symbol"]
     try:
-        limit = max(PIVOT_LEN * 4 + 20, 100)
+        limit = max(LEVEL_LOOKBACK + 50, 150)
         df = get_klines(symbol, TIMEFRAME, limit=limit)
         sigs = check_signal(df, symbol)
         return symbol, sigs
@@ -396,9 +460,9 @@ def _scan_one(coin):
         log.error(f"{symbol} hata: {e}")
         return symbol, []
 
-
 def run_scan():
-    log.info(f"Tarama basladi TF:{TIMEFRAME} PivotLen:{PIVOT_LEN} Max:{MAX_COINS}")
+    log.info(f"Tarama basladi TF:{TIMEFRAME} Lookback:{LEVEL_LOOKBACK} "
+             f"MinTouches:{MIN_TOUCHES} Tol:{LEVEL_TOLERANCE_PCT}")
 
     symbols = get_symbols(min_volume=MIN_VOLUME)
     if not symbols:
@@ -427,7 +491,8 @@ def run_scan():
                 if should_send(symbol, sig["type"]):
                     msg = format_message(symbol, sig)
                     if send_telegram(msg):
-                        log.info(f"OK {symbol} {sig['type']} pivot:{sig['pivot_level']}")
+                        log.info(f"OK {symbol} {sig['type']} seviye:{sig['level']} "
+                                 f"temas:{sig['touches']}")
                         found += 1
 
             if scanned % 50 == 0:
@@ -436,27 +501,27 @@ def run_scan():
     elapsed = time.time() - t0
     log.info(f"Tarama tamamlandi {found} sinyal gonderildi ({elapsed:.1f}sn)")
 
-
 def main():
-    log.info("=" * 55)
-    log.info("PURPLE ROSE BOT baslatildi")
-    log.info(f"  Strateji : Pivot High/Low breakout + Govde + Fitil + Hacim")
+    log.info("=" * 60)
+    log.info("SPIKE TOUCH BOT baslatildi")
+    log.info(f"  Strateji : Yatay Seviye + {MIN_TOUCHES}x Fitil Temas + Govde Kirilimi")
     log.info(f"  Zaman    : {TIMEFRAME}")
+    log.info(f"  Lookback : {LEVEL_LOOKBACK} mum")
+    log.info(f"  Tolerans : {LEVEL_TOLERANCE_PCT*100}%")
     log.info(f"  Min Vol  : {MIN_VOLUME} USDT")
     log.info(f"  Aralik   : her {SCAN_INTERVAL} saniye")
     log.info(f"  Max coin : {MAX_COINS}")
-    log.info(f"  Paralel  : {SCAN_WORKERS} worker, {REQUESTS_PER_SEC} istek/sn")
-    log.info("=" * 55)
+    log.info("=" * 60)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID eksik!")
         return
 
     send_telegram(
-        f"PURPLE ROSE BOT BASLADI\n"
-        f"Strateji: Pivot Breakout + Govde + Fitil + Hacim\n"
-        f"Zaman: {TIMEFRAME} | Min Hacim: {MIN_VOLUME} USDT\n"
-        f"Aralik: {SCAN_INTERVAL//60} dk | Max Coin: {MAX_COINS}\n"
+        f"SPIKE TOUCH BOT BASLADI\n"
+        f"Strateji: Yatay Seviye + {MIN_TOUCHES}x Fitil Temas + Govde Kırılımı\n"
+        f"Zaman: {TIMEFRAME} | Lookback: {LEVEL_LOOKBACK} | Tolerans: {LEVEL_TOLERANCE_PCT*100}%\n"
+        f"Min Hacim: {MIN_VOLUME} USDT | Aralik: {SCAN_INTERVAL//60} dk\n"
         f"{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
     )
 
@@ -469,7 +534,6 @@ def main():
 
         log.info(f"Sonraki tarama {SCAN_INTERVAL} saniye sonra...")
         time.sleep(SCAN_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
