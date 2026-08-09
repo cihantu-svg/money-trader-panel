@@ -1,539 +1,468 @@
 # -*- coding: utf-8 -*-
 """
-SPIKE TOUCH BOT
-Strateji: Yatay direnç/destek çizgisi + Min 5 fitil(spike) teması + Gövde kırılımı
-Zaman: 15m | Borsa: Binance Futures (USDT-M)
+DIRENC KIRILIM SCANNER - GERIYE DONUK BACKTEST
+================================================
+Amac: Mevcut "15DK DIRENC KIRILIM SCANNER" botunun urettigi sinyalleri
+gecmis veride yeniden uretip, her sinyal icin:
+  - +%7 hedefine ulasti mi (stop'tan once)?
+  - +%20 hedefine ulasti mi (stop'tan once)?
+  - Ek metrikler: hacim orani, RSI(14), 1s trend yonu, ATR/govde orani,
+    retest olustu mu ve retest tuttu mu?
+hesaplayip CSV'ye yazar. Boylece "hangi filtre basari oranini artiriyor"
+sorusuna veriyle cevap verebiliriz.
+
+ONEMLI: Bu script Binance Futures API'sine (fapi.binance.com) canli agi
+gerektirir. Kendi sunucunda / botun calistigi ortamda calistir.
+
+Kullanim:
+    pip install requests pandas numpy
+    python backtest_direnc_kirilim.py
+
+Cikti:
+    backtest_signals.csv   -> her sinyalin tum detaylari + sonuc
+    backtest_summary.csv   -> filtre kirilimlarina gore basari oranlari
 """
 import os
+import sys
 import time
 import logging
-import threading
-from datetime import datetime
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
 import numpy as np
-import urllib3
-import warnings
 
-urllib3.disable_warnings()
-warnings.filterwarnings('ignore')
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
-# ============================================================
-# AYARLAR (Render Environment Variables)
-# ============================================================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-SCAN_INTERVAL = int(os.environ.get("SCAN_INTERVAL_SEC", "180"))  # 3 dk
-TIMEFRAME = os.environ.get("SCAN_TIMEFRAME", "15m")
-MAX_COINS = int(os.environ.get("MAX_COINS", "600"))
-MIN_VOLUME = float(os.environ.get("MIN_VOLUME_USDT", "5000000"))
-
-# Strateji parametreleri
-LEVEL_LOOKBACK = int(os.environ.get("LEVEL_LOOKBACK", "100"))      # Kaç mum geriye bakılacak
-LEVEL_TOLERANCE_PCT = float(os.environ.get("LEVEL_TOLERANCE_PCT", "0.002"))  # %0.2 tolerans
-MIN_TOUCHES = int(os.environ.get("MIN_TOUCHES", "5"))              # Min fitil teması
-REQUIRE_BODY = os.environ.get("REQUIRE_BODY", "true").lower() == "true"
-USE_VOLUME_FILTER = os.environ.get("USE_VOLUME_FILTER", "true").lower() == "true"
-VOL_PERIOD = int(os.environ.get("VOL_PERIOD", "20"))
-MIN_VOL_MULT = float(os.environ.get("MIN_VOL_MULT", "1.0"))
-SIGNAL_COOLDOWN = int(os.environ.get("SIGNAL_COOLDOWN", "1800"))   # 30 dk
-
-# Paralel tarama
-SCAN_WORKERS = int(os.environ.get("SCAN_WORKERS", "10"))
-REQUESTS_PER_SEC = float(os.environ.get("REQUESTS_PER_SEC", "8"))
-TELEGRAM_MSGS_PER_SEC = float(os.environ.get("TELEGRAM_MSGS_PER_SEC", "1.0"))
-
+# ══════════════════════════════════════════════════════════════════
+# AYARLAR (sinyal mantigi botla BIREBIR ayni tutuldu)
+# ══════════════════════════════════════════════════════════════════
 BINANCE_BASE = "https://fapi.binance.com"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": "SpikeTouchBot/1.0"})
-_adapter = requests.adapters.HTTPAdapter(pool_connections=SCAN_WORKERS, pool_maxsize=SCAN_WORKERS * 2)
-SESSION.mount("https://", _adapter)
 
-# Sinyal takip
-sent_signals: dict = {}
+TIMEFRAME = "15m"
+RES_LOOKBACK = int(os.getenv("RES_LOOKBACK", "50"))
+RES_BREAK_PCT = float(os.getenv("RES_BREAK_PCT", "0.5"))
+MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "10.0"))
 
-# ============================================================
-# COIN BAŞINA DURUM (Her coin için aktif direnç/destek seviyesi)
-# ============================================================
-coin_states: dict = {}
+USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "5000000"))
 
-def get_coin_state(symbol: str):
-    if symbol not in coin_states:
-        coin_states[symbol] = {
-            "resistance_level": None,   # Aktif direnç çizgisi
-            "support_level": None,      # Aktif destek çizgisi
-            "trend": 0,                 # 1=Long, -1=Short, 0=Nötr
-        }
-    return coin_states[symbol]
+# --- BACKTEST AYARLARI ---
+BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "30"))
+MAX_COINS = int(os.getenv("MAX_COINS", "150"))          # once kucuk basla, sonra artir
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+SYMBOLS_OVERRIDE = os.getenv("SYMBOLS_OVERRIDE", "")     # "BTCUSDT,ETHUSDT" gibi, bos ise otomatik secilir
 
-# Rate limiter
-_rate_lock = threading.Lock()
-_next_slot = [0.0]
+# Sonuc degerlendirme
+TARGETS_PCT = [7.0, 20.0]
+FORWARD_MAX_BARS = int(os.getenv("FORWARD_MAX_BARS", "192"))   # 192*15dk = 48 saat
+RETEST_LOOKAHEAD_BARS = int(os.getenv("RETEST_LOOKAHEAD_BARS", "20"))
+RETEST_TOUCH_TOLERANCE_PCT = 0.3   # direncin %0.3 yakinina dokunma = retest sayilir
 
-def _rate_limit_wait():
-    with _rate_lock:
-        now = time.time()
-        wait = _next_slot[0] - now
-        if wait > 0:
-            time.sleep(wait)
-            now = time.time()
-        _next_slot[0] = max(now, _next_slot[0]) + 1.0 / REQUESTS_PER_SEC
+OUTPUT_CSV = os.getenv("OUTPUT_CSV", "backtest_signals.csv")
+SUMMARY_CSV = os.getenv("SUMMARY_CSV", "backtest_summary.csv")
 
-_tg_lock = threading.Lock()
-_tg_next_slot = [0.0]
+session = requests.Session()
 
-def _telegram_rate_wait():
-    with _tg_lock:
-        now = time.time()
-        wait = _tg_next_slot[0] - now
-        if wait > 0:
-            time.sleep(wait)
-            now = time.time()
-        _tg_next_slot[0] = max(now, _tg_next_slot[0]) + 1.0 / TELEGRAM_MSGS_PER_SEC
 
-# ============================================================
-# VERİ ÇEKME
-# ============================================================
-def get_symbols(min_volume: float = 0) -> list:
-    try:
-        r = SESSION.get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=30, verify=False)
-        if r.status_code != 200:
-            log.error(f"Sembol listesi alinamadi: HTTP {r.status_code}")
-            return []
-        data = r.json()
-        exclude = ("3L", "3S", "5L", "5S", "UP", "DOWN", "BULL", "BEAR")
-        symbols = []
-        for t in data:
-            sym = str(t.get("symbol", "")).upper()
-            if not sym.endswith("USDT") or "_" in sym:
+# ══════════════════════════════════════════════════════════════════
+# BINANCE VERI CEKME (pagination + basit rate-limit koruma)
+# ══════════════════════════════════════════════════════════════════
+def _get(url, params=None, retries=3):
+    for attempt in range(retries):
+        try:
+            r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 429 or r.status_code == 418:
+                wait = 5 * (attempt + 1)
+                log.warning(f"Rate limit ({r.status_code}), {wait}sn bekleniyor...")
+                time.sleep(wait)
                 continue
-            if any(sym[:-4].endswith(x) for x in exclude):
-                continue
-            qv = float(t.get("quoteVolume") or 0)
-            if qv < min_volume:
-                continue
-            symbols.append({
-                "symbol": sym,
-                "volume_24h": qv,
-                "price": float(t.get("lastPrice") or 0),
-                "change_24h": float(t.get("priceChangePercent") or 0),
-            })
-        symbols.sort(key=lambda x: x["volume_24h"], reverse=True)
-        return symbols
-    except Exception as e:
-        log.error(f"get_symbols hata: {e}")
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            if attempt == retries - 1:
+                log.error(f"Istek basarisiz ({url}): {e}")
+                return None
+            time.sleep(2 * (attempt + 1))
+    return None
+
+
+def get_symbols():
+    if SYMBOLS_OVERRIDE.strip():
+        return [s.strip().upper() for s in SYMBOLS_OVERRIDE.split(",") if s.strip()]
+
+    data = _get(f"{BINANCE_BASE}/fapi/v1/exchangeInfo")
+    if not data:
         return []
+    syms = [s["symbol"] for s in data["symbols"]
+            if s["symbol"].endswith("USDT") and s["status"] == "TRADING"]
 
-def get_klines(symbol: str, interval: str = "15m", limit: int = 200):
-    _rate_limit_wait()
-    try:
-        r = SESSION.get(
-            f"{BINANCE_BASE}/fapi/v1/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=15, verify=False
-        )
-        if r.status_code in (429, 418):
-            log.warning(f"Rate limit uyarisi ({r.status_code}) {symbol}")
-            return None
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        if not isinstance(data, list) or len(data) < 50:
-            return None
-        rows = []
-        for k in data:
-            try:
-                rows.append({
-                    "ts": pd.to_datetime(int(k[0]), unit="ms"),
-                    "Open": float(k[1]),
-                    "High": float(k[2]),
-                    "Low": float(k[3]),
-                    "Close": float(k[4]),
-                    "Volume": float(k[5]),
-                })
-            except Exception:
-                continue
-        if len(rows) < 50:
-            return None
-        df = pd.DataFrame(rows).set_index("ts")
-        return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-    except Exception:
+    if USE_LIQUIDITY_FILTER:
+        vols = get_all_24h_quote_volumes()
+        syms = [s for s in syms if vols.get(s, 0) >= MIN_QUOTE_VOLUME_24H]
+        # en yuksek hacimliden basla (backtest'i temsili ve verimli tutmak icin)
+        syms.sort(key=lambda s: vols.get(s, 0), reverse=True)
+
+    return syms[:MAX_COINS]
+
+
+def get_all_24h_quote_volumes():
+    data = _get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr")
+    if not data:
+        return {}
+    return {d["symbol"]: float(d.get("quoteVolume", 0)) for d in data}
+
+
+def get_klines_range(symbol, interval, start_ms, end_ms, limit=1500):
+    """Belirtilen araligi (start_ms -> end_ms) sayfalayarak ceker."""
+    all_rows = []
+    cur = start_ms
+    guard = 0
+    while cur < end_ms and guard < 50:  # guard: sonsuz donguye karsi
+        guard += 1
+        params = {"symbol": symbol, "interval": interval, "startTime": cur,
+                   "endTime": end_ms, "limit": limit}
+        raw = _get(f"{BINANCE_BASE}/fapi/v1/klines", params=params)
+        if not raw:
+            break
+        all_rows.extend(raw)
+        if len(raw) < limit:
+            break
+        cur = raw[-1][0] + 1  # son mumun acilis zamanindan 1ms sonrasi
+        time.sleep(0.05)  # nazik ol, rate limit yeme
+
+    if not all_rows:
         return None
 
-# ============================================================
-# STRATEJI - SEVIYE BULMA & TEMAS SAYMA
-# ============================================================
-def find_level(df: pd.DataFrame, side: str = "resistance", lookback: int = 100,
-               tolerance_pct: float = 0.002, min_touches: int = 5):
-    """
-    Son 'lookback' mumda yatay direnç/destek seviyesi bulur.
-    side='resistance' -> High'lar, side='support' -> Low'lar
-    
-    Donus: (level, touches) veya (None, 0)
-    """
-    if len(df) < lookback + 10:
-        return None, 0
-
-    sub = df.iloc[-lookback:].copy()
-    
-    if side == "resistance":
-        prices = sub["High"].values
-    else:
-        prices = sub["Low"].values
-    
-    prices = [p for p in prices if p > 0]
-    if len(prices) < min_touches:
-        return None, 0
-    
-    # Basit clustering: sirala, yakin fiyatlari grupla
-    sorted_prices = sorted(prices)
-    clusters = []
-    current = [sorted_prices[0]]
-    
-    for p in sorted_prices[1:]:
-        ref = current[0] if current[0] != 0 else 0.0001
-        if abs(p - ref) / ref <= tolerance_pct:
-            current.append(p)
-        else:
-            clusters.append(current)
-            current = [p]
-    clusters.append(current)
-    
-    best_level = None
-    best_touches = 0
-    
-    for cluster in clusters:
-        if len(cluster) < min_touches:
-            continue
-            
-        level = sum(cluster) / len(cluster)
-        touches = 0
-        
-        for idx in range(len(sub)):
-            row = sub.iloc[idx]
-            
-            if side == "resistance":
-                wick_tip = row["High"]
-                body_top = max(row["Open"], row["Close"])
-                # Fitil ucu seviyeye yakin mi?
-                near = abs(wick_tip - level) / level <= tolerance_pct if level > 0 else False
-                # Govde seviyenin ALTINDA mi? (fitil var, govde asmamis)
-                body_below = body_top <= level * (1 + tolerance_pct * 0.3)
-                
-                if near and body_below:
-                    touches += 1
-                    
-            else:  # support
-                wick_tip = row["Low"]
-                body_bottom = min(row["Open"], row["Close"])
-                near = abs(wick_tip - level) / level <= tolerance_pct if level > 0 else False
-                # Govde seviyenin USTUNDE mi?
-                body_above = body_bottom >= level * (1 - tolerance_pct * 0.3)
-                
-                if near and body_above:
-                    touches += 1
-        
-        if touches >= min_touches and touches > best_touches:
-            best_level = level
-            best_touches = touches
-    
-    return best_level, best_touches
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume", "close_time",
+        "qav", "trades", "tbv", "tqv", "ignore"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df.drop_duplicates(subset="open_time").reset_index(drop=True)
+    return df
 
 
-def count_touches(df: pd.DataFrame, level: float, side: str, lookback: int, tolerance_pct: float):
-    """Belirli bir seviye icin fitil temas sayisini hesaplar"""
-    if len(df) < lookback or level <= 0:
-        return 0
-    sub = df.iloc[-lookback:]
-    touches = 0
-    for idx in range(len(sub)):
-        row = sub.iloc[idx]
-        if side == "resistance":
-            near = abs(row["High"] - level) / level <= tolerance_pct
-            below = max(row["Open"], row["Close"]) <= level * (1 + tolerance_pct * 0.3)
-            if near and below:
-                touches += 1
-        else:
-            near = abs(row["Low"] - level) / level <= tolerance_pct
-            above = min(row["Open"], row["Close"]) >= level * (1 - tolerance_pct * 0.3)
-            if near and above:
-                touches += 1
-    return touches
+# ══════════════════════════════════════════════════════════════════
+# INDIKATORLER
+# ══════════════════════════════════════════════════════════════════
+def compute_rsi(close: pd.Series, period=14):
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(50)
 
 
-def check_signal(df: pd.DataFrame, symbol: str) -> list:
-    """
-    Strateji:
-    1. Son N mumda en cok fitil temasi olan yatay seviyeyi bul
-    2. Min 5 temas varsa seviyeyi "aktif" olarak kaydet
-    3. Son kapanmis mumda GOVDE ile kirilim varsa sinyal ver
-    4. Kirilim sonrasi seviyeyi resetle
-    """
-    if df is None or len(df) < LEVEL_LOOKBACK + 20:
+def compute_atr(df: pd.DataFrame, period=14):
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
+def compute_ema(series: pd.Series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
+# ══════════════════════════════════════════════════════════════════
+# SINYAL TESPITI (bot ile ayni mantik, tum gecmis uzerinde tarama)
+# ══════════════════════════════════════════════════════════════════
+@dataclass
+class SignalRecord:
+    symbol: str
+    signal_time: str
+    entry_price: float
+    resistance: float
+    break_pct: float
+    body_pct: float
+    volume_ratio: float
+    rsi14: float
+    atr_body_ratio: float
+    trend_1h_up: bool
+    retest_occurred: bool
+    retest_held: bool
+    retest_bars: object
+    outcome_7pct: str
+    bars_to_7pct: object
+    outcome_20pct: str
+    bars_to_20pct: object
+    bars_to_stop: object
+
+
+def find_signals_and_evaluate(symbol, df15, df1h):
+    """df15: 15dk mum verisi (tum backtest penceresi + RES_LOOKBACK icin ekstra pay).
+    df1h: 1s mum verisi (trend icin)."""
+    if df15 is None or len(df15) < RES_LOOKBACK + FORWARD_MAX_BARS + 5:
         return []
 
-    state = get_coin_state(symbol)
-    i = -2  # Son kapanmis mum (repaint yok)
+    df15["rsi14"] = compute_rsi(df15["close"], 14)
+    df15["atr14"] = compute_atr(df15, 14)
+    df15["vol_ma20"] = df15["volume"].rolling(20).mean()
 
-    def safe(s, idx, default=0.0):
-        try:
-            v = s.iloc[idx]
-            return float(v) if not pd.isna(v) else default
-        except Exception:
-            return default
-
-    cur_close = safe(df["Close"], i)
-    cur_open = safe(df["Open"], i)
-    prev_close = safe(df["Close"], i - 1)
-    cur_vol = safe(df["Volume"], i)
-
-    if cur_close <= 0 or cur_open <= 0:
-        return []
+    trend_up_series = None
+    if df1h is not None and len(df1h) > 210:
+        ema50_1h = compute_ema(df1h["close"], 50)
+        ema200_1h = compute_ema(df1h["close"], 200)
+        trend_up_series = (ema50_1h > ema200_1h)
+        trend_up_series.index = df1h["open_time"]
 
     results = []
+    n = len(df15)
+    # Son FORWARD_MAX_BARS mum icin ileri simulasyon yapamayacagimizdan
+    # taramayi n - FORWARD_MAX_BARS - 1 ile sinirliyoruz.
+    scan_end = n - FORWARD_MAX_BARS - 1
+    for i in range(RES_LOOKBACK, scan_end):
+        history = df15.iloc[i - RES_LOOKBACK:i]
+        breakout = df15.iloc[i]
 
-    # Hacim filtresi
-    vol_sma = df["Volume"].rolling(window=VOL_PERIOD).mean().iloc[i]
-    volume_ok = not USE_VOLUME_FILTER or (vol_sma > 0 and cur_vol >= vol_sma * MIN_VOL_MULT)
+        resistance = float(history["high"].max())
+        open_now = float(breakout["open"])
+        close_now = float(breakout["close"])
 
-    # ============================================================
-    # LONG - DIRENC KIRILIMI
-    # ============================================================
-    res_level, _ = find_level(df, "resistance", LEVEL_LOOKBACK, LEVEL_TOLERANCE_PCT, MIN_TOUCHES)
-    
-    if res_level is not None:
-        # Eski direncle ayni zone'da mi? (sallanmaları yumusat)
-        if state["resistance_level"] is not None and state["resistance_level"] > 0:
-            if abs(res_level - state["resistance_level"]) / state["resistance_level"] <= LEVEL_TOLERANCE_PCT:
-                state["resistance_level"] = (state["resistance_level"] + res_level) / 2
-            else:
-                state["resistance_level"] = res_level
-        else:
-            state["resistance_level"] = res_level
+        if close_now <= open_now:
+            continue
+        if close_now <= resistance:
+            continue
 
-    if state["resistance_level"] is not None:
-        # Govde kirilimi kontrolu
-        if REQUIRE_BODY:
-            body_break = min(cur_close, cur_open) > state["resistance_level"]
-        else:
-            body_break = cur_close > state["resistance_level"]
-        
-        # Onceki mum direncin altinda/bitisiginde miydi?
-        prev_below = prev_close <= state["resistance_level"]
-        
-        # Mevcut seviye icin guncel temas sayisi
-        actual_touches = count_touches(df, state["resistance_level"], "resistance", 
-                                       LEVEL_LOOKBACK, LEVEL_TOLERANCE_PCT)
-        
-        if (body_break and prev_below and actual_touches >= MIN_TOUCHES and 
-            volume_ok and state["trend"] != 1):
-            
-            results.append({
-                "direction": "AL",
-                "type": "SPIKE_TOUCH_AL",
-                "price": cur_close,
-                "level": round(state["resistance_level"], 8),
-                "touches": actual_touches,
-                "volume_ratio": round(cur_vol / vol_sma, 2) if vol_sma > 0 else 0,
-            })
-            state["trend"] = 1
-            log.info(f"{symbol} AL SINYALI! Direnc {actual_touches}x temas sonrasi kirildi: "
-                     f"{cur_close} > {state['resistance_level']}")
-            state["resistance_level"] = None  # RESET
+        break_pct = (close_now - resistance) / resistance * 100
+        body_pct = (close_now - open_now) / open_now * 100
+        if break_pct < RES_BREAK_PCT or body_pct < MIN_CANDLE_BODY_PCT:
+            continue
 
-    # ============================================================
-    # SHORT - DESTEK KIRILIMI
-    # ============================================================
-    sup_level, _ = find_level(df, "support", LEVEL_LOOKBACK, LEVEL_TOLERANCE_PCT, MIN_TOUCHES)
-    
-    if sup_level is not None:
-        if state["support_level"] is not None and state["support_level"] > 0:
-            if abs(sup_level - state["support_level"]) / state["support_level"] <= LEVEL_TOLERANCE_PCT:
-                state["support_level"] = (state["support_level"] + sup_level) / 2
-            else:
-                state["support_level"] = sup_level
-        else:
-            state["support_level"] = sup_level
+        # --- ek metrikler ---
+        vol_ma20 = breakout["vol_ma20"]
+        volume_ratio = float(breakout["volume"] / vol_ma20) if vol_ma20 and vol_ma20 > 0 else np.nan
+        rsi_val = float(breakout["rsi14"])
+        atr_val = float(breakout["atr14"]) if not np.isnan(breakout["atr14"]) else np.nan
+        atr_body_ratio = float((close_now - open_now) / atr_val) if atr_val and atr_val > 0 else np.nan
 
-    if state["support_level"] is not None:
-        if REQUIRE_BODY:
-            body_break = max(cur_close, cur_open) < state["support_level"]
-        else:
-            body_break = cur_close < state["support_level"]
-        
-        prev_above = prev_close >= state["support_level"]
-        
-        actual_touches = count_touches(df, state["support_level"], "support",
-                                       LEVEL_LOOKBACK, LEVEL_TOLERANCE_PCT)
-        
-        if (body_break and prev_above and actual_touches >= MIN_TOUCHES and
-            volume_ok and state["trend"] != -1):
-            
-            results.append({
-                "direction": "SAT",
-                "type": "SPIKE_TOUCH_SAT",
-                "price": cur_close,
-                "level": round(state["support_level"], 8),
-                "touches": actual_touches,
-                "volume_ratio": round(cur_vol / vol_sma, 2) if vol_sma > 0 else 0,
-            })
-            state["trend"] = -1
-            log.info(f"{symbol} SAT SINYALI! Destek {actual_touches}x temas sonrasi kirildi: "
-                     f"{cur_close} < {state['support_level']}")
-            state["support_level"] = None  # RESET
+        trend_up = None
+        if trend_up_series is not None:
+            past_hours = trend_up_series[trend_up_series.index <= breakout["open_time"]]
+            if len(past_hours) > 0:
+                trend_up = bool(past_hours.iloc[-1])
+
+        # --- ileri simulasyon: +7% / +20% hedef ve stop (kirilan direncin alti) ---
+        forward = df15.iloc[i + 1: i + 1 + FORWARD_MAX_BARS]
+        entry = close_now
+        targets = {t: entry * (1 + t / 100) for t in TARGETS_PCT}
+        outcome = {t: None for t in TARGETS_PCT}
+        bars_to = {t: None for t in TARGETS_PCT}
+        bars_to_stop = None
+
+        for j, row in enumerate(forward.itertuples(index=False), start=1):
+            stop_this_bar = row.low <= resistance
+            if stop_this_bar and bars_to_stop is None:
+                bars_to_stop = j
+            for t in TARGETS_PCT:
+                if outcome[t] is not None:
+                    continue
+                if row.high >= targets[t]:
+                    # ayni bar icinde stop da tetiklendiyse, MUHAFAZAKAR varsayimla
+                    # (intrabar sirasi OHLC'den kesin bilinemez) STOP kazanir.
+                    if stop_this_bar or (bars_to_stop is not None and bars_to_stop <= j):
+                        outcome[t] = "STOP"
+                    else:
+                        outcome[t] = "SUCCESS"
+                        bars_to[t] = j
+                elif bars_to_stop is not None and bars_to_stop <= j:
+                    outcome[t] = "STOP"
+            if all(outcome[t] is not None for t in TARGETS_PCT):
+                break
+
+        for t in TARGETS_PCT:
+            if outcome[t] is None:
+                outcome[t] = "TIMEOUT"
+
+        # --- retest tespiti ---
+        retest_occurred = False
+        retest_held = False
+        retest_bar = None
+        lookahead = df15.iloc[i + 1: i + 1 + RETEST_LOOKAHEAD_BARS]
+        for j, row in enumerate(lookahead.itertuples(index=False), start=1):
+            if row.low <= resistance * (1 + RETEST_TOUCH_TOLERANCE_PCT / 100):
+                retest_occurred = True
+                retest_bar = j
+                retest_held = row.close >= resistance
+                break
+
+        results.append(SignalRecord(
+            symbol=symbol,
+            signal_time=str(breakout["open_time"]),
+            entry_price=entry,
+            resistance=resistance,
+            break_pct=break_pct,
+            body_pct=body_pct,
+            volume_ratio=volume_ratio,
+            rsi14=rsi_val,
+            atr_body_ratio=atr_body_ratio,
+            trend_1h_up=trend_up,
+            retest_occurred=retest_occurred,
+            retest_held=retest_held,
+            retest_bars=retest_bar,
+            outcome_7pct=outcome[7.0],
+            bars_to_7pct=bars_to[7.0],
+            outcome_20pct=outcome[20.0],
+            bars_to_20pct=bars_to[20.0],
+            bars_to_stop=bars_to_stop,
+        ))
 
     return results
 
-# ============================================================
-# TELEGRAM & FORMAT
-# ============================================================
-def send_telegram(message: str) -> bool:
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram token veya chat_id eksik!")
-        return False
-    _telegram_rate_wait()
+
+# ══════════════════════════════════════════════════════════════════
+# COIN BASINA ISLEM
+# ══════════════════════════════════════════════════════════════════
+def process_symbol(symbol, start_ms, end_ms, buffer_ms):
     try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-            timeout=10
-        )
-        return r.status_code == 200
+        df15 = get_klines_range(symbol, "15m", start_ms - buffer_ms, end_ms)
+        df1h = get_klines_range(symbol, "1h", start_ms - buffer_ms, end_ms)
+        if df15 is None:
+            return symbol, []
+        recs = find_signals_and_evaluate(symbol, df15, df1h)
+        return symbol, recs
     except Exception as e:
-        log.error(f"Telegram hata: {e}")
-        return False
-
-def format_message(symbol: str, sig: dict) -> str:
-    yon = sig["direction"]
-    if yon == "AL":
-        bas = "AL SINYALI (DIRENC KIRILIMI)"
-        emoji = "🟢"
-    else:
-        bas = "SAT SINYALI (DESTEK KIRILIMI)"
-        emoji = "🔴"
-
-    coin = symbol.replace("USDT", "/USDT")
-
-    lines = [
-        f"{emoji} {bas}",
-        "-" * 24,
-        f"Coin: {coin}",
-        f"Zaman: {TIMEFRAME}",
-        f"Strateji: {sig['touches']}x Fitil Temas + Govde Kırılımı",
-        "-" * 24,
-        f"Fiyat: {sig['price']}",
-        f"Seviye: {sig['level']}",
-        f"Temas Sayisi: {sig['touches']}",
-        f"Hacim Orani: {sig['volume_ratio']}x",
-        "-" * 24,
-        datetime.now().strftime('%H:%M:%S %d/%m/%Y')
-    ]
-    return "\n".join(lines)
-
-def should_send(symbol: str, sig_type: str) -> bool:
-    key = f"{symbol}_{sig_type}"
-    now = time.time()
-    if key in sent_signals and (now - sent_signals[key]) < SIGNAL_COOLDOWN:
-        return False
-    sent_signals[key] = now
-    return True
-
-# ============================================================
-# TARAMA & MAIN
-# ============================================================
-def _scan_one(coin):
-    symbol = coin["symbol"]
-    try:
-        limit = max(LEVEL_LOOKBACK + 50, 150)
-        df = get_klines(symbol, TIMEFRAME, limit=limit)
-        sigs = check_signal(df, symbol)
-        return symbol, sigs
-    except Exception as e:
-        log.error(f"{symbol} hata: {e}")
+        log.error(f"{symbol} islenirken hata: {e}")
         return symbol, []
 
-def run_scan():
-    log.info(f"Tarama basladi TF:{TIMEFRAME} Lookback:{LEVEL_LOOKBACK} "
-             f"MinTouches:{MIN_TOUCHES} Tol:{LEVEL_TOLERANCE_PCT}")
 
-    symbols = get_symbols(min_volume=MIN_VOLUME)
-    if not symbols:
-        log.error("Coin listesi alinamadi!")
-        return
+# ══════════════════════════════════════════════════════════════════
+# OZET RAPOR
+# ══════════════════════════════════════════════════════════════════
+def build_summary(df: pd.DataFrame):
+    rows = []
 
-    symbols = symbols[:MAX_COINS]
-    total = len(symbols)
-    found = 0
-    scanned = 0
-    t0 = time.time()
+    def add_row(label, subset):
+        n = len(subset)
+        if n == 0:
+            return
+        succ7 = (subset["outcome_7pct"] == "SUCCESS").mean() * 100
+        succ20 = (subset["outcome_20pct"] == "SUCCESS").mean() * 100
+        rows.append({"kirilim": label, "sinyal_sayisi": n,
+                     "basari_%7": round(succ7, 1), "basari_%20": round(succ20, 1)})
 
-    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        futures = {pool.submit(_scan_one, coin): coin["symbol"] for coin in symbols}
+    add_row("TUMU (filtresiz)", df)
 
-        for future in as_completed(futures):
-            symbol = futures[future]
-            scanned += 1
-            try:
-                _, sigs = future.result()
-            except Exception as e:
-                log.error(f"{symbol} beklenmeyen hata: {e}")
-                continue
+    for lo, hi, lbl in [(0, 1.5, "hacim_orani < 1.5x"),
+                         (1.5, 2.0, "hacim_orani 1.5x-2x"),
+                         (2.0, 1e9, "hacim_orani > 2x")]:
+        add_row(lbl, df[(df["volume_ratio"] >= lo) & (df["volume_ratio"] < hi)])
 
-            for sig in sigs:
-                if should_send(symbol, sig["type"]):
-                    msg = format_message(symbol, sig)
-                    if send_telegram(msg):
-                        log.info(f"OK {symbol} {sig['type']} seviye:{sig['level']} "
-                                 f"temas:{sig['touches']}")
-                        found += 1
+    for lo, hi, lbl in [(0, 60, "RSI < 60"), (60, 70, "RSI 60-70"),
+                         (70, 100, "RSI > 70")]:
+        add_row(lbl, df[(df["rsi14"] >= lo) & (df["rsi14"] < hi)])
 
-            if scanned % 50 == 0:
-                log.info(f"[{scanned}/{total}] tarandi {found} sinyal")
+    if "trend_1h_up" in df.columns:
+        add_row("1s trend YUKARI ile uyumlu", df[df["trend_1h_up"] == True])   # noqa: E712
+        add_row("1s trend AŞAĞI (uyumsuz)", df[df["trend_1h_up"] == False])  # noqa: E712
 
-    elapsed = time.time() - t0
-    log.info(f"Tarama tamamlandi {found} sinyal gonderildi ({elapsed:.1f}sn)")
+    add_row("retest OLUSTU ve TUTTU", df[(df["retest_occurred"] == True) & (df["retest_held"] == True)])   # noqa: E712
+    add_row("retest OLUSTU ama TUTMADI", df[(df["retest_occurred"] == True) & (df["retest_held"] == False)])  # noqa: E712
+    add_row("retest OLUSMADI (direkt devam)", df[df["retest_occurred"] == False])  # noqa: E712
 
+    # en umut vaat eden kombinasyon ornegi
+    combo = df[(df["volume_ratio"] >= 1.5) & (df["rsi14"] < 70)]
+    add_row("KOMBO: hacim>=1.5x VE RSI<70", combo)
+
+    combo2 = df[(df["volume_ratio"] >= 1.5) & (df["rsi14"] < 70) &
+                (df["retest_occurred"] == True) & (df["retest_held"] == True)]  # noqa: E712
+    add_row("KOMBO: hacim>=1.5x VE RSI<70 VE retest+tuttu", combo2)
+
+    return pd.DataFrame(rows)
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
 def main():
+    end_dt = datetime.now(timezone.utc)
+    start_dt = end_dt - timedelta(days=BACKTEST_DAYS)
+    end_ms = int(end_dt.timestamp() * 1000)
+    start_ms = int(start_dt.timestamp() * 1000)
+    # RES_LOOKBACK + FORWARD_MAX_BARS icin ekstra veri payi (15dk cinsinden -> ms)
+    buffer_ms = (RES_LOOKBACK + FORWARD_MAX_BARS + 10) * 15 * 60 * 1000
+
     log.info("=" * 60)
-    log.info("SPIKE TOUCH BOT baslatildi")
-    log.info(f"  Strateji : Yatay Seviye + {MIN_TOUCHES}x Fitil Temas + Govde Kirilimi")
-    log.info(f"  Zaman    : {TIMEFRAME}")
-    log.info(f"  Lookback : {LEVEL_LOOKBACK} mum")
-    log.info(f"  Tolerans : {LEVEL_TOLERANCE_PCT*100}%")
-    log.info(f"  Min Vol  : {MIN_VOLUME} USDT")
-    log.info(f"  Aralik   : her {SCAN_INTERVAL} saniye")
-    log.info(f"  Max coin : {MAX_COINS}")
+    log.info("DIRENC KIRILIM - GERIYE DONUK BACKTEST")
+    log.info(f"Aralik        : {start_dt.date()} -> {end_dt.date()} ({BACKTEST_DAYS} gun)")
+    log.info(f"Max coin      : {MAX_COINS}")
+    log.info(f"Sinyal ayari  : lookback={RES_LOOKBACK} break%={RES_BREAK_PCT} govde%={MIN_CANDLE_BODY_PCT}")
+    log.info(f"Hedefler      : {TARGETS_PCT}  | Stop: kirilan direncin alti")
+    log.info(f"Ileri pencere : {FORWARD_MAX_BARS} mum (~{FORWARD_MAX_BARS * 15 / 60:.0f} saat)")
     log.info("=" * 60)
 
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID eksik!")
+    symbols = get_symbols()
+    if not symbols:
+        log.error("Sembol listesi bos, cikiliyor.")
+        return
+    log.info(f"{len(symbols)} coin taranacak.")
+
+    all_records = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_symbol, s, start_ms, end_ms, buffer_ms): s
+                   for s in symbols}
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            symbol, recs = future.result()
+            all_records.extend(recs)
+            if done % 10 == 0 or done == len(symbols):
+                log.info(f"[{done}/{len(symbols)}] islendi | toplam sinyal: {len(all_records)}")
+
+    if not all_records:
+        log.warning("Hic sinyal bulunamadi. Ayarlari veya tarihi kontrol et.")
         return
 
-    send_telegram(
-        f"SPIKE TOUCH BOT BASLADI\n"
-        f"Strateji: Yatay Seviye + {MIN_TOUCHES}x Fitil Temas + Govde Kırılımı\n"
-        f"Zaman: {TIMEFRAME} | Lookback: {LEVEL_LOOKBACK} | Tolerans: {LEVEL_TOLERANCE_PCT*100}%\n"
-        f"Min Hacim: {MIN_VOLUME} USDT | Aralik: {SCAN_INTERVAL//60} dk\n"
-        f"{datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
-    )
+    df = pd.DataFrame([asdict(r) for r in all_records])
+    df.to_csv(OUTPUT_CSV, index=False)
+    log.info(f"Detay CSV yazildi: {OUTPUT_CSV} ({len(df)} sinyal)")
 
+    summary = build_summary(df)
+    summary.to_csv(SUMMARY_CSV, index=False)
+    log.info(f"Ozet CSV yazildi: {SUMMARY_CSV}")
+
+    print("\n" + "=" * 70)
+    print("OZET SONUCLAR")
+    print("=" * 70)
+    print(summary.to_string(index=False))
+    print("=" * 70)
+    overall7 = (df["outcome_7pct"] == "SUCCESS").mean() * 100
+    overall20 = (df["outcome_20pct"] == "SUCCESS").mean() * 100
+    print(f"\nToplam sinyal: {len(df)}")
+    print(f"Filtresiz genel basari (+%7): {overall7:.1f}%")
+    print(f"Filtresiz genel basari (+%20): {overall20:.1f}%")
+    print("\nBu oranlari senin gercek 'canli' 3-4/14 (~%21-29) oranınla karsilastir.")
+    print("Sonra summary.csv'deki en yuksek basari oranli filtre kombinasyonlarini")
+    print("gercek bot koduna (analyze_symbol fonksiyonuna) ekleyecegiz.")
+
+    # --- DETAY CSV'yi de LOG'a bas (Render Shell'e girmeden Logs sekmesinden okunabilsin) ---
+    print("\n" + "=" * 70)
+    print(f"DETAY CSV ICERIGI ({OUTPUT_CSV}) - asagidan kopyalayabilirsin:")
+    print("=" * 70)
+    print(df.to_csv(index=False))
+
+    # --- RENDER ICIN ONEMLI: script bitince process sonlanirsa Render worker'i ---
+    # --- otomatik yeniden baslatir ve backtest bastan calisir. Bunu onlemek icin ---
+    # --- burada sonsuza kadar bekletiyoruz. Sonuclari Logs sekmesinden okuduktan ---
+    # --- sonra Render dashboard'dan servisi SUSPEND et / eski koda geri don. ---
+    log.info("Backtest tamamlandi. Sonsuz bekleme moduna geciliyor (Render restart-loop onlemi).")
+    log.info("Sonuclari Logs sekmesinden kopyaladiktan sonra servisi SUSPEND edip eski botu geri koy.")
     while True:
-        try:
-            run_scan()
-        except Exception as e:
-            log.error(f"Dongu hatasi: {e}")
-            send_telegram(f"Bot Hatasi: {e}")
+        time.sleep(3600)
 
-        log.info(f"Sonraki tarama {SCAN_INTERVAL} saniye sonra...")
-        time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
     main()
