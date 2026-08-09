@@ -52,8 +52,8 @@ MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "5000000"))
 
 # --- BACKTEST AYARLARI ---
 BACKTEST_DAYS = int(os.getenv("BACKTEST_DAYS", "30"))
-MAX_COINS = int(os.getenv("MAX_COINS", "150"))          # once kucuk basla, sonra artir
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+MAX_COINS = int(os.getenv("MAX_COINS", "100"))           # once kucuk basla, sonra artir
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))          # global throttle var, yuksek tutma
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 SYMBOLS_OVERRIDE = os.getenv("SYMBOLS_OVERRIDE", "")     # "BTCUSDT,ETHUSDT" gibi, bos ise otomatik secilir
 
@@ -66,19 +66,39 @@ RETEST_TOUCH_TOLERANCE_PCT = 0.3   # direncin %0.3 yakinina dokunma = retest say
 OUTPUT_CSV = os.getenv("OUTPUT_CSV", "backtest_signals.csv")
 SUMMARY_CSV = os.getenv("SUMMARY_CSV", "backtest_summary.csv")
 
+# --- GLOBAL HIZ SINIRLAMA (429'lari onlemek icin) ---
+# MAX_WORKERS thread'i paralel istek atinca Binance limitine hizlica carpiyor.
+# Bu kilit tum thread'ler arasinda istekleri esit araliklarla yayar.
+REQUEST_MIN_INTERVAL = float(os.getenv("REQUEST_MIN_INTERVAL", "0.15"))  # ~6-7 istek/sn
+
 session = requests.Session()
+
+import threading
+_rate_lock = threading.Lock()
+_last_request_time = [0.0]
+
+
+def _throttle():
+    with _rate_lock:
+        now = time.time()
+        wait = REQUEST_MIN_INTERVAL - (now - _last_request_time[0])
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_time[0] = time.time()
 
 
 # ══════════════════════════════════════════════════════════════════
 # BINANCE VERI CEKME (pagination + basit rate-limit koruma)
 # ══════════════════════════════════════════════════════════════════
-def _get(url, params=None, retries=3):
+def _get(url, params=None, retries=5):
     for attempt in range(retries):
+        _throttle()
         try:
             r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if r.status_code == 429 or r.status_code == 418:
-                wait = 5 * (attempt + 1)
-                log.warning(f"Rate limit ({r.status_code}), {wait}sn bekleniyor...")
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after else 8 * (attempt + 1)
+                log.warning(f"Rate limit ({r.status_code}), {wait:.0f}sn bekleniyor...")
                 time.sleep(wait)
                 continue
             r.raise_for_status()
@@ -87,7 +107,7 @@ def _get(url, params=None, retries=3):
             if attempt == retries - 1:
                 log.error(f"Istek basarisiz ({url}): {e}")
                 return None
-            time.sleep(2 * (attempt + 1))
+            time.sleep(3 * (attempt + 1))
     return None
 
 
