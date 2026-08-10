@@ -401,18 +401,17 @@ def run_scan_parallel():
 
     for signal in found:
         try:
-            msg = format_signal_message(signal)
-            if send_telegram(msg):
-                log.info(f"SINYAL GONDERILDI: {signal.symbol} fiyat={signal.price:.6f} direnc={signal.resistance:.6f}")
-            else:
-                log.error(f"Telegram gonderilemedi: {signal.symbol}")
+            # NOT: 15dk kirilim mesaji artik Telegram'a GONDERILMIYOR (kullanici istegi).
+            # Kirilim tespiti hala calisiyor cunku SMA100 dokunma takibi buna dayanıyor;
+            # sadece bildirim susturuldu, log'a yazmaya devam ediyoruz.
+            log.info(f"KIRILIM TESPIT EDILDI (sessiz): {signal.symbol} fiyat={signal.price:.6f} direnc={signal.resistance:.6f}")
 
-            # YENI: kirilim basariyla gonderildikten sonra SMA100 dokunma takibine ekle
+            # kirilim tespit edildikten sonra SMA100 dokunma takibine ekle
             if USE_SMA_TOUCH_ALERT:
                 add_pending_touch(signal)
 
         except Exception as e:
-            log.error(f"Gonderim hatasi {signal.symbol}: {e}")
+            log.error(f"Isleme hatasi {signal.symbol}: {e}")
 
     log.info(f"Tarama tamamlandi | {stats['signal']} sinyal | {stats}")
     return stats["signal"]
