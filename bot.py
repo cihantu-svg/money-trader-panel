@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-15DK DIRENC KIRILIM SCANNER BOT + 1DK SMA100 DOKUNMA TAKIBI
-- 15dk grafikte son N mumun en yuksegini (direnc) hesaplar (SADECE KAPANMIS mumlar - repaint yok)
+5DK DIRENC KIRILIM SCANNER BOT + 1H SMA100 MTF ONAY FILTRESI
+- 5dk grafikte son N mumun en yuksegini (direnc) hesaplar (SADECE KAPANMIS mumlar - repaint yok)
 - Kirilim mumu direnci gecmis, YESIL olmali, govdesi (open-close farki) en az MIN_CANDLE_BODY_PCT olmali
 - Coin'in son 24s USDT hacmi MIN_QUOTE_VOLUME_24H altindaysa sinyal uretilmez (dusuk likidite elenir)
+- 1H SMA100 MTF onayi -> 1h'de SMA100 kesisimi (crossover) son MAX_BARS_SINCE_CROSS_1H
+  1h mum icinde olmus olmali VE fiyat hala SMA100 ustunde kalmis olmali. Boylece kesisim
+  aninda gelen 5dk kirilimlar da, kesisimden 1-4 mum sonra gelenler de yakalanir.
 - Kosullar saglaninca Telegram'a bildirim atar
-- YENI: 15dk kirilim sinyali gelince coin "takip listesi"ne alinir. Ayri bir thread,
-  kirilimdan sonraki EN FAZLA SMA_MAX_CANDLES adet 1dk mum icinde fiyatin 1dk SMA(SMA_PERIOD)'e
-  dokunup dokunmadigini kontrol eder. Dokunma olursa ikinci bir Telegram alarmi gonderilir.
 """
 import os
 import time
-import threading
 import logging
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -29,13 +28,13 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "300"))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))   # 5dk TF oldugu icin daha sik taranmasi mantikli
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 RES_LOOKBACK = int(os.getenv("RES_LOOKBACK", "50"))          # direnc kac mumdan hesaplansin
 RES_BREAK_PCT = float(os.getenv("RES_BREAK_PCT", "0.5"))     # direncten en az % kac yukarida kapanmali
 MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "10.0"))  # kirilim mumunun govdesi min %
@@ -44,12 +43,10 @@ MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "10.0"))  # kirilim
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "5000000"))  # 5 milyon USDT
 
-# --- YENI: 1DK SMA100 DOKUNMA TAKIBI ---
-USE_SMA_TOUCH_ALERT = os.getenv("USE_SMA_TOUCH_ALERT", "true").lower() == "true"
-SMA_TIMEFRAME = os.getenv("SMA_TIMEFRAME", "1m")
-SMA_PERIOD = int(os.getenv("SMA_PERIOD", "100"))
-SMA_MAX_CANDLES = int(os.getenv("SMA_MAX_CANDLES", "10"))            # kirilimdan sonra en fazla kac 1dk mum icinde dokunma aranacak
-SMA_MONITOR_INTERVAL = int(os.getenv("SMA_MONITOR_INTERVAL", "30"))  # takip dongusunun calisma araligi (sn)
+# --- 1H SMA100 MTF ONAY FILTRESI ---
+USE_1H_SMA_FILTER = os.getenv("USE_1H_SMA_FILTER", "true").lower() == "true"
+SMA_PERIOD_1H = int(os.getenv("SMA_PERIOD_1H", "100"))
+MAX_BARS_SINCE_CROSS_1H = int(os.getenv("MAX_BARS_SINCE_CROSS_1H", "4"))  # kesisimden sonra kac 1h muma kadar gecerli
 
 BINANCE_BASE = "https://fapi.binance.com"
 last_signal = {}
@@ -100,9 +97,8 @@ def get_klines_closed(symbol, interval, limit=200):
 
 def get_all_24h_quote_volumes():
     """
-    TUM sembollerin 24s USDT hacmini TEK istekte ceker (parametresiz cagrilirsa
-    Binance hepsini doner). Boylece her coin icin ayri istek atmaya gerek kalmaz,
-    tarama suresine ek yuk binmez.
+    TUM sembollerin 24s USDT hacmini TEK istekte ceker. Boylece her coin icin
+    ayri istek atmaya gerek kalmaz, tarama suresine ek yuk binmez.
     Dondugu deger: {symbol: quoteVolume} sozlugu.
     """
     try:
@@ -116,6 +112,51 @@ def get_all_24h_quote_volumes():
 
 
 # ══════════════════════════════════════════════════════════════════
+# 1H SMA100 MTF ONAY KONTROLU
+# ══════════════════════════════════════════════════════════════════
+def check_1h_sma_confirmation(symbol):
+    """
+    1h'de SMA100 kesisimi (crossover) son MAX_BARS_SINCE_CROSS_1H 1h mum icinde
+    gerceklesmis mi VE fiyat hala SMA100 ustunde mi kontrol eder.
+
+    - Kesisim mumunun kendisinde de, 1-4 mum sonrasinda da (fiyat hala ustteyse) True doner.
+    - Kesisimden sonra pencere disina tasmissa (5+ mum gecmisse) -> False.
+    - Kesisim olmus ama fiyat tekrar SMA100 altina dusmusse -> False (fake kesisim sayilir).
+
+    Sadece KAPANMIS 1h mumlar kullanilir, repaint yoktur.
+    """
+    limit = SMA_PERIOD_1H + MAX_BARS_SINCE_CROSS_1H + 10
+    df = get_klines_closed(symbol, "1h", limit=limit)
+    if df is None or len(df) < SMA_PERIOD_1H + 2:
+        return False
+
+    df["sma100_1h"] = df["close"].rolling(SMA_PERIOD_1H).mean()
+    df = df.dropna(subset=["sma100_1h"]).reset_index(drop=True)
+    if len(df) < 2:
+        return False
+
+    current_close = float(df["close"].iloc[-1])
+    current_sma = float(df["sma100_1h"].iloc[-1])
+
+    # Sart 1: fiyat su an SMA100'un ustunde olmali
+    if current_close <= current_sma:
+        return False
+
+    # Sart 2: pencere icinde (son MAX_BARS_SINCE_CROSS_1H mum) bir yukari kesisim olmus olmali
+    n = len(df)
+    start_idx = max(1, n - MAX_BARS_SINCE_CROSS_1H)
+    for i in range(n - 1, start_idx - 1, -1):
+        prev_close = float(df["close"].iloc[i - 1])
+        prev_sma = float(df["sma100_1h"].iloc[i - 1])
+        cur_close = float(df["close"].iloc[i])
+        cur_sma = float(df["sma100_1h"].iloc[i])
+        if prev_close <= prev_sma and cur_close > cur_sma:
+            return True
+
+    return False
+
+
+# ══════════════════════════════════════════════════════════════════
 # SINYAL: DIRENC KIRILIMI
 # ══════════════════════════════════════════════════════════════════
 @dataclass
@@ -126,6 +167,7 @@ class Signal:
     break_pct: float
     body_pct: float
     bar_time: str
+    sma1h_onay: bool = False
 
 
 def analyze_symbol(symbol, quote_volumes=None):
@@ -162,9 +204,18 @@ def analyze_symbol(symbol, quote_volumes=None):
     if body_pct < MIN_CANDLE_BODY_PCT:
         return None
 
+    # --- 1H SMA100 MTF onayi -- sadece 5dk sartlarini gecen adaylar icin kontrol edilir
+    # (her coin icin degil, sadece kirilim uretenler icin -- gereksiz API yukunu onler)
+    sma1h_onay = True
+    if USE_1H_SMA_FILTER:
+        sma1h_onay = check_1h_sma_confirmation(symbol)
+        if not sma1h_onay:
+            return None
+
     return Signal(
         symbol=symbol, price=close_now, resistance=resistance,
         break_pct=break_pct, body_pct=body_pct, bar_time=bar_time,
+        sma1h_onay=sma1h_onay,
     )
 
 
@@ -209,150 +260,11 @@ def format_signal_message(signal: Signal):
         f"📍 <b>Kırılan Direnç ({TIMEFRAME}, son {RES_LOOKBACK} mum):</b> {signal.resistance:.6f}",
         f"📏 <b>Kırılım Mesafesi:</b> %{signal.break_pct:.2f}",
         f"🕯️ <b>Mum Gövdesi:</b> %{signal.body_pct:.2f}",
+        f"📊 <b>1H SMA100 Onayı:</b> {'✅ Var (son ' + str(MAX_BARS_SINCE_CROSS_1H) + ' mum içinde kesişim)' if signal.sma1h_onay else '—'}",
         sep,
         f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
     return "\n".join(lines)
-
-
-# ══════════════════════════════════════════════════════════════════
-# YENI: 15DK KIRILIM SONRASI 1DK SMA100 DOKUNMA TAKIBI
-# ══════════════════════════════════════════════════════════════════
-pending_lock = threading.Lock()
-pending_signals = {}   # symbol -> PendingTouch
-
-
-@dataclass
-class PendingTouch:
-    symbol: str
-    resistance: float
-    breakout_price: float
-    signal_open_time: int          # 15dk kirilim mumunun open_time'i (ms)
-    last_checked_open_time: int    # 1dk tarafinda en son kontrol edilen mumun open_time'i
-    candles_checked: int = 0
-
-
-def add_pending_touch(signal: Signal):
-    """15dk kirilim sinyali geldiginde, coin'i 1dk SMA100 dokunma takibine ekler."""
-    with pending_lock:
-        if signal.symbol in pending_signals:
-            return  # zaten takip ediliyor
-        pending_signals[signal.symbol] = PendingTouch(
-            symbol=signal.symbol,
-            resistance=signal.resistance,
-            breakout_price=signal.price,
-            signal_open_time=int(signal.bar_time),
-            last_checked_open_time=int(signal.bar_time),
-        )
-        log.info(f"[SMA TAKIP] {signal.symbol} takibe alindi "
-                 f"(kirilimdan sonraki max {SMA_MAX_CANDLES} 1dk mum icinde SMA{SMA_PERIOD} dokunmasi araniyor)")
-
-
-def check_sma_touch(pt: PendingTouch):
-    """
-    1dk grafikte SMA(SMA_PERIOD) hesaplar; kirilimdan sonra olusan YENI kapanmis
-    mumlarda fiyatin (low<=SMA<=high) SMA'ya dokunup dokunmadigina bakar.
-    Donus: ("touch", sma_degeri, mum) | ("expired", None, None) | ("wait", None, None)
-    """
-    limit = SMA_PERIOD + SMA_MAX_CANDLES + 5
-    df = get_klines_closed(pt.symbol, SMA_TIMEFRAME, limit=limit)
-    if df is None or len(df) < SMA_PERIOD + 1:
-        return "wait", None, None
-
-    df["sma"] = df["close"].rolling(SMA_PERIOD).mean()
-
-    # sadece 15dk kirilim mumunun ACILIS zamanindan SONRA olusan 1dk mumlarina bak
-    new_candles = df[df["open_time"] > pt.signal_open_time]
-    if new_candles.empty:
-        return "wait", None, None
-
-    # daha once kontrol edilmemis (yeni kapanmis) mumlar
-    unseen = new_candles[new_candles["open_time"] > pt.last_checked_open_time]
-    if unseen.empty:
-        return "wait", None, None
-
-    for _, candle in unseen.iterrows():
-        pt.candles_checked += 1
-        pt.last_checked_open_time = int(candle["open_time"])
-
-        sma_val = candle["sma"]
-        if pd.isna(sma_val):
-            continue
-
-        low, high = float(candle["low"]), float(candle["high"])
-        if low <= sma_val <= high:
-            return "touch", sma_val, candle
-
-        if pt.candles_checked >= SMA_MAX_CANDLES:
-            return "expired", None, None
-
-    if pt.candles_checked >= SMA_MAX_CANDLES:
-        return "expired", None, None
-
-    return "wait", None, None
-
-
-def format_sma_touch_message(pt: PendingTouch, sma_val: float, candle):
-    coin = pt.symbol.replace("USDT", "/USDT")
-    sep = "=" * 24
-    lines = [
-        "🎯 <b>SMA100 DOKUNMA (1dk)</b>",
-        sep,
-        f"💱 <b>Coin:</b> {coin}",
-        f"📍 <b>15dk Kırılım Direnci:</b> {pt.resistance:.6f}",
-        f"💰 <b>Kırılım Fiyatı:</b> {pt.breakout_price:.6f}",
-        f"📉 <b>SMA{SMA_PERIOD} (1dk) Değeri:</b> {sma_val:.6f}",
-        f"🕯️ <b>Dokunma Mumu (low-high):</b> {float(candle['low']):.6f} - {float(candle['high']):.6f}",
-        f"🔢 <b>Kırılımdan Sonraki Mum Sayısı:</b> {pt.candles_checked}/{SMA_MAX_CANDLES}",
-        sep,
-        f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
-    ]
-    return "\n".join(lines)
-
-
-def monitor_pending_touches():
-    """
-    Ayri thread'de calisir. SMA_MONITOR_INTERVAL saniyede bir, takipteki
-    tum semboller icin 1dk SMA100 dokunma kontrolu yapar.
-    """
-    log.info(f"[SMA TAKIP] izleme thread'i basladi (her {SMA_MONITOR_INTERVAL}sn bir kontrol)")
-    while True:
-        try:
-            with pending_lock:
-                symbols = list(pending_signals.keys())
-
-            for symbol in symbols:
-                with pending_lock:
-                    pt = pending_signals.get(symbol)
-                if pt is None:
-                    continue
-
-                try:
-                    status, sma_val, candle = check_sma_touch(pt)
-                except Exception as e:
-                    log.error(f"[SMA TAKIP] {symbol} kontrol hatasi: {e}")
-                    continue
-
-                if status == "touch":
-                    msg = format_sma_touch_message(pt, sma_val, candle)
-                    if send_telegram(msg):
-                        log.info(f"[SMA TAKIP] {symbol} SMA{SMA_PERIOD} dokunmasi bulundu, alarm gonderildi")
-                    else:
-                        log.error(f"[SMA TAKIP] {symbol} icin telegram gonderilemedi")
-                    with pending_lock:
-                        pending_signals.pop(symbol, None)
-
-                elif status == "expired":
-                    log.info(f"[SMA TAKIP] {symbol} {SMA_MAX_CANDLES} mum icinde SMA{SMA_PERIOD}'e dokunmadi, takipten cikarildi")
-                    with pending_lock:
-                        pending_signals.pop(symbol, None)
-
-                # status == "wait" -> pt zaten guncellendi (candles_checked, last_checked_open_time), bekleniyor
-
-        except Exception as e:
-            log.error(f"monitor_pending_touches genel hata: {e}")
-
-        time.sleep(SMA_MONITOR_INTERVAL)
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -373,7 +285,9 @@ def check_signal(symbol, quote_volumes=None):
 def run_scan_parallel():
     symbols = get_symbols()
     total = len(symbols)
-    log.info(f"TARAMA BASLADI | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | Direnc lookback: {RES_LOOKBACK}")
+    log.info(f"TARAMA BASLADI | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | "
+              f"Direnc lookback: {RES_LOOKBACK} | 1H SMA filtre: {USE_1H_SMA_FILTER} "
+              f"(pencere: {MAX_BARS_SINCE_CROSS_1H} mum)")
 
     # likidite verisi TEK istekte, tarama basinda bir kez cekilir (600 ayri istek yerine 1 istek)
     quote_volumes = get_all_24h_quote_volumes() if USE_LIQUIDITY_FILTER else {}
@@ -401,17 +315,13 @@ def run_scan_parallel():
 
     for signal in found:
         try:
-            # NOT: 15dk kirilim mesaji artik Telegram'a GONDERILMIYOR (kullanici istegi).
-            # Kirilim tespiti hala calisiyor cunku SMA100 dokunma takibi buna dayanıyor;
-            # sadece bildirim susturuldu, log'a yazmaya devam ediyoruz.
-            log.info(f"KIRILIM TESPIT EDILDI (sessiz): {signal.symbol} fiyat={signal.price:.6f} direnc={signal.resistance:.6f}")
-
-            # kirilim tespit edildikten sonra SMA100 dokunma takibine ekle
-            if USE_SMA_TOUCH_ALERT:
-                add_pending_touch(signal)
-
+            msg = format_signal_message(signal)
+            if send_telegram(msg):
+                log.info(f"SINYAL GONDERILDI: {signal.symbol} fiyat={signal.price:.6f} direnc={signal.resistance:.6f}")
+            else:
+                log.error(f"Telegram gonderilemedi: {signal.symbol}")
         except Exception as e:
-            log.error(f"Isleme hatasi {signal.symbol}: {e}")
+            log.error(f"Gonderim hatasi {signal.symbol}: {e}")
 
     log.info(f"Tarama tamamlandi | {stats['signal']} sinyal | {stats}")
     return stats["signal"]
@@ -422,7 +332,7 @@ def run_scan_parallel():
 # ══════════════════════════════════════════════════════════════════
 def main():
     log.info("=" * 60)
-    log.info("15DK DIRENC KIRILIM SCANNER baslatildi")
+    log.info("5DK DIRENC KIRILIM SCANNER + 1H SMA100 FILTRESI baslatildi")
     log.info(f"Max coin       : {MAX_COINS}")
     log.info(f"Workers        : {MAX_WORKERS}")
     log.info(f"TF             : {TIMEFRAME}")
@@ -430,11 +340,9 @@ def main():
     log.info(f"Min kirilim    : %{RES_BREAK_PCT}")
     log.info(f"Min mum govdesi: %{MIN_CANDLE_BODY_PCT}")
     log.info(f"Likidite filtre: {USE_LIQUIDITY_FILTER} (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)")
+    log.info(f"1H SMA filtre  : {USE_1H_SMA_FILTER} (SMA{SMA_PERIOD_1H}, pencere {MAX_BARS_SINCE_CROSS_1H} mum)")
     log.info(f"Tarama araligi : {SCAN_INTERVAL} sn")
     log.info(f"Cooldown       : {SIGNAL_COOLDOWN} sn")
-    log.info(f"SMA takip      : {USE_SMA_TOUCH_ALERT} "
-             f"(TF={SMA_TIMEFRAME}, periyot={SMA_PERIOD}, max {SMA_MAX_CANDLES} mum, "
-             f"her {SMA_MONITOR_INTERVAL}sn kontrol)")
     log.info("=" * 60)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -442,22 +350,17 @@ def main():
         return
 
     send_telegram(
-        "🚀 DIRENC KIRILIM SCANNER BASLADI\n"
+        "🚀 5DK DIRENC KIRILIM SCANNER + 1H SMA100 FILTRESI BASLADI\n"
         + "=" * 30 + "\n"
         f"💱 TF: {TIMEFRAME}\n"
         f"📍 Direnc: son {RES_LOOKBACK} mumun en yuksegi\n"
         f"📏 Min kirilim: %{RES_BREAK_PCT}\n"
         f"🕯️ Min mum govdesi: %{MIN_CANDLE_BODY_PCT}\n"
         f"💧 Min likidite: {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT\n"
+        f"📊 1H SMA100 onay penceresi: {MAX_BARS_SINCE_CROSS_1H} mum\n"
         f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn\n"
-        f"🎯 SMA{SMA_PERIOD} (1dk) takip: {'Acik' if USE_SMA_TOUCH_ALERT else 'Kapali'} "
-        f"(max {SMA_MAX_CANDLES} mum)\n"
         f"⚡ Workers: {MAX_WORKERS}"
     )
-
-    # YENI: 1dk SMA100 dokunma takibini ayri thread'de baslat
-    if USE_SMA_TOUCH_ALERT:
-        threading.Thread(target=monitor_pending_touches, daemon=True).start()
 
     while True:
         try:
