@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-5DK DIRENC KIRILIM SCANNER BOT + 1H SMA100 MTF ONAY FILTRESI
-- 5dk grafikte son N mumun en yuksegini (direnc) hesaplar (SADECE KAPANMIS mumlar - repaint yok)
-- Kirilim mumu direnci gecmis, YESIL olmali, govdesi (open-close farki) en az MIN_CANDLE_BODY_PCT olmali
-- Coin'in son 24s USDT hacmi MIN_QUOTE_VOLUME_24H altindaysa sinyal uretilmez (dusuk likidite elenir)
-- 1H SMA100 MTF onayi -> 1h'de SMA100 kesisimi (crossover) son MAX_BARS_SINCE_CROSS_1H
-  1h mum icinde olmus olmali VE fiyat hala SMA100 ustunde kalmis olmali. Boylece kesisim
-  aninda gelen 5dk kirilimlar da, kesisimden 1-4 mum sonra gelenler de yakalanir.
+5DK HACIM + MOMENTUM SCANNER BOT
+(MONEY TRADER - "Hacim + Momentum Yükselişi (AL)" sinyalinin Pine Script'ten
+ birebir Python'a uyarlanmis hali)
+
+SINYAL MANTIGI (Pine ile ayni):
+- volRatio = volume / SMA(volume, 20)   -> hacim, 20 periyotluk ortalamaya orani
+- Hacim sarti: volRatio >= MIN_VOLUME_RATIO  (varsayilan 1.07 -> ortalamanin en az %7 uzeri)
+- rsiVal = RSI(close, 14)  (Wilder RSI, Pine'deki ta.rsi ile ayni yontem)
+- Momentum sarti: RSI, 50 seviyesini YUKARI KESMIS olmali (crossover)
+  -> onceki mumda RSI <= 50, mevcut mumda RSI > 50
+- Coin'in son 24s USDT hacmi MIN_QUOTE_VOLUME_24H altindaysa sinyal uretilmez
 - Kosullar saglaninca Telegram'a bildirim atar
+- SADECE KAPANMIS mumlar kullanilir (repaint yok)
 """
 import os
 import time
@@ -18,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import pandas as pd
+import numpy as np
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -28,28 +34,32 @@ log = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))   # 5dk TF oldugu icin daha sik taranmasi mantikli
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
 SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
-RES_LOOKBACK = int(os.getenv("RES_LOOKBACK", "50"))          # direnc kac mumdan hesaplansin
-RES_BREAK_PCT = float(os.getenv("RES_BREAK_PCT", "0.5"))     # direncten en az % kac yukarida kapanmali
-MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "10.0"))  # kirilim mumunun govdesi min %
+
+# --- HACIM AYARLARI (Pine: volSma20 = ta.sma(volume, 20)) ---
+VOLUME_SMA_PERIOD = int(os.getenv("VOLUME_SMA_PERIOD", "20"))
+MIN_VOLUME_INCREASE_PCT = float(os.getenv("MIN_VOLUME_INCREASE_PCT", "7.0"))  # ortalamadan en az % kac fazla (Pine'deki vol_mult_up'in karsiligi)
+MIN_VOLUME_RATIO = 1.0 + (MIN_VOLUME_INCREASE_PCT / 100.0)  # ornek: %7 -> 1.07x
+
+# --- MOMENTUM AYARLARI (Pine: rsiVal = ta.rsi(close, 14), crossover(rsiVal, 50)) ---
+RSI_LEN = int(os.getenv("RSI_LEN", "14"))
+RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50"))
 
 # --- LIKIDITE FILTRESI ---
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "5000000"))  # 5 milyon USDT
 
-# --- 1H SMA100 MTF ONAY FILTRESI ---
-USE_1H_SMA_FILTER = os.getenv("USE_1H_SMA_FILTER", "true").lower() == "true"
-SMA_PERIOD_1H = int(os.getenv("SMA_PERIOD_1H", "100"))
-MAX_BARS_SINCE_CROSS_1H = int(os.getenv("MAX_BARS_SINCE_CROSS_1H", "4"))  # kesisimden sonra kac 1h muma kadar gecerli
-
 BINANCE_BASE = "https://fapi.binance.com"
 last_signal = {}
+
+# RSI icin yeterli isinma (warm-up) mumu + hacim SMA'si icin pay
+KLINES_LIMIT = max(RSI_LEN, VOLUME_SMA_PERIOD) * 5 + 20
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -96,11 +106,7 @@ def get_klines_closed(symbol, interval, limit=200):
 
 
 def get_all_24h_quote_volumes():
-    """
-    TUM sembollerin 24s USDT hacmini TEK istekte ceker. Boylece her coin icin
-    ayri istek atmaya gerek kalmaz, tarama suresine ek yuk binmez.
-    Dondugu deger: {symbol: quoteVolume} sozlugu.
-    """
+    """TUM sembollerin 24s USDT hacmini TEK istekte ceker."""
     try:
         session = requests.Session()
         r = session.get(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", timeout=15)
@@ -112,110 +118,89 @@ def get_all_24h_quote_volumes():
 
 
 # ══════════════════════════════════════════════════════════════════
-# 1H SMA100 MTF ONAY KONTROLU
+# INDIKATOR HESAPLAMALARI (Pine Script ile birebir ayni yontem)
 # ══════════════════════════════════════════════════════════════════
-def check_1h_sma_confirmation(symbol):
+def wilder_rsi(close: pd.Series, length: int) -> pd.Series:
     """
-    1h'de SMA100 kesisimi (crossover) son MAX_BARS_SINCE_CROSS_1H 1h mum icinde
-    gerceklesmis mi VE fiyat hala SMA100 ustunde mi kontrol eder.
-
-    - Kesisim mumunun kendisinde de, 1-4 mum sonrasinda da (fiyat hala ustteyse) True doner.
-    - Kesisimden sonra pencere disina tasmissa (5+ mum gecmisse) -> False.
-    - Kesisim olmus ama fiyat tekrar SMA100 altina dusmusse -> False (fake kesisim sayilir).
-
-    Sadece KAPANMIS 1h mumlar kullanilir, repaint yoktur.
+    Pine'in ta.rsi() fonksiyonuyla ayni sonucu veren Wilder RSI hesabi
+    (RMA / Wilder's smoothing kullanir, basit EMA degil).
     """
-    limit = SMA_PERIOD_1H + MAX_BARS_SINCE_CROSS_1H + 10
-    df = get_klines_closed(symbol, "1h", limit=limit)
-    if df is None or len(df) < SMA_PERIOD_1H + 2:
-        return False
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = -delta.clip(upper=0.0)
 
-    df["sma100_1h"] = df["close"].rolling(SMA_PERIOD_1H).mean()
-    df = df.dropna(subset=["sma100_1h"]).reset_index(drop=True)
-    if len(df) < 2:
-        return False
+    # Wilder's RMA: ilk deger SMA, sonrasi alpha=1/length ile ussel yumusatma
+    avg_gain = gain.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1.0 / length, min_periods=length, adjust=False).mean()
 
-    current_close = float(df["close"].iloc[-1])
-    current_sma = float(df["sma100_1h"].iloc[-1])
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(avg_loss != 0, 100.0)  # kayip sifirsa RSI 100
+    return rsi
 
-    # Sart 1: fiyat su an SMA100'un ustunde olmali
-    if current_close <= current_sma:
-        return False
 
-    # Sart 2: pencere icinde (son MAX_BARS_SINCE_CROSS_1H mum) bir yukari kesisim olmus olmali
-    n = len(df)
-    start_idx = max(1, n - MAX_BARS_SINCE_CROSS_1H)
-    for i in range(n - 1, start_idx - 1, -1):
-        prev_close = float(df["close"].iloc[i - 1])
-        prev_sma = float(df["sma100_1h"].iloc[i - 1])
-        cur_close = float(df["close"].iloc[i])
-        cur_sma = float(df["sma100_1h"].iloc[i])
-        if prev_close <= prev_sma and cur_close > cur_sma:
-            return True
-
-    return False
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["vol_sma"] = df["volume"].rolling(VOLUME_SMA_PERIOD).mean()
+    df["vol_ratio"] = df["volume"] / df["vol_sma"]
+    df["rsi"] = wilder_rsi(df["close"], RSI_LEN)
+    return df
 
 
 # ══════════════════════════════════════════════════════════════════
-# SINYAL: DIRENC KIRILIMI
+# SINYAL: HACIM + MOMENTUM (Pine: show_vol_mom_up)
 # ══════════════════════════════════════════════════════════════════
 @dataclass
 class Signal:
     symbol: str
     price: float
-    resistance: float
-    break_pct: float
-    body_pct: float
+    volume: float
+    vol_sma: float
+    vol_ratio: float
+    rsi_prev: float
+    rsi_now: float
     bar_time: str
-    sma1h_onay: bool = False
 
 
 def analyze_symbol(symbol, quote_volumes=None):
-    # --- likidite kontrolu once yapilir, dusukse hic kline cekmeye gerek yok ---
     if USE_LIQUIDITY_FILTER:
         qv = (quote_volumes or {}).get(symbol, 0.0)
         if qv < MIN_QUOTE_VOLUME_24H:
             return None
 
-    # RES_LOOKBACK (direnc icin gecmis mum) + 1 (kirilim mumunun kendisi) + biraz pay
-    df = get_klines_closed(symbol, TIMEFRAME, limit=RES_LOOKBACK + 5)
-    if df is None or len(df) < RES_LOOKBACK + 1:
+    df = get_klines_closed(symbol, TIMEFRAME, limit=KLINES_LIMIT)
+    if df is None or len(df) < max(RSI_LEN, VOLUME_SMA_PERIOD) + 5:
         return None
 
-    breakout = df.iloc[-1]                              # kirilim adayi mum
-    history = df.iloc[-(RES_LOOKBACK + 1):-1]            # direnc SADECE bu mumlardan hesaplanir (kirilim mumu HARIC)
+    df = compute_indicators(df)
+    if df[["vol_ratio", "rsi"]].iloc[-2:].isna().any().any():
+        return None  # isinma donemi bitmemis (yeterli veri yok)
 
-    resistance = float(history["high"].max())
-    open_now = float(breakout["open"])
-    close_now = float(breakout["close"])
-    bar_time = str(breakout["open_time"])
+    candidate = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    if close_now <= open_now:
-        return None  # yesil mum degil -> kirilim sayilmaz
+    vol_ratio = float(candidate["vol_ratio"])
+    rsi_now = float(candidate["rsi"])
+    rsi_prev = float(prev["rsi"])
 
-    if close_now <= resistance:
-        return None  # direnc kirilmamis
-
-    break_pct = (close_now - resistance) / resistance * 100
-    body_pct = (close_now - open_now) / open_now * 100
-
-    if break_pct < RES_BREAK_PCT:
-        return None
-    if body_pct < MIN_CANDLE_BODY_PCT:
+    # --- Hacim sarti: volRatio >= MIN_VOLUME_RATIO ---
+    if vol_ratio < MIN_VOLUME_RATIO:
         return None
 
-    # --- 1H SMA100 MTF onayi -- sadece 5dk sartlarini gecen adaylar icin kontrol edilir
-    # (her coin icin degil, sadece kirilim uretenler icin -- gereksiz API yukunu onler)
-    sma1h_onay = True
-    if USE_1H_SMA_FILTER:
-        sma1h_onay = check_1h_sma_confirmation(symbol)
-        if not sma1h_onay:
-            return None
+    # --- Momentum sarti: RSI, 50 seviyesini YUKARI KESMIS olmali (crossover) ---
+    rsi_crossed_up = (rsi_prev <= RSI_LEVEL) and (rsi_now > RSI_LEVEL)
+    if not rsi_crossed_up:
+        return None
 
     return Signal(
-        symbol=symbol, price=close_now, resistance=resistance,
-        break_pct=break_pct, body_pct=body_pct, bar_time=bar_time,
-        sma1h_onay=sma1h_onay,
+        symbol=symbol,
+        price=float(candidate["close"]),
+        volume=float(candidate["volume"]),
+        vol_sma=float(candidate["vol_sma"]),
+        vol_ratio=vol_ratio,
+        rsi_prev=rsi_prev,
+        rsi_now=rsi_now,
+        bar_time=str(candidate["open_time"]),
     )
 
 
@@ -252,15 +237,14 @@ def send_telegram(text):
 def format_signal_message(signal: Signal):
     coin = signal.symbol.replace("USDT", "/USDT")
     sep = "=" * 24
+    vol_increase_pct = (signal.vol_ratio - 1.0) * 100
     lines = [
-        "🟢 <b>DİRENÇ KIRILIMI</b>",
+        "🟢 <b>HACIM + MOMENTUM YÜKSELİŞİ (AL)</b>",
         sep,
         f"💱 <b>Coin:</b> {coin}",
         f"💰 <b>Fiyat:</b> {signal.price:.6f}",
-        f"📍 <b>Kırılan Direnç ({TIMEFRAME}, son {RES_LOOKBACK} mum):</b> {signal.resistance:.6f}",
-        f"📏 <b>Kırılım Mesafesi:</b> %{signal.break_pct:.2f}",
-        f"🕯️ <b>Mum Gövdesi:</b> %{signal.body_pct:.2f}",
-        f"📊 <b>1H SMA100 Onayı:</b> {'✅ Var (son ' + str(MAX_BARS_SINCE_CROSS_1H) + ' mum içinde kesişim)' if signal.sma1h_onay else '—'}",
+        f"📊 <b>Hacim / SMA{VOLUME_SMA_PERIOD} Oranı:</b> {signal.vol_ratio:.2f}x (%{vol_increase_pct:.2f} üzeri)",
+        f"📈 <b>RSI{RSI_LEN}:</b> {signal.rsi_prev:.1f} → {signal.rsi_now:.1f} (50 yukarı kesişim ✅)",
         sep,
         f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
@@ -286,10 +270,9 @@ def run_scan_parallel():
     symbols = get_symbols()
     total = len(symbols)
     log.info(f"TARAMA BASLADI | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | "
-              f"Direnc lookback: {RES_LOOKBACK} | 1H SMA filtre: {USE_1H_SMA_FILTER} "
-              f"(pencere: {MAX_BARS_SINCE_CROSS_1H} mum)")
+              f"Min hacim orani: {MIN_VOLUME_RATIO:.2f}x (%{MIN_VOLUME_INCREASE_PCT}) | "
+              f"RSI{RSI_LEN} 50 yukari kesisim")
 
-    # likidite verisi TEK istekte, tarama basinda bir kez cekilir (600 ayri istek yerine 1 istek)
     quote_volumes = get_all_24h_quote_volumes() if USE_LIQUIDITY_FILTER else {}
 
     stats = {"total": total, "signal": 0, "no_signal": 0, "cooldown": 0, "error": 0}
@@ -317,7 +300,7 @@ def run_scan_parallel():
         try:
             msg = format_signal_message(signal)
             if send_telegram(msg):
-                log.info(f"SINYAL GONDERILDI: {signal.symbol} fiyat={signal.price:.6f} direnc={signal.resistance:.6f}")
+                log.info(f"SINYAL GONDERILDI: {signal.symbol} vol_ratio={signal.vol_ratio:.2f}x rsi={signal.rsi_now:.1f}")
             else:
                 log.error(f"Telegram gonderilemedi: {signal.symbol}")
         except Exception as e:
@@ -332,17 +315,16 @@ def run_scan_parallel():
 # ══════════════════════════════════════════════════════════════════
 def main():
     log.info("=" * 60)
-    log.info("5DK DIRENC KIRILIM SCANNER + 1H SMA100 FILTRESI baslatildi")
-    log.info(f"Max coin       : {MAX_COINS}")
-    log.info(f"Workers        : {MAX_WORKERS}")
-    log.info(f"TF             : {TIMEFRAME}")
-    log.info(f"Direnc lookback: {RES_LOOKBACK} mum")
-    log.info(f"Min kirilim    : %{RES_BREAK_PCT}")
-    log.info(f"Min mum govdesi: %{MIN_CANDLE_BODY_PCT}")
-    log.info(f"Likidite filtre: {USE_LIQUIDITY_FILTER} (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)")
-    log.info(f"1H SMA filtre  : {USE_1H_SMA_FILTER} (SMA{SMA_PERIOD_1H}, pencere {MAX_BARS_SINCE_CROSS_1H} mum)")
-    log.info(f"Tarama araligi : {SCAN_INTERVAL} sn")
-    log.info(f"Cooldown       : {SIGNAL_COOLDOWN} sn")
+    log.info("5DK HACIM + MOMENTUM SCANNER (Pine uyumlu) baslatildi")
+    log.info(f"Max coin        : {MAX_COINS}")
+    log.info(f"Workers         : {MAX_WORKERS}")
+    log.info(f"TF              : {TIMEFRAME}")
+    log.info(f"Hacim SMA       : {VOLUME_SMA_PERIOD} mum")
+    log.info(f"Min hacim orani : {MIN_VOLUME_RATIO:.2f}x (%{MIN_VOLUME_INCREASE_PCT} uzeri)")
+    log.info(f"RSI             : {RSI_LEN} periyot, seviye {RSI_LEVEL} (yukari kesisim)")
+    log.info(f"Likidite filtre : {USE_LIQUIDITY_FILTER} (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)")
+    log.info(f"Tarama araligi  : {SCAN_INTERVAL} sn")
+    log.info(f"Cooldown        : {SIGNAL_COOLDOWN} sn")
     log.info("=" * 60)
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -350,14 +332,13 @@ def main():
         return
 
     send_telegram(
-        "🚀 5DK DIRENC KIRILIM SCANNER + 1H SMA100 FILTRESI BASLADI\n"
+        "🚀 5DK HACIM + MOMENTUM SCANNER BASLADI\n"
         + "=" * 30 + "\n"
         f"💱 TF: {TIMEFRAME}\n"
-        f"📍 Direnc: son {RES_LOOKBACK} mumun en yuksegi\n"
-        f"📏 Min kirilim: %{RES_BREAK_PCT}\n"
-        f"🕯️ Min mum govdesi: %{MIN_CANDLE_BODY_PCT}\n"
+        f"📊 Hacim SMA: {VOLUME_SMA_PERIOD} mum\n"
+        f"🚀 Min hacim oranı: {MIN_VOLUME_RATIO:.2f}x (%{MIN_VOLUME_INCREASE_PCT} üzeri)\n"
+        f"📈 Momentum: RSI{RSI_LEN} 50 yukarı kesişim\n"
         f"💧 Min likidite: {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT\n"
-        f"📊 1H SMA100 onay penceresi: {MAX_BARS_SINCE_CROSS_1H} mum\n"
         f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn\n"
         f"⚡ Workers: {MAX_WORKERS}"
     )
