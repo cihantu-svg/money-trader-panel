@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-15DK DIRENC KIRILIM SCANNER BOT + 4H SMA100 MTF ONAY FILTRESI
+15DK DIRENC KIRILIM SCANNER BOT + 4H SMA100 MTF ONAY FILTRESI (TANI SAYACLI)
 - 15dk grafikte son N mumun en yuksegini (direnc) hesaplar (SADECE KAPANMIS mumlar - repaint yok)
 - Kirilim mumu direnci gecmis, YESIL olmali, govdesi (open-close farki) en az MIN_CANDLE_BODY_PCT olmali
 - Coin'in son 24s USDT hacmi MIN_QUOTE_VOLUME_24H altindaysa sinyal uretilmez (dusuk likidite elenir)
-- YENI: 4H SMA100 MTF onayi -> 4h'de SMA100 kesisimi (crossover) son MAX_BARS_SINCE_CROSS_4H
-  4h mum icinde olmus olmali VE fiyat hala SMA100 ustunde kalmis olmali. Boylece kesisim
-  aninda gelen 15dk kirilimlar da, kesisimden 1-4 mum sonra gelenler de yakalanir.
+- 4H SMA100 MTF onayi -> 4h'de SMA100 kesisimi (crossover) son MAX_BARS_SINCE_CROSS_4H
+  4h mum icinde olmus olmali VE fiyat hala SMA100 ustunde kalmis olmali.
+- YENI: her coin hangi asamada elendiyse ayri sayaclarla loglanir, boylece darbogazin
+  hangi filtrede oldugu (likidite / yesil mum / direnc / kirilim mesafesi / govde / 4H) net gorulur.
 - Kosullar saglaninca Telegram'a bildirim atar
 """
 import os
@@ -43,7 +44,7 @@ MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "10.0"))  # kirilim
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "5000000"))  # 5 milyon USDT
 
-# --- YENI: 4H SMA100 MTF ONAY FILTRESI ---
+# --- 4H SMA100 MTF ONAY FILTRESI ---
 USE_4H_SMA_FILTER = os.getenv("USE_4H_SMA_FILTER", "true").lower() == "true"
 SMA_PERIOD_4H = int(os.getenv("SMA_PERIOD_4H", "100"))
 MAX_BARS_SINCE_CROSS_4H = int(os.getenv("MAX_BARS_SINCE_CROSS_4H", "4"))  # kesisimden sonra kac 4h muma kadar gecerli
@@ -112,7 +113,7 @@ def get_all_24h_quote_volumes():
 
 
 # ══════════════════════════════════════════════════════════════════
-# YENI: 4H SMA100 MTF ONAY KONTROLU
+# 4H SMA100 MTF ONAY KONTROLU
 # ══════════════════════════════════════════════════════════════════
 def check_4h_sma_confirmation(symbol):
     """
@@ -171,16 +172,21 @@ class Signal:
 
 
 def analyze_symbol(symbol, quote_volumes=None):
+    """
+    Doner: (Signal | None, reason)
+    reason -- hangi asamada elendigini gosteren tani etiketi:
+      liquidity_filtered / insufficient_data / not_green / resistance_not_broken /
+      break_pct_low / body_pct_low / 4h_filter_failed / signal
+    """
     # --- likidite kontrolu once yapilir, dusukse hic kline cekmeye gerek yok ---
     if USE_LIQUIDITY_FILTER:
         qv = (quote_volumes or {}).get(symbol, 0.0)
         if qv < MIN_QUOTE_VOLUME_24H:
-            return None
+            return None, "liquidity_filtered"
 
-    # RES_LOOKBACK (direnc icin gecmis mum) + 1 (kirilim mumunun kendisi) + biraz pay
     df = get_klines_closed(symbol, TIMEFRAME, limit=RES_LOOKBACK + 5)
     if df is None or len(df) < RES_LOOKBACK + 1:
-        return None
+        return None, "insufficient_data"
 
     breakout = df.iloc[-1]                              # kirilim adayi mum
     history = df.iloc[-(RES_LOOKBACK + 1):-1]            # direnc SADECE bu mumlardan hesaplanir (kirilim mumu HARIC)
@@ -191,32 +197,31 @@ def analyze_symbol(symbol, quote_volumes=None):
     bar_time = str(breakout["open_time"])
 
     if close_now <= open_now:
-        return None  # yesil mum degil -> kirilim sayilmaz
+        return None, "not_green"
 
     if close_now <= resistance:
-        return None  # direnc kirilmamis
+        return None, "resistance_not_broken"
 
     break_pct = (close_now - resistance) / resistance * 100
     body_pct = (close_now - open_now) / open_now * 100
 
     if break_pct < RES_BREAK_PCT:
-        return None
+        return None, "break_pct_low"
     if body_pct < MIN_CANDLE_BODY_PCT:
-        return None
+        return None, "body_pct_low"
 
-    # --- YENI: 4H SMA100 MTF onayi -- sadece 15dk sartlarini gecen adaylar icin kontrol edilir
-    # (her coin icin degil, sadece kirilim uretenler icin -- gereksiz API yukunu onler)
+    # --- 4H SMA100 MTF onayi -- sadece 15dk sartlarini gecen adaylar icin kontrol edilir
     sma4h_onay = True
     if USE_4H_SMA_FILTER:
         sma4h_onay = check_4h_sma_confirmation(symbol)
         if not sma4h_onay:
-            return None
+            return None, "4h_filter_failed"
 
     return Signal(
         symbol=symbol, price=close_now, resistance=resistance,
         break_pct=break_pct, body_pct=body_pct, bar_time=bar_time,
         sma4h_onay=sma4h_onay,
-    )
+    ), "signal"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -272,9 +277,9 @@ def format_signal_message(signal: Signal):
 # ══════════════════════════════════════════════════════════════════
 def check_signal(symbol, quote_volumes=None):
     try:
-        signal = analyze_symbol(symbol, quote_volumes=quote_volumes)
+        signal, reason = analyze_symbol(symbol, quote_volumes=quote_volumes)
         if signal is None:
-            return None, {"symbol": symbol, "status": "no_signal"}
+            return None, {"symbol": symbol, "status": reason}
         if not should_send(symbol):
             return None, {"symbol": symbol, "status": "cooldown"}
         return signal, {"symbol": symbol, "status": "signal"}
@@ -292,7 +297,13 @@ def run_scan_parallel():
     # likidite verisi TEK istekte, tarama basinda bir kez cekilir (600 ayri istek yerine 1 istek)
     quote_volumes = get_all_24h_quote_volumes() if USE_LIQUIDITY_FILTER else {}
 
-    stats = {"total": total, "signal": 0, "no_signal": 0, "cooldown": 0, "error": 0}
+    # YENI: tani sayaclari - hangi asamada elendigi ayri ayri sayilir
+    stats = {
+        "total": total, "signal": 0, "cooldown": 0, "error": 0,
+        "liquidity_filtered": 0, "insufficient_data": 0, "not_green": 0,
+        "resistance_not_broken": 0, "break_pct_low": 0, "body_pct_low": 0,
+        "4h_filter_failed": 0,
+    }
     found = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -311,7 +322,7 @@ def run_scan_parallel():
                 stats["error"] += 1
 
             if completed % 100 == 0 or completed == total:
-                log.info(f"[{completed}/{total}] Sinyal:{stats['signal']} NoSignal:{stats['no_signal']} Hata:{stats['error']}")
+                log.info(f"[{completed}/{total}] Sinyal:{stats['signal']} Hata:{stats['error']}")
 
     for signal in found:
         try:
@@ -323,7 +334,13 @@ def run_scan_parallel():
         except Exception as e:
             log.error(f"Gonderim hatasi {signal.symbol}: {e}")
 
-    log.info(f"Tarama tamamlandi | {stats['signal']} sinyal | {stats}")
+    # YENI: darbogaz analizi - hangi filtrede en cok coin elendi, buyukten kucuge
+    elenme_ozet = {k: v for k, v in stats.items() if k not in ("total", "signal", "error")}
+    elenme_siralama = sorted(elenme_ozet.items(), key=lambda x: x[1], reverse=True)
+    elenme_str = " | ".join(f"{k}:{v}" for k, v in elenme_siralama if v > 0)
+
+    log.info(f"Tarama tamamlandi | {stats['signal']} sinyal")
+    log.info(f"TANI - elenme dagilimi: {elenme_str}")
     return stats["signal"]
 
 
@@ -332,7 +349,7 @@ def run_scan_parallel():
 # ══════════════════════════════════════════════════════════════════
 def main():
     log.info("=" * 60)
-    log.info("15DK DIRENC KIRILIM SCANNER + 4H SMA100 FILTRESI baslatildi")
+    log.info("15DK DIRENC KIRILIM SCANNER + 4H SMA100 FILTRESI (TANI SAYACLI) baslatildi")
     log.info(f"Max coin       : {MAX_COINS}")
     log.info(f"Workers        : {MAX_WORKERS}")
     log.info(f"TF             : {TIMEFRAME}")
