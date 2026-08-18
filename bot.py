@@ -1,19 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-5DK SPIKE + TAKER BUY/SELL ONAY SCANNER (LONG/SHORT)
+5DK TAKER BUY/SELL BASKINLIGI + GUCLU MUM SCANNER (LONG/SHORT)
 
 MANTIK:
-1) Coin'de son birkac kapanmis 5dk mumda en az MIN_SPIKE_BODY_PCT (%5) govdeli
-   YESIL bir "spike" mumu aranir.
-2) Spike'tan sonraki en fazla MAX_CONFIRM_BARS (3) mumda, taker buy/sell hacim
-   oranina bakilarak yon belirlenir:
-     - Taker BUY baskin kalirsa (buy_ratio >= LONG_TAKER_BUY_RATIO)
-       -> LONG sinyali (spike gercek, alim devam ediyor)
-     - Taker SELL baskin olursa (sell_ratio >= SHORT_TAKER_SELL_RATIO)
-       -> SHORT sinyali (spike tuzak, tersine donuyor / satis yiyor)
-3) Onay penceresi (MAX_CONFIRM_BARS) icinde net bir yon olusmazsa sinyal
-   uretilmez, bir sonraki taramada ayni spike icin tekrar denenir (pencere
-   dolana kadar).
+Son KAPANMIS 5dk mumda iki sart ayni anda aranir:
+  1) Taker buy veya sell baskinligi >= IMBALANCE_RATIO (%55)
+  2) Mum govdesi ayni yonde en az MIN_BODY_PCT (%4)
+
+  - Taker BUY >= %55 VE yesil govde >= +%4  -> LONG sinyali
+  - Taker SELL >= %55 VE kirmizi govde <= -%4 -> SHORT sinyali
+
+Uyumsuz durumlar (orn. %60 buy ama kirmizi mum) sinyal uretmez.
 
 Taker buy hacmi, Binance kline API'sinin dogal alani (taker_buy_base_asset_volume)
 oldugu icin ayri bir istege gerek yok.
@@ -41,19 +38,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "120"))
 MAX_COINS = int(os.getenv("MAX_COINS", "600"))
-SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "3600"))
+SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", "1800"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "8"))
 
 TIMEFRAME = os.getenv("TIMEFRAME", "5m")
 
-# --- SPIKE (KIRILIM MUMU) AYARLARI ---
-MIN_SPIKE_BODY_PCT = float(os.getenv("MIN_SPIKE_BODY_PCT", "5.0"))   # spike mumunun govdesi en az % kac olmali
-MAX_CONFIRM_BARS = int(os.getenv("MAX_CONFIRM_BARS", "3"))           # spike'tan sonra en fazla kac mum icinde onay aranir
-
-# --- TAKER BUY/SELL ONAY ESIKLERI ---
-LONG_TAKER_BUY_RATIO = float(os.getenv("LONG_TAKER_BUY_RATIO", "0.55"))    # onay penceresinde taker buy orani >= bu ise LONG
-SHORT_TAKER_SELL_RATIO = float(os.getenv("SHORT_TAKER_SELL_RATIO", "0.55"))  # onay penceresinde taker sell orani >= bu ise SHORT
+# --- TAKER BASKINLIGI + MUM GOVDESI AYARLARI ---
+IMBALANCE_RATIO = float(os.getenv("IMBALANCE_RATIO", "0.55"))   # taker buy veya sell orani >= bu olmali
+MIN_BODY_PCT = float(os.getenv("MIN_BODY_PCT", "4.0"))          # mum govdesi min % bu olmali (yon ile uyumlu)
 
 # --- LIKIDITE FILTRESI ---
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
@@ -67,8 +60,8 @@ MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "5"))
 BINANCE_BASE = "https://fapi.binance.com"
 last_signal = {}
 
-# Spike aramasi + onay penceresi icin yeterli mum + pay
-KLINES_LIMIT = MAX_CONFIRM_BARS + 10
+# Tek muma bakildigi icin birkac mum yeterli
+KLINES_LIMIT = 5
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -130,16 +123,15 @@ def get_all_24h_quote_volumes():
 
 
 # ══════════════════════════════════════════════════════════════════
-# SINYAL: SPIKE + TAKER BUY/SELL ONAYI
+# SINYAL: TAKER BASKINLIGI + GUCLU MUM
 # ══════════════════════════════════════════════════════════════════
 @dataclass
 class Signal:
     symbol: str
     direction: str          # "LONG" veya "SHORT"
     price: float
-    spike_body_pct: float
-    bars_since_spike: int
-    taker_buy_ratio: float  # onay penceresindeki taker buy orani (0-1)
+    body_pct: float         # mum govdesi % (isaretli: + yesil, - kirmizi)
+    taker_buy_ratio: float  # mumdaki taker buy orani (0-1)
     bar_time: str
 
 
@@ -150,59 +142,34 @@ def analyze_symbol(symbol, quote_volumes=None):
             return None
 
     df = get_klines_closed(symbol, TIMEFRAME, limit=KLINES_LIMIT)
-    if df is None or len(df) < MAX_CONFIRM_BARS + 3:
+    if df is None or len(df) < 2:
         return None
 
-    df["body_pct"] = (df["close"] - df["open"]) / df["open"] * 100
-    df["is_spike"] = (df["body_pct"] >= MIN_SPIKE_BODY_PCT) & (df["close"] > df["open"])
-
-    n = len(df)
-    last_idx = n - 1
-
-    # --- Onay penceresi icindeki en son spike'i bul (en yakin/en gecerli) ---
-    spike_idx = None
-    for j in range(last_idx - 1, max(last_idx - 1 - MAX_CONFIRM_BARS, -1), -1):
-        if bool(df["is_spike"].iloc[j]):
-            spike_idx = j
-            break
-
-    if spike_idx is None:
-        return None  # onay penceresinde spike yok
-
-    bars_since_spike = last_idx - spike_idx
-    if bars_since_spike < 1 or bars_since_spike > MAX_CONFIRM_BARS:
-        return None  # spike ya cok yeni (henuz onay mumu yok) ya da pencere disi
-
-    # --- Onay penceresi: spike'tan sonraki mumlar (spike_idx+1 .. last_idx) ---
-    confirm = df.iloc[spike_idx + 1: last_idx + 1]
-    total_volume = float(confirm["volume"].sum())
-    if total_volume <= 0:
+    last = df.iloc[-1]                      # son KAPANMIS mum
+    vol = float(last["volume"])
+    if vol <= 0:
         return None
 
-    total_taker_buy = float(confirm["taker_buy_base"].sum())
-    taker_buy_ratio = total_taker_buy / total_volume
-    taker_sell_ratio = 1.0 - taker_buy_ratio
+    body_pct = (float(last["close"]) - float(last["open"])) / float(last["open"]) * 100
+    buy_ratio = float(last["taker_buy_base"]) / vol
+    sell_ratio = 1.0 - buy_ratio
 
-    current = df.iloc[last_idx]
-    spike = df.iloc[spike_idx]
-
-    direction = None
-    if taker_buy_ratio >= LONG_TAKER_BUY_RATIO:
+    # LONG: taker buy >= %55 VE yesil govde >= +%4
+    if buy_ratio >= IMBALANCE_RATIO and body_pct >= MIN_BODY_PCT:
         direction = "LONG"
-    elif taker_sell_ratio >= SHORT_TAKER_SELL_RATIO:
+    # SHORT: taker sell >= %55 VE kirmizi govde <= -%4
+    elif sell_ratio >= IMBALANCE_RATIO and body_pct <= -MIN_BODY_PCT:
         direction = "SHORT"
-
-    if direction is None:
-        return None  # henuz net bir yon olusmadi, sonraki taramada tekrar denenir
+    else:
+        return None
 
     return Signal(
         symbol=symbol,
         direction=direction,
-        price=float(current["close"]),
-        spike_body_pct=float(spike["body_pct"]),
-        bars_since_spike=bars_since_spike,
-        taker_buy_ratio=taker_buy_ratio,
-        bar_time=str(current["open_time"]),
+        price=float(last["close"]),
+        body_pct=body_pct,
+        taker_buy_ratio=buy_ratio,
+        bar_time=str(last["open_time"]),
     )
 
 
@@ -240,19 +207,18 @@ def format_signal_message(signal: Signal):
     coin = signal.symbol.replace("USDT", "/USDT")
     sep = "=" * 24
     if signal.direction == "LONG":
-        header = "🟢 <b>SPIKE ONAYLANDI (LONG)</b>"
-        ratio_line = f"📈 <b>Taker Buy Oranı:</b> %{signal.taker_buy_ratio*100:.1f} (alım baskın, spike devam ediyor)"
+        header = "🟢 <b>ALIM BASKINI + GUCLU MUM (LONG)</b>"
+        ratio_line = f"📈 <b>Taker Buy Oranı:</b> %{signal.taker_buy_ratio*100:.1f} (alım baskın)"
     else:
-        header = "🔴 <b>SPIKE TERSİNE DÖNDÜ (SHORT)</b>"
-        ratio_line = f"📉 <b>Taker Sell Oranı:</b> %{(1-signal.taker_buy_ratio)*100:.1f} (satış baskın, spike tuzak)"
+        header = "🔴 <b>SATIS BASKINI + GUCLU MUM (SHORT)</b>"
+        ratio_line = f"📉 <b>Taker Sell Oranı:</b> %{(1-signal.taker_buy_ratio)*100:.1f} (satış baskın)"
 
     lines = [
         header,
         sep,
         f"💱 <b>Coin:</b> {coin}",
         f"💰 <b>Fiyat:</b> {signal.price:.6f}",
-        f"🕯️ <b>Spike Mum Gövdesi:</b> %{signal.spike_body_pct:.2f}",
-        f"⏳ <b>Spike'tan Sonra:</b> {signal.bars_since_spike} mum",
+        f"🕯️ <b>Mum Gövdesi:</b> %{signal.body_pct:.2f}",
         ratio_line,
         sep,
         f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
@@ -279,8 +245,7 @@ def run_scan_parallel():
     symbols = get_symbols()
     total = len(symbols)
     log.info(f"TARAMA BASLADI | Coin: {total} | Workers: {MAX_WORKERS} | TF: {TIMEFRAME} | "
-              f"Min spike govde: %{MIN_SPIKE_BODY_PCT} | Onay penceresi: {MAX_CONFIRM_BARS} mum | "
-              f"LONG esik: %{LONG_TAKER_BUY_RATIO*100:.0f} taker buy | SHORT esik: %{SHORT_TAKER_SELL_RATIO*100:.0f} taker sell")
+              f"Imbalance esik: %{IMBALANCE_RATIO*100:.0f} | Min govde: %{MIN_BODY_PCT}")
 
     quote_volumes = get_all_24h_quote_volumes() if USE_LIQUIDITY_FILTER else {}
 
@@ -316,7 +281,7 @@ def run_scan_parallel():
             msg = format_signal_message(signal)
             if send_telegram(msg):
                 log.info(f"SINYAL GONDERILDI: {signal.symbol} {signal.direction} "
-                          f"taker_buy_ratio={signal.taker_buy_ratio:.2f} bars={signal.bars_since_spike}")
+                          f"taker_buy_ratio={signal.taker_buy_ratio:.2f} body={signal.body_pct:.2f}%")
             else:
                 log.error(f"Telegram gonderilemedi: {signal.symbol}")
         except Exception as e:
@@ -331,14 +296,12 @@ def run_scan_parallel():
 # ══════════════════════════════════════════════════════════════════
 def main():
     log.info("=" * 60)
-    log.info("5DK SPIKE + TAKER BUY/SELL ONAY SCANNER baslatildi")
+    log.info("5DK TAKER BUY/SELL BASKINLIGI + GUCLU MUM SCANNER baslatildi")
     log.info(f"Max coin         : {MAX_COINS}")
     log.info(f"Workers          : {MAX_WORKERS}")
     log.info(f"TF               : {TIMEFRAME}")
-    log.info(f"Min spike govde  : %{MIN_SPIKE_BODY_PCT}")
-    log.info(f"Onay penceresi   : {MAX_CONFIRM_BARS} mum")
-    log.info(f"LONG esik        : taker buy orani >= %{LONG_TAKER_BUY_RATIO*100:.0f}")
-    log.info(f"SHORT esik       : taker sell orani >= %{SHORT_TAKER_SELL_RATIO*100:.0f}")
+    log.info(f"Imbalance esik   : taker buy/sell orani >= %{IMBALANCE_RATIO*100:.0f}")
+    log.info(f"Min mum govdesi  : %{MIN_BODY_PCT} (yon ile uyumlu)")
     log.info(f"Likidite filtre  : {USE_LIQUIDITY_FILTER} (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)")
     log.info(f"Max sinyal/tarama: {MAX_SIGNALS_PER_SCAN if MAX_SIGNALS_PER_SCAN > 0 else 'sinirsiz'}")
     log.info(f"Tarama araligi   : {SCAN_INTERVAL} sn")
@@ -350,13 +313,11 @@ def main():
         return
 
     send_telegram(
-        "🚀 5DK SPIKE + TAKER BUY/SELL ONAY SCANNER BASLADI\n"
+        "🚀 5DK TAKER BASKINLIGI + GUCLU MUM SCANNER BASLADI\n"
         + "=" * 30 + "\n"
         f"💱 TF: {TIMEFRAME}\n"
-        f"🕯️ Min spike gövde: %{MIN_SPIKE_BODY_PCT}\n"
-        f"⏳ Onay penceresi: {MAX_CONFIRM_BARS} mum\n"
-        f"🟢 LONG eşik: taker buy >= %{LONG_TAKER_BUY_RATIO*100:.0f}\n"
-        f"🔴 SHORT eşik: taker sell >= %{SHORT_TAKER_SELL_RATIO*100:.0f}\n"
+        f"📊 Imbalance eşik: taker buy/sell >= %{IMBALANCE_RATIO*100:.0f}\n"
+        f"🕯️ Min mum gövdesi: %{MIN_BODY_PCT}\n"
         f"💧 Min likidite: {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT\n"
         f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn\n"
         f"⚡ Workers: {MAX_WORKERS}"
