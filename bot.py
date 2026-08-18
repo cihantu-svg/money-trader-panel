@@ -51,9 +51,20 @@ MIN_VOLUME_RATIO = 1.0 + (MIN_VOLUME_INCREASE_PCT / 100.0)  # ornek: %7 -> 1.07x
 RSI_LEN = int(os.getenv("RSI_LEN", "14"))
 RSI_LEVEL = float(os.getenv("RSI_LEVEL", "50"))
 
+# --- MUM BOYU (GOVDE) SARTI ---
+# Sadece hacim + RSI kesisimi zayif fiyat hareketlerinde de tetiklenebiliyordu.
+# Bu yuzden mumun govdesi (fiyat hareketi) de en az MIN_CANDLE_BODY_PCT olmali.
+MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", "3.0"))
+
 # --- LIKIDITE FILTRESI ---
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "5000000"))  # 5 milyon USDT
+
+# --- SINYAL SAYISI SINIRI ---
+# Esik ne olursa olsun, piyasa hareketliyse cok sinyal gelebilir.
+# Bu yuzden her taramada SADECE en guclu (hacim orani en yuksek) MAX_SIGNALS_PER_SCAN
+# kadar sinyal gonderilir, gerisi elenir. 0 = sinir yok (hepsini gonder).
+MAX_SIGNALS_PER_SCAN = int(os.getenv("MAX_SIGNALS_PER_SCAN", "5"))
 
 BINANCE_BASE = "https://fapi.binance.com"
 last_signal = {}
@@ -159,6 +170,7 @@ class Signal:
     vol_ratio: float
     rsi_prev: float
     rsi_now: float
+    body_pct: float
     bar_time: str
 
 
@@ -192,6 +204,14 @@ def analyze_symbol(symbol, quote_volumes=None):
     if not rsi_crossed_up:
         return None
 
+    # --- Mum boyu sarti: mum yesil olmali ve govdesi en az MIN_CANDLE_BODY_PCT olmali ---
+    open_now = float(candidate["open"])
+    close_now = float(candidate["close"])
+    body_pct = (close_now - open_now) / open_now * 100
+
+    if body_pct < MIN_CANDLE_BODY_PCT:
+        return None  # yesil degil veya govde cok kucuk
+
     return Signal(
         symbol=symbol,
         price=float(candidate["close"]),
@@ -200,6 +220,7 @@ def analyze_symbol(symbol, quote_volumes=None):
         vol_ratio=vol_ratio,
         rsi_prev=rsi_prev,
         rsi_now=rsi_now,
+        body_pct=body_pct,
         bar_time=str(candidate["open_time"]),
     )
 
@@ -245,6 +266,7 @@ def format_signal_message(signal: Signal):
         f"💰 <b>Fiyat:</b> {signal.price:.6f}",
         f"📊 <b>Hacim / SMA{VOLUME_SMA_PERIOD} Oranı:</b> {signal.vol_ratio:.2f}x (%{vol_increase_pct:.2f} üzeri)",
         f"📈 <b>RSI{RSI_LEN}:</b> {signal.rsi_prev:.1f} → {signal.rsi_now:.1f} (50 yukarı kesişim ✅)",
+        f"🕯️ <b>Mum Gövdesi:</b> %{signal.body_pct:.2f}",
         sep,
         f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}",
     ]
@@ -296,6 +318,12 @@ def run_scan_parallel():
             if completed % 100 == 0 or completed == total:
                 log.info(f"[{completed}/{total}] Sinyal:{stats['signal']} NoSignal:{stats['no_signal']} Hata:{stats['error']}")
 
+    # --- En guclu sinyalleri one al, MAX_SIGNALS_PER_SCAN ile sinirla ---
+    found.sort(key=lambda s: s.vol_ratio, reverse=True)
+    if MAX_SIGNALS_PER_SCAN > 0 and len(found) > MAX_SIGNALS_PER_SCAN:
+        log.info(f"{len(found)} sinyal bulundu, en guclu {MAX_SIGNALS_PER_SCAN} tanesi gonderiliyor (digerleri elendi)")
+        found = found[:MAX_SIGNALS_PER_SCAN]
+
     for signal in found:
         try:
             msg = format_signal_message(signal)
@@ -322,7 +350,9 @@ def main():
     log.info(f"Hacim SMA       : {VOLUME_SMA_PERIOD} mum")
     log.info(f"Min hacim orani : {MIN_VOLUME_RATIO:.2f}x (%{MIN_VOLUME_INCREASE_PCT} uzeri)")
     log.info(f"RSI             : {RSI_LEN} periyot, seviye {RSI_LEVEL} (yukari kesisim)")
+    log.info(f"Min mum govdesi : %{MIN_CANDLE_BODY_PCT}")
     log.info(f"Likidite filtre : {USE_LIQUIDITY_FILTER} (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)")
+    log.info(f"Max sinyal/tarama: {MAX_SIGNALS_PER_SCAN if MAX_SIGNALS_PER_SCAN > 0 else 'sinirsiz'}")
     log.info(f"Tarama araligi  : {SCAN_INTERVAL} sn")
     log.info(f"Cooldown        : {SIGNAL_COOLDOWN} sn")
     log.info("=" * 60)
@@ -338,6 +368,7 @@ def main():
         f"📊 Hacim SMA: {VOLUME_SMA_PERIOD} mum\n"
         f"🚀 Min hacim oranı: {MIN_VOLUME_RATIO:.2f}x (%{MIN_VOLUME_INCREASE_PCT} üzeri)\n"
         f"📈 Momentum: RSI{RSI_LEN} 50 yukarı kesişim\n"
+        f"🕯️ Min mum gövdesi: %{MIN_CANDLE_BODY_PCT}\n"
         f"💧 Min likidite: {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT\n"
         f"⏰ Cooldown: {SIGNAL_COOLDOWN}sn\n"
         f"⚡ Workers: {MAX_WORKERS}"
