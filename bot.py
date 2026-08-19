@@ -167,9 +167,11 @@ def compute_signals_for_symbol(symbol, df):
     if n < DELTA_LOOKBACK_CANDLES + FORWARD_CANDLES + 5:
         return signals
 
-    buy_ratio = df["taker_buy_base"] / df["volume"].replace(0, pd.NA)
-    body_pct = (df["close"] - df["open"]) / df["open"] * 100
-    rolling_avg = buy_ratio.rolling(DELTA_LOOKBACK_CANDLES).mean().shift(1)  # kendisi haric onceki N mum
+    import numpy as np
+    vol_safe = df["volume"].replace(0, np.nan).astype(float)
+    buy_ratio = (df["taker_buy_base"].astype(float) / vol_safe).astype(float)
+    body_pct = ((df["close"] - df["open"]) / df["open"] * 100).astype(float)
+    rolling_avg = buy_ratio.rolling(DELTA_LOOKBACK_CANDLES, min_periods=DELTA_LOOKBACK_CANDLES).mean().shift(1)
 
     for i in range(DELTA_LOOKBACK_CANDLES, n - FORWARD_CANDLES):
         br = buy_ratio.iloc[i]
