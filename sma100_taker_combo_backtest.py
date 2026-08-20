@@ -1,28 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-SMA100 HIZLI KIRILIM BACKTEST (15dk)
+BIRLESIK STRATEJI: SMA100 HIZLI KIRILIM + TAKER IMBALANCE (15dk)
 
-MANTIK:
-Fiyat SMA100'e yakinken (son 2-3 mum icinde SMA100'e uzakligi kucukken,
-"NEAR_TOL" toleransi icinde) aniden SMA100'den BREAK_PCT (%4) veya daha
-fazla uzaklasiyorsa -> hizli kirilim sinyali.
+En iyi cikan iki stratejiyi birlestirir:
+  1) SMA100 Hizli Kirilim: fiyat SMA100'e yakinken (son 2-3 mumda uzaklik
+     <=%1.5) aniden %4+ uzaklasiyor (kirilim mumu)
+  2) Taker Imbalance: kirilim mumunun KENDISINDE taker buy/sell orani
+     belirli bir esigi (0/%50/%55/%60/%65/%70) geciyor mu
 
-  LONG  : fiyat SMA100'un uzerine hizla %4+ tasti (son 2-3 mumda SMA100'e
-          yakindi, simdi %4+ uzerinde)
-  SHORT : fiyat SMA100'un altina hizla %4+ dustu (son 2-3 mumda SMA100'e
-          yakindi, simdi %4+ altinda)
+MANTIK: SMA100 kirilimi zaten guclu bir sinyal (%48.2 hit-rate, 1055
+sinyal). Soru: kirilim mumunda ayrica taker akisi da o yonde baskinsa
+(LONG kiriliminda taker buy baskin, SHORT kiriliminda taker sell baskin),
+isabet orani daha da artiyor mu?
 
-"Yakinlik" penceresi: son 3 mumun (i-1, i-2, i-3) SMA100'e uzakliginin
-EN KUCUGU NEAR_TOL (%1.5) altindaysa, mevcut mum (i) BREAK_PCT'i asiyorsa
-sinyal kabul edilir. Ayni kirilimin art arda tekrar sinyal vermemesi icin
-bir onceki mumun zaten kirilim sartini saglamamis olmasi gerekir (yeni kirilim).
+BASELINE (taker esigi 0) = saf SMA100 kirilimi (taker filtresi yok).
+Esik yukseldikce sinyal sayisi azalir, hit-rate degisimi izlenir.
 
-ZAMAN DILIMI: 15dk
-COIN SAYISI: 200 (en likit, min 3M USDT 24s hacim)
-LOOKBACK: 30 gun (onceki testlerden biraz daha fazla veri)
-
-DEGERLENDIRME: Sinyal sonrasi 48 saat (192x15dk mum) icinde en iyi lehte
-hareket olculur, %5/%10/%20 hedeflerine ulasma orani hesaplanir.
+ZAMAN DILIMI: 15dk | COIN: 200 (min 3M USDT) | LOOKBACK: 30 gun
 """
 import time
 import logging
@@ -49,9 +43,12 @@ MIN_QUOTE_VOLUME_24H = 3_000_000
 LOOKBACK_DAYS = 30
 
 SMA_PERIOD = 100
-NEAR_TOL_PCT = 1.5          # "SMA100'e yakin" sayilmasi icin uzaklik esigi (%)
-BREAK_PCT = 4.0              # kirilim esigi (%)
-LOOKBACK_WINDOW = 3          # son kac mum icinde "yakinlik" arandigi
+NEAR_TOL_PCT = 1.5
+BREAK_PCT = 4.0
+LOOKBACK_WINDOW = 3
+
+# Test edilecek taker imbalance esikleri (0 = filtre yok / baseline)
+TAKER_THRESHOLDS = [0.0, 0.50, 0.55, 0.60, 0.65, 0.70]
 
 FORWARD_HOURS = 48
 TARGET_PCTS = [5, 10, 20]
@@ -137,7 +134,7 @@ def get_klines_range(symbol, interval, start_ms, end_ms):
     df = pd.DataFrame(all_rows, columns=[
         "open_time", "open", "high", "low", "close", "volume", "close_time",
         "qav", "trades", "taker_buy_base", "taker_buy_quote", "ignore"])
-    for c in ["open", "high", "low", "close", "volume"]:
+    for c in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
         df[c] = df[c].astype(float)
     df = df.drop_duplicates(subset="open_time").reset_index(drop=True)
     return df
@@ -151,7 +148,8 @@ class Signal:
     symbol: str
     direction: str
     signal_time: str
-    distance_pct: float     # sinyal anindaki SMA100'e uzaklik (%)
+    distance_pct: float
+    taker_ratio: float      # yon ile uyumlu taker orani (LONG->buy, SHORT->sell)
     max_favorable_pct: float
     hit_targets: dict = field(default_factory=dict)
 
@@ -167,12 +165,14 @@ def compute_signals(symbol, df, forward_candles):
     sma100 = close.rolling(SMA_PERIOD).mean()
     distance_pct = (close - sma100) / sma100 * 100
 
+    vol_safe = df["volume"].replace(0, np.nan).astype(float)
+    buy_ratio = (df["taker_buy_base"].astype(float) / vol_safe)
+
     for i in range(SMA_PERIOD + LOOKBACK_WINDOW, n - forward_candles):
         d_now = distance_pct.iloc[i]
         if pd.isna(d_now):
             continue
 
-        # son LOOKBACK_WINDOW mumda (i-1..i-LOOKBACK_WINDOW) SMA100'e en yakin nokta
         recent = distance_pct.iloc[i - LOOKBACK_WINDOW:i]
         if recent.isna().any():
             continue
@@ -186,13 +186,18 @@ def compute_signals(symbol, df, forward_candles):
         if direction is None:
             continue
 
-        # yeni kirilim mi - bir onceki mum zaten ayni yonde kirilim sartini sagliyorsa atla
         d_prev = distance_pct.iloc[i - 1]
         if not pd.isna(d_prev):
             if direction == "LONG" and d_prev >= BREAK_PCT:
                 continue
             if direction == "SHORT" and d_prev <= -BREAK_PCT:
                 continue
+
+        br = buy_ratio.iloc[i]
+        if pd.isna(br):
+            continue
+        sr = 1.0 - br
+        taker_ratio = br if direction == "LONG" else sr
 
         entry_price = float(close.iloc[i])
         future = df.iloc[i + 1: i + 1 + forward_candles]
@@ -207,7 +212,8 @@ def compute_signals(symbol, df, forward_candles):
         signals.append(Signal(
             symbol=symbol, direction=direction,
             signal_time=datetime.fromtimestamp(int(df["open_time"].iloc[i]) / 1000).strftime("%Y-%m-%d %H:%M"),
-            distance_pct=float(d_now), max_favorable_pct=float(max_fav), hit_targets=hit,
+            distance_pct=float(d_now), taker_ratio=float(taker_ratio),
+            max_favorable_pct=float(max_fav), hit_targets=hit,
         ))
     return signals
 
@@ -216,52 +222,61 @@ def compute_signals(symbol, df, forward_candles):
 # RAPOR
 # ══════════════════════════════════════════════════════════════════
 def summarize(all_signals):
-    print("\n" + "=" * 90)
-    print(f"SMA100 HIZLI KIRILIM BACKTEST (15dk)  {TOP_N_SYMBOLS} coin, {LOOKBACK_DAYS} gun, "
-          f"kirilim>=%{BREAK_PCT}, yakinlik<=%{NEAR_TOL_PCT} (son {LOOKBACK_WINDOW} mumda)")
-    print("=" * 90)
+    print("\n" + "=" * 95)
+    print(f"BIRLESIK: SMA100 KIRILIM + TAKER IMBALANCE (15dk)  {TOP_N_SYMBOLS} coin, {LOOKBACK_DAYS} gun")
+    print(f"kirilim>=%{BREAK_PCT}, yakinlik<=%{NEAR_TOL_PCT} | taker esigi taraniyor")
+    print("=" * 95)
 
-    n = len(all_signals)
-    rates = {}
-    for t in TARGET_PCTS:
-        hits = sum(1 for s in all_signals if s.hit_targets.get(t))
-        rates[t] = (hits / n * 100) if n else 0
-    avg_fav = (sum(s.max_favorable_pct for s in all_signals) / n) if n else 0
+    header = f"{'Taker esik':>11} | {'n':>6} |" + "".join(f" %{t} hit |" for t in TARGET_PCTS) + f" {'Ort.max.fav%':>13}"
+    print(header)
+    print("-" * len(header))
 
-    print(f"\nTOPLAM SINYAL: {n}")
-    for t in TARGET_PCTS:
-        print(f"  >= %{t} hedefe ulasma orani: {rates[t]:.1f}%")
-    print(f"  Ortalama en iyi lehte hareket: {avg_fav:.2f}%")
-
-    print("\n--- YON BAZINDA ---")
-    for direction in ("LONG", "SHORT"):
-        subset = [s for s in all_signals if s.direction == direction]
-        if not subset:
-            continue
-        nd = len(subset)
-        rates_d = {}
+    for th in TAKER_THRESHOLDS:
+        subset = [s for s in all_signals if s.taker_ratio >= th]
+        n = len(subset)
+        rates = {}
         for t in TARGET_PCTS:
             hits = sum(1 for s in subset if s.hit_targets.get(t))
-            rates_d[t] = hits / nd * 100
-        avg_fav_d = sum(s.max_favorable_pct for s in subset) / nd
-        print(f"  {direction:<6} n={nd:>5}  " + " ".join(f"%{t}={rates_d[t]:.1f}%" for t in TARGET_PCTS)
-              + f"  ort.fav={avg_fav_d:.2f}%")
+            rates[t] = (hits / n * 100) if n else 0
+        avg_fav = (sum(s.max_favorable_pct for s in subset) / n) if n else 0
+        row = f"{th*100:>10.0f}% | {n:>6} |"
+        for t in TARGET_PCTS:
+            row += f" {rates[t]:>7.1f}% |"
+        row += f" {avg_fav:>12.2f}%"
+        print(row)
 
-    print("\n--- EN COK SINYAL URETEN 15 COIN ---")
+    print("\nYorum: '0%' satiri saf SMA100 kirilimi (taker filtresi yok - baseline, 1055 sinyalle")
+    print("onceki testte %10 hit-rate %48.2 idi). Esik yukseldikce hit-rate baseline'in USTUNE")
+    print("cikiyorsa, taker akisi eklemek gercekten degerlidir. Cikmiyorsa/dususe geciyorsa,")
+    print("SMA100 kirilimi zaten kendi basina yeterince guclu bir filtre demektir.")
+
+    # yon bazinda kirilim, esik=0 (baseline) ve esik=0.60 (tipik pratik esik) icin
+    print("\n--- YON BAZINDA KIRILIM (taker esigine gore) ---")
+    for th in TAKER_THRESHOLDS:
+        for direction in ("LONG", "SHORT"):
+            subset = [s for s in all_signals if s.taker_ratio >= th and s.direction == direction]
+            if not subset:
+                continue
+            hits10 = sum(1 for s in subset if s.hit_targets.get(10))
+            rate10 = hits10 / len(subset) * 100
+            print(f"  taker>=%{th*100:.0f} {direction:<6} n={len(subset):>5}  %10 hit-rate={rate10:.1f}%")
+
+    print("\n--- EN COK SINYAL URETEN 15 COIN (taker filtresiz, tum sinyaller) ---")
     from collections import Counter
     counts = Counter(s.symbol for s in all_signals)
     for sym, cnt in counts.most_common(15):
         sub = [s for s in all_signals if s.symbol == sym]
         hits10 = sum(1 for s in sub if s.hit_targets.get(10))
-        print(f"  {sym:<15} sinyal={cnt:>3}  %10 hit-rate={hits10/cnt*100:.1f}%")
+        print(f"  {sym:<15} n={cnt:>3}  %10 hit-rate={hits10/cnt*100:.1f}%")
 
 
-def save_csv(all_signals, path="sma100_fast_break_results.csv"):
+def save_csv(all_signals, path="sma100_taker_combo_results.csv"):
     rows = []
     for s in all_signals:
         row = {
             "symbol": s.symbol, "direction": s.direction, "signal_time": s.signal_time,
-            "distance_pct": round(s.distance_pct, 2), "max_favorable_pct": round(s.max_favorable_pct, 2),
+            "distance_pct": round(s.distance_pct, 2), "taker_ratio": round(s.taker_ratio, 4),
+            "max_favorable_pct": round(s.max_favorable_pct, 2),
         }
         for t in TARGET_PCTS:
             row[f"hit_{t}pct"] = s.hit_targets.get(t)
@@ -308,7 +323,7 @@ def main():
     log.info(f"Top {TOP_N_SYMBOLS} likit coin cekiliyor (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)...")
     symbols = get_top_symbols(TOP_N_SYMBOLS, MIN_QUOTE_VOLUME_24H)
     log.info(f"{len(symbols)} coin bulundu. TF={TIMEFRAME}, Lookback={LOOKBACK_DAYS}gun, "
-              f"SMA{SMA_PERIOD}, kirilim>=%{BREAK_PCT}")
+              f"SMA{SMA_PERIOD} kirilim>=%{BREAK_PCT} + taker esik taramasi")
 
     forward_candles = int(FORWARD_HOURS * 60 / TF_MINUTES)
     end_ms = int(time.time() * 1000)
@@ -329,25 +344,36 @@ def main():
         time.sleep(0.05)
 
     if not all_signals:
-        log.error("Hic sinyal bulunamadi - BREAK_PCT/NEAR_TOL_PCT ayarlarini gevsetmeyi dene.")
+        log.error("Hic sinyal bulunamadi.")
         return
 
     summarize(all_signals)
     save_csv(all_signals)
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        n = len(all_signals)
-        hits10 = sum(1 for s in all_signals if s.hit_targets.get(10))
+        baseline = all_signals
+        n0 = len(baseline)
+        hits10_0 = sum(1 for s in baseline if s.hit_targets.get(10))
+        best_th, best_rate, best_n = 0.0, hits10_0 / n0 * 100 if n0 else 0, n0
+        for th in TAKER_THRESHOLDS:
+            subset = [s for s in all_signals if s.taker_ratio >= th]
+            if len(subset) < 30:
+                continue
+            hits = sum(1 for s in subset if s.hit_targets.get(10))
+            rate = hits / len(subset) * 100
+            if rate > best_rate:
+                best_th, best_rate, best_n = th, rate, len(subset)
+
         msg = (
-            "📊 <b>SMA100 HIZLI KIRILIM BACKTEST (15dk)</b>\n"
-            f"{TOP_N_SYMBOLS} coin | {LOOKBACK_DAYS} gun | kirilim>=%{BREAK_PCT}\n"
+            "📊 <b>SMA100 KIRILIM + TAKER IMBALANCE BACKTEST</b>\n"
+            f"{TOP_N_SYMBOLS} coin | {LOOKBACK_DAYS} gun | 15dk\n"
             "=" * 25 + "\n"
-            f"Toplam sinyal: {n}\n"
-            f"%10 hit-rate: {hits10/n*100:.1f}%\n"
+            f"Baseline (taker filtresiz): n={n0}, %10 hit-rate={hits10_0/n0*100:.1f}%\n"
+            f"En iyi (n>=30 sartiyla): taker>=%{best_th*100:.0f} → n={best_n}, %10 hit-rate={best_rate:.1f}%\n"
             f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
         )
         send_telegram_message(msg)
-        sent = send_telegram_document("sma100_fast_break_results.csv", caption="SMA100 hizli kirilim - detayli sonuclar")
+        sent = send_telegram_document("sma100_taker_combo_results.csv", caption="SMA100+Taker birlesik strateji - detayli sonuclar")
         if sent:
             log.info("Ozet ve CSV Telegram'a gonderildi.")
 
