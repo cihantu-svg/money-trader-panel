@@ -42,8 +42,8 @@ session = requests.Session()
 # ══════════════════════════════════════════════════════════════════
 # AYARLAR
 # ══════════════════════════════════════════════════════════════════
-TIMEFRAMES = ["5m", "15m", "1h"]
-TOP_N_SYMBOLS = 80
+TIMEFRAMES = ["15m"]
+TOP_N_SYMBOLS = 100
 MIN_QUOTE_VOLUME_24H = 3_000_000
 LOOKBACK_DAYS = 30          # 200 SMA + forward pencere icin yeterli tarihce
 
