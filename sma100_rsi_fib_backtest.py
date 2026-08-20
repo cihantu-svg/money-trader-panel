@@ -1,20 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-BIRLESIK STRATEJI: SMA100 HIZLI KIRILIM + TAKER IMBALANCE (15dk)
+SMA100 KIRILIM + RSI(50) + FIBONACCI(%50) UC KATMANLI FILTRE BACKTEST
 
-En iyi cikan iki stratejiyi birlestirir:
-  1) SMA100 Hizli Kirilim: fiyat SMA100'e yakinken (son 2-3 mumda uzaklik
-     <=%1.5) aniden %4+ uzaklasiyor (kirilim mumu)
-  2) Taker Imbalance: kirilim mumunun KENDISINDE taker buy/sell orani
-     belirli bir esigi (0/%50/%55/%60/%65/%70) geciyor mu
+TEMEL SINYAL: SMA100 hizli kirilimi (once test edilen, %48.2 hit-rate,
+1055 sinyal - degismedi).
 
-MANTIK: SMA100 kirilimi zaten guclu bir sinyal (%48.2 hit-rate, 1055
-sinyal). Soru: kirilim mumunda ayrica taker akisi da o yonde baskinsa
-(LONG kiriliminda taker buy baskin, SHORT kiriliminda taker sell baskin),
-isabet orani daha da artiyor mu?
+EK FILTRELER (kirilim mumunda):
+  RSI  : iki mod test edilir
+    - CROSS : RSI(14) 50'yi TAM O MUMDA kesmis olmali (LONG: asagidan
+              yukari, SHORT: yukaridan asagi)
+    - SIDE  : RSI(14) sadece 50'nin dogru tarafinda olmali (kesisim sarti yok)
 
-BASELINE (taker esigi 0) = saf SMA100 kirilimi (taker filtresi yok).
-Esik yukseldikce sinyal sayisi azalir, hit-rate degisimi izlenir.
+  FIBO : iki pencere test edilir (son 50 mum / son 100 mum, kirilim
+         mumu HARIC - bakis onune gecmeyi (look-ahead) onlemek icin)
+    - O penceredeki en yuksek/en dusuk nokta arasindaki %50 seviyesi
+      hesaplanir (fib50 = (high+low)/2)
+    - Fiyatin kirilim mumunda bu seviyeyi KESMIS olmasi aranir
+      (LONG: bir onceki mum fib50 altinda, bu mum ustunde;
+       SHORT: bir onceki mum fib50 ustunde, bu mum altinda)
+
+KOMBINASYONLAR (2 RSI modu x 2 fib penceresi = 4 varyant), hepsi
+BASELINE (filtresiz SMA100 kirilimi) ile karsilastirilir:
+  1) RSI_CROSS + FIB50
+  2) RSI_CROSS + FIB100
+  3) RSI_SIDE  + FIB50
+  4) RSI_SIDE  + FIB100
 
 ZAMAN DILIMI: 15dk | COIN: 200 (min 3M USDT) | LOOKBACK: 30 gun
 """
@@ -47,8 +57,8 @@ NEAR_TOL_PCT = 1.5
 BREAK_PCT = 4.0
 LOOKBACK_WINDOW = 3
 
-# Test edilecek taker imbalance esikleri (0 = filtre yok / baseline)
-TAKER_THRESHOLDS = [0.0, 0.50, 0.55, 0.60, 0.65, 0.70]
+RSI_PERIOD = 14
+FIB_WINDOWS = [50, 100]
 
 FORWARD_HOURS = 48
 TARGET_PCTS = [5, 10, 20]
@@ -134,10 +144,20 @@ def get_klines_range(symbol, interval, start_ms, end_ms):
     df = pd.DataFrame(all_rows, columns=[
         "open_time", "open", "high", "low", "close", "volume", "close_time",
         "qav", "trades", "taker_buy_base", "taker_buy_quote", "ignore"])
-    for c in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = df[c].astype(float)
     df = df.drop_duplicates(subset="open_time").reset_index(drop=True)
     return df
+
+
+def compute_rsi(close, period=14):
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -148,27 +168,63 @@ class Signal:
     symbol: str
     direction: str
     signal_time: str
-    distance_pct: float
-    taker_ratio: float      # yon ile uyumlu taker orani (LONG->buy, SHORT->sell)
     max_favorable_pct: float
     hit_targets: dict = field(default_factory=dict)
+    rsi_now: float = None
+    rsi_prev: float = None
+    close_now: float = None
+    close_prev: float = None
+    fib50_50: float = None      # son 50 muma gore fib %50 seviyesi
+    fib50_100: float = None     # son 100 muma gore fib %50 seviyesi
+
+
+def rsi_cross_ok(s, direction):
+    if s.rsi_now is None or s.rsi_prev is None:
+        return False
+    if direction == "LONG":
+        return s.rsi_prev < 50 <= s.rsi_now
+    return s.rsi_prev >= 50 > s.rsi_now
+
+
+def rsi_side_ok(s, direction):
+    if s.rsi_now is None:
+        return False
+    return s.rsi_now >= 50 if direction == "LONG" else s.rsi_now < 50
+
+
+def fib_cross_ok(s, direction, window):
+    level = s.fib50_50 if window == 50 else s.fib50_100
+    if level is None or pd.isna(level) or s.close_now is None or s.close_prev is None:
+        return False
+    if direction == "LONG":
+        return s.close_prev < level <= s.close_now
+    return s.close_prev >= level > s.close_now
 
 
 def compute_signals(symbol, df, forward_candles):
     signals = []
     n = len(df)
-    min_needed = SMA_PERIOD + LOOKBACK_WINDOW + forward_candles + 5
+    min_needed = max(SMA_PERIOD, max(FIB_WINDOWS)) + LOOKBACK_WINDOW + forward_candles + 5
     if n < min_needed:
         return signals
 
     close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
     sma100 = close.rolling(SMA_PERIOD).mean()
     distance_pct = (close - sma100) / sma100 * 100
+    rsi = compute_rsi(close, RSI_PERIOD)
 
-    vol_safe = df["volume"].replace(0, np.nan).astype(float)
-    buy_ratio = (df["taker_buy_base"].astype(float) / vol_safe)
+    roll_high_50 = high.rolling(50).max().shift(1)
+    roll_low_50 = low.rolling(50).min().shift(1)
+    fib50_50 = (roll_high_50 + roll_low_50) / 2
 
-    for i in range(SMA_PERIOD + LOOKBACK_WINDOW, n - forward_candles):
+    roll_high_100 = high.rolling(100).max().shift(1)
+    roll_low_100 = low.rolling(100).min().shift(1)
+    fib50_100 = (roll_high_100 + roll_low_100) / 2
+
+    start_i = max(SMA_PERIOD, max(FIB_WINDOWS)) + LOOKBACK_WINDOW
+    for i in range(start_i, n - forward_candles):
         d_now = distance_pct.iloc[i]
         if pd.isna(d_now):
             continue
@@ -193,12 +249,6 @@ def compute_signals(symbol, df, forward_candles):
             if direction == "SHORT" and d_prev <= -BREAK_PCT:
                 continue
 
-        br = buy_ratio.iloc[i]
-        if pd.isna(br):
-            continue
-        sr = 1.0 - br
-        taker_ratio = br if direction == "LONG" else sr
-
         entry_price = float(close.iloc[i])
         future = df.iloc[i + 1: i + 1 + forward_candles]
         if len(future) == 0:
@@ -212,8 +262,12 @@ def compute_signals(symbol, df, forward_candles):
         signals.append(Signal(
             symbol=symbol, direction=direction,
             signal_time=datetime.fromtimestamp(int(df["open_time"].iloc[i]) / 1000).strftime("%Y-%m-%d %H:%M"),
-            distance_pct=float(d_now), taker_ratio=float(taker_ratio),
             max_favorable_pct=float(max_fav), hit_targets=hit,
+            rsi_now=float(rsi.iloc[i]) if not pd.isna(rsi.iloc[i]) else None,
+            rsi_prev=float(rsi.iloc[i - 1]) if not pd.isna(rsi.iloc[i - 1]) else None,
+            close_now=float(close.iloc[i]), close_prev=float(close.iloc[i - 1]),
+            fib50_50=float(fib50_50.iloc[i]) if not pd.isna(fib50_50.iloc[i]) else None,
+            fib50_100=float(fib50_100.iloc[i]) if not pd.isna(fib50_100.iloc[i]) else None,
         ))
     return signals
 
@@ -221,65 +275,79 @@ def compute_signals(symbol, df, forward_candles):
 # ══════════════════════════════════════════════════════════════════
 # RAPOR
 # ══════════════════════════════════════════════════════════════════
+VARIANTS = [
+    ("RSI_CROSS + FIB50", lambda s, d: rsi_cross_ok(s, d) and fib_cross_ok(s, d, 50)),
+    ("RSI_CROSS + FIB100", lambda s, d: rsi_cross_ok(s, d) and fib_cross_ok(s, d, 100)),
+    ("RSI_SIDE + FIB50", lambda s, d: rsi_side_ok(s, d) and fib_cross_ok(s, d, 50)),
+    ("RSI_SIDE + FIB100", lambda s, d: rsi_side_ok(s, d) and fib_cross_ok(s, d, 100)),
+]
+
+
 def summarize(all_signals):
-    print("\n" + "=" * 95)
-    print(f"BIRLESIK: SMA100 KIRILIM + TAKER IMBALANCE (15dk)  {TOP_N_SYMBOLS} coin, {LOOKBACK_DAYS} gun")
-    print(f"kirilim>=%{BREAK_PCT}, yakinlik<=%{NEAR_TOL_PCT} | taker esigi taraniyor")
-    print("=" * 95)
+    print("\n" + "=" * 100)
+    print(f"SMA100 KIRILIM + RSI(50) + FIBONACCI(%50) FILTRE KARSILASTIRMA (15dk)")
+    print(f"{TOP_N_SYMBOLS} coin, {LOOKBACK_DAYS} gun, kirilim>=%{BREAK_PCT}")
+    print("=" * 100)
 
-    header = f"{'Taker esik':>11} | {'n':>6} |" + "".join(f" %{t} hit |" for t in TARGET_PCTS) + f" {'Ort.max.fav%':>13}"
-    print(header)
-    print("-" * len(header))
-
-    for th in TAKER_THRESHOLDS:
-        subset = [s for s in all_signals if s.taker_ratio >= th]
+    def rates_for(subset):
         n = len(subset)
         rates = {}
         for t in TARGET_PCTS:
             hits = sum(1 for s in subset if s.hit_targets.get(t))
             rates[t] = (hits / n * 100) if n else 0
         avg_fav = (sum(s.max_favorable_pct for s in subset) / n) if n else 0
-        row = f"{th*100:>10.0f}% | {n:>6} |"
+        return n, rates, avg_fav
+
+    header = f"{'Varyant':<22} | {'n':>6} |" + "".join(f" %{t} hit |" for t in TARGET_PCTS) + f" {'Ort.max.fav%':>13}"
+    print(header)
+    print("-" * len(header))
+
+    n0, rates0, fav0 = rates_for(all_signals)
+    row = f"{'BASELINE (filtresiz)':<22} | {n0:>6} |"
+    for t in TARGET_PCTS:
+        row += f" {rates0[t]:>7.1f}% |"
+    row += f" {fav0:>12.2f}%"
+    print(row)
+    print("-" * len(header))
+
+    for name, cond in VARIANTS:
+        subset = [s for s in all_signals if cond(s, s.direction)]
+        n, rates, fav = rates_for(subset)
+        row = f"{name:<22} | {n:>6} |"
         for t in TARGET_PCTS:
             row += f" {rates[t]:>7.1f}% |"
-        row += f" {avg_fav:>12.2f}%"
+        row += f" {fav:>12.2f}%"
         print(row)
 
-    print("\nYorum: '0%' satiri saf SMA100 kirilimi (taker filtresi yok - baseline, 1055 sinyalle")
-    print("onceki testte %10 hit-rate %48.2 idi). Esik yukseldikce hit-rate baseline'in USTUNE")
-    print("cikiyorsa, taker akisi eklemek gercekten degerlidir. Cikmiyorsa/dususe geciyorsa,")
-    print("SMA100 kirilimi zaten kendi basina yeterince guclu bir filtre demektir.")
+    print("\nYorum: BASELINE = saf SMA100 kirilimi (onceki testte %10 hit-rate %48.2, 1055 sinyal).")
+    print("Herhangi bir varyant BASELINE'in USTUNE cikiyorsa, o RSI+Fib kombinasyonu gercekten")
+    print("degerli bir ek filtredir. n kucukse (<30) rakamlara temkinli yaklas.")
 
-    # yon bazinda kirilim, esik=0 (baseline) ve esik=0.60 (tipik pratik esik) icin
-    print("\n--- YON BAZINDA KIRILIM (taker esigine gore) ---")
-    for th in TAKER_THRESHOLDS:
+    print("\n--- YON BAZINDA KIRILIM (her varyant, %10 hit-rate) ---")
+    for name, cond in VARIANTS:
         for direction in ("LONG", "SHORT"):
-            subset = [s for s in all_signals if s.taker_ratio >= th and s.direction == direction]
+            subset = [s for s in all_signals if s.direction == direction and cond(s, direction)]
             if not subset:
                 continue
-            hits10 = sum(1 for s in subset if s.hit_targets.get(10))
-            rate10 = hits10 / len(subset) * 100
-            print(f"  taker>=%{th*100:.0f} {direction:<6} n={len(subset):>5}  %10 hit-rate={rate10:.1f}%")
-
-    print("\n--- EN COK SINYAL URETEN 15 COIN (taker filtresiz, tum sinyaller) ---")
-    from collections import Counter
-    counts = Counter(s.symbol for s in all_signals)
-    for sym, cnt in counts.most_common(15):
-        sub = [s for s in all_signals if s.symbol == sym]
-        hits10 = sum(1 for s in sub if s.hit_targets.get(10))
-        print(f"  {sym:<15} n={cnt:>3}  %10 hit-rate={hits10/cnt*100:.1f}%")
+            hits = sum(1 for s in subset if s.hit_targets.get(10))
+            rate = hits / len(subset) * 100
+            print(f"  {name:<22} {direction:<6} n={len(subset):>5}  %10 hit-rate={rate:.1f}%")
 
 
-def save_csv(all_signals, path="sma100_taker_combo_results.csv"):
+def save_csv(all_signals, path="sma100_rsi_fib_results.csv"):
     rows = []
     for s in all_signals:
         row = {
             "symbol": s.symbol, "direction": s.direction, "signal_time": s.signal_time,
-            "distance_pct": round(s.distance_pct, 2), "taker_ratio": round(s.taker_ratio, 4),
             "max_favorable_pct": round(s.max_favorable_pct, 2),
+            "rsi_now": s.rsi_now, "rsi_prev": s.rsi_prev,
+            "close_now": s.close_now, "close_prev": s.close_prev,
+            "fib50_50": s.fib50_50, "fib50_100": s.fib50_100,
         }
         for t in TARGET_PCTS:
             row[f"hit_{t}pct"] = s.hit_targets.get(t)
+        for name, cond in VARIANTS:
+            row[name.replace(" ", "")] = bool(cond(s, s.direction))
         rows.append(row)
     pd.DataFrame(rows).to_csv(path, index=False)
     log.info(f"Detayli sonuclar kaydedildi: {path}")
@@ -322,8 +390,7 @@ def send_telegram_message(text):
 def main():
     log.info(f"Top {TOP_N_SYMBOLS} likit coin cekiliyor (min {MIN_QUOTE_VOLUME_24H/1e6:.1f}M USDT)...")
     symbols = get_top_symbols(TOP_N_SYMBOLS, MIN_QUOTE_VOLUME_24H)
-    log.info(f"{len(symbols)} coin bulundu. TF={TIMEFRAME}, Lookback={LOOKBACK_DAYS}gun, "
-              f"SMA{SMA_PERIOD} kirilim>=%{BREAK_PCT} + taker esik taramasi")
+    log.info(f"{len(symbols)} coin bulundu. SMA100 kirilim + RSI50 + Fib50 filtreleri test edilecek")
 
     forward_candles = int(FORWARD_HOURS * 60 / TF_MINUTES)
     end_ms = int(time.time() * 1000)
@@ -333,7 +400,7 @@ def main():
     for idx, symbol in enumerate(symbols, 1):
         try:
             df = get_klines_range(symbol, TIMEFRAME, start_ms, end_ms)
-            if df is None or len(df) < SMA_PERIOD + LOOKBACK_WINDOW + forward_candles + 5:
+            if df is None or len(df) < max(SMA_PERIOD, max(FIB_WINDOWS)) + LOOKBACK_WINDOW + forward_candles + 5:
                 continue
             sigs = compute_signals(symbol, df, forward_candles)
             all_signals.extend(sigs)
@@ -351,29 +418,27 @@ def main():
     save_csv(all_signals)
 
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-        baseline = all_signals
-        n0 = len(baseline)
-        hits10_0 = sum(1 for s in baseline if s.hit_targets.get(10))
-        best_th, best_rate, best_n = 0.0, hits10_0 / n0 * 100 if n0 else 0, n0
-        for th in TAKER_THRESHOLDS:
-            subset = [s for s in all_signals if s.taker_ratio >= th]
-            if len(subset) < 30:
+        n0 = len(all_signals)
+        hits10_0 = sum(1 for s in all_signals if s.hit_targets.get(10))
+        lines = [f"Baseline: n={n0}, %10 hit-rate={hits10_0/n0*100:.1f}%"]
+        for name, cond in VARIANTS:
+            subset = [s for s in all_signals if cond(s, s.direction)]
+            n = len(subset)
+            if n == 0:
+                lines.append(f"{name}: sinyal yok")
                 continue
             hits = sum(1 for s in subset if s.hit_targets.get(10))
-            rate = hits / len(subset) * 100
-            if rate > best_rate:
-                best_th, best_rate, best_n = th, rate, len(subset)
+            lines.append(f"{name}: n={n}, %10 hit-rate={hits/n*100:.1f}%")
 
         msg = (
-            "📊 <b>SMA100 KIRILIM + TAKER IMBALANCE BACKTEST</b>\n"
+            "📊 <b>SMA100 + RSI50 + FIB50 FILTRE BACKTEST</b>\n"
             f"{TOP_N_SYMBOLS} coin | {LOOKBACK_DAYS} gun | 15dk\n"
             "=" * 25 + "\n"
-            f"Baseline (taker filtresiz): n={n0}, %10 hit-rate={hits10_0/n0*100:.1f}%\n"
-            f"En iyi (n>=30 sartiyla): taker>=%{best_th*100:.0f} → n={best_n}, %10 hit-rate={best_rate:.1f}%\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
+            + "\n".join(lines)
+            + f"\n\n⏰ {datetime.now().strftime('%H:%M:%S %d/%m/%Y')}"
         )
         send_telegram_message(msg)
-        sent = send_telegram_document("sma100_taker_combo_results.csv", caption="SMA100+Taker birlesik strateji - detayli sonuclar")
+        sent = send_telegram_document("sma100_rsi_fib_results.csv", caption="SMA100+RSI50+Fib50 - detayli sonuclar")
         if sent:
             log.info("Ozet ve CSV Telegram'a gonderildi.")
 
