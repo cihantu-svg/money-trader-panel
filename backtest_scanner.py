@@ -84,11 +84,11 @@ PIVOT_LEFT_RIGHT = int(os.getenv("PIVOT_LEFT_RIGHT", "2"))
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "3000000"))
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
-MAX_WEIGHT_PER_MIN = int(os.getenv("MAX_WEIGHT_PER_MIN", "2200"))
-KLINE_PAGE_LIMIT = int(os.getenv("KLINE_PAGE_LIMIT", "500"))  # agirlik/mum acisindan optimum
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "10"))
+MAX_WEIGHT_PER_MIN = int(os.getenv("MAX_WEIGHT_PER_MIN", "1400"))  # 2400 limitinin altinda genis pay
+KLINE_PAGE_LIMIT = int(os.getenv("KLINE_PAGE_LIMIT", "499"))  # [100,500) araligi = weight 2 (500'un kendisi weight 5!)
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "8"))
 RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))
 CACHE_DIR = os.getenv("CACHE_DIR", "./bt_cache")
 
@@ -102,41 +102,66 @@ session.mount("https://", _adapter)
 
 
 # ══════════════════════════════════════════════════════════════════
-# PAYLASIMLI AGIRLIK BAZLI RATE LIMITER
-# (thread sayisindan bagimsiz - gercek darbogaz Binance'in dakikalik
-#  agirlik butcesi, bu limiter o butceyi tum threadler arasinda
-#  optimum sekilde paylastirir)
+# PAYLASIMLI AGIRLIK BAZLI RATE LIMITER + ORTAK SOGUMA (cooldown)
+# Binance'in her yanitta bildirdigi GERCEK kullanilan agirliga
+# (X-MBX-USED-WEIGHT-1M header) da bakiyor - sadece kendi tahminimize
+# guvenmiyoruz. 429/418 gelirse TUM threadleri durduran ortak bir
+# soguma baslatiliyor (bir thread banlanmisken digerlerinin ateş
+# etmeye devam etmesi banin uzamasina/agirlasmasina sebep oluyordu).
 # ══════════════════════════════════════════════════════════════════
-class WeightRateLimiter:
+class ApiThrottle:
     def __init__(self, max_weight_per_min):
         self.max_weight = max_weight_per_min
         self.window = 60.0
         self.events = deque()  # (timestamp, weight)
         self.lock = threading.Lock()
+        self.cooldown_until = 0.0
+        self.last_used_weight = 0
+        self.last_used_weight_ts = 0.0
 
     def acquire(self, weight):
         while True:
             with self.lock:
                 now = time.time()
-                while self.events and now - self.events[0][0] > self.window:
-                    self.events.popleft()
-                used = sum(w for _, w in self.events)
-                if used + weight <= self.max_weight:
-                    self.events.append((now, weight))
-                    return
-                wait = self.window - (now - self.events[0][0]) + 0.05
+                if now < self.cooldown_until:
+                    wait = self.cooldown_until - now
+                else:
+                    while self.events and now - self.events[0][0] > self.window:
+                        self.events.popleft()
+                    used_local = sum(w for _, w in self.events)
+                    header_fresh = (now - self.last_used_weight_ts) < 5
+                    used = max(used_local, self.last_used_weight) if header_fresh else used_local
+                    if used + weight <= self.max_weight:
+                        self.events.append((now, weight))
+                        return
+                    wait = 1.0
             time.sleep(max(wait, 0.05))
 
+    def report_used_weight(self, value):
+        with self.lock:
+            self.last_used_weight = value
+            self.last_used_weight_ts = time.time()
 
-rate_limiter = WeightRateLimiter(MAX_WEIGHT_PER_MIN)
+    def trigger_cooldown(self, seconds):
+        with self.lock:
+            self.cooldown_until = max(self.cooldown_until, time.time() + seconds)
+            log.warning(f"TUM ISTEKLER {seconds:.0f}sn duraklatiliyor (429/418 sonrasi ortak soguma)")
+
+
+rate_limiter = ApiThrottle(MAX_WEIGHT_PER_MIN)
 
 
 def _kline_weight(limit):
-    if limit <= 100:
+    # Binance USDT-M Futures /fapi/v1/klines resmi agirlik tablosu:
+    #   [1,100)    -> 1
+    #   [100,500)  -> 2   <-- limit TAM 500 burada DEGIL, bir alttaki dilimde
+    #   [500,1000) -> 5
+    #   [1000,1500]-> 10
+    if limit < 100:
         return 1
-    if limit <= 500:
+    if limit < 500:
         return 2
-    if limit <= 1000:
+    if limit < 1000:
         return 5
     return 10
 
@@ -145,11 +170,19 @@ def _kline_weight(limit):
 # HTTP + RETRY
 # ══════════════════════════════════════════════════════════════════
 def _request_with_retry(url, params=None, weight=1):
-    rate_limiter.acquire(weight)
     last_exc = None
     for attempt in range(MAX_RETRIES + 1):
+        rate_limiter.acquire(weight)
         try:
             r = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
+            used_hdr = r.headers.get("X-MBX-USED-WEIGHT-1M") or r.headers.get("x-mbx-used-weight-1m")
+            if used_hdr:
+                try:
+                    rate_limiter.report_used_weight(int(used_hdr))
+                except ValueError:
+                    pass
+
             if r.status_code == 200:
                 return r
             if r.status_code in (429, 418) or r.status_code >= 500:
@@ -160,7 +193,10 @@ def _request_with_retry(url, params=None, weight=1):
                         wait = max(wait, float(retry_after))
                     except ValueError:
                         pass
-                log.warning(f"HTTP {r.status_code}, {wait:.1f}sn sonra tekrar")
+                if r.status_code in (429, 418):
+                    wait = max(wait, 5.0)  # 418/429'da minimum 5sn - agresif tekrar denemeyi engelle
+                    rate_limiter.trigger_cooldown(wait)
+                log.warning(f"HTTP {r.status_code}, {wait:.1f}sn sonra tekrar (deneme {attempt+1})")
                 time.sleep(wait)
                 last_exc = Exception(f"HTTP {r.status_code}")
                 continue
