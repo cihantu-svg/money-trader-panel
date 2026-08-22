@@ -27,8 +27,17 @@ ORTAM DEGISKENLERI (hepsi opsiyonel, varsayilanlar test icin makul):
     PULLBACK_SEARCH_CANDLES - onay arama penceresi, 1dk mum sayisi (45)
     CMO_PERIOD             - CMO rolling toplama periyodu (9)
     MIN_QUOTE_VOLUME_24H   - likidite filtresi (3_000_000)
-    MAX_WORKERS             - paralel fetch thread sayisi (4)
+    MAX_WORKERS             - paralel fetch thread sayisi (20)
+    MAX_WEIGHT_PER_MIN      - Binance agirlik butcesi/dk, guvenlik payi birakildi (2200)
     CACHE_DIR               - indirilen mumlarin onbellek klasoru (./bt_cache)
+
+HIZ NOTU: Canli scanner'daki FAZ A / FAZ B ayrimi burada da uygulaniyor.
+15dk verisi TUM semboller icin ucuza cekilir (olay var mi diye bakmak
+icin). 1dk verisi ise SADECE %7 olayi yasanan sembollerde, SADECE o
+olayin etrafindaki kucuk pencerede (warmup+arama+ufuk, ~370dk) cekilir -
+400 coin'in 15 gunluk TUM 1dk gecmisi ARTIK indirilmiyor. Bu yuzden
+gercek yuk, olay sayisina bagli (ornegin 400 coinden ~100-200 olay
+cikiyorsa, sadece o kadar kucuk pencere cekilir).
 
 CIKTI:
     ./bt_cache/ altinda ham kline onbellegi
@@ -39,6 +48,8 @@ import os
 import time
 import logging
 import hashlib
+import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -73,7 +84,9 @@ PIVOT_LEFT_RIGHT = int(os.getenv("PIVOT_LEFT_RIGHT", "2"))
 USE_LIQUIDITY_FILTER = os.getenv("USE_LIQUIDITY_FILTER", "true").lower() == "true"
 MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "3000000"))
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "4"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
+MAX_WEIGHT_PER_MIN = int(os.getenv("MAX_WEIGHT_PER_MIN", "2200"))
+KLINE_PAGE_LIMIT = int(os.getenv("KLINE_PAGE_LIMIT", "500"))  # agirlik/mum acisindan optimum
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "15"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "0.5"))
@@ -89,9 +102,50 @@ session.mount("https://", _adapter)
 
 
 # ══════════════════════════════════════════════════════════════════
+# PAYLASIMLI AGIRLIK BAZLI RATE LIMITER
+# (thread sayisindan bagimsiz - gercek darbogaz Binance'in dakikalik
+#  agirlik butcesi, bu limiter o butceyi tum threadler arasinda
+#  optimum sekilde paylastirir)
+# ══════════════════════════════════════════════════════════════════
+class WeightRateLimiter:
+    def __init__(self, max_weight_per_min):
+        self.max_weight = max_weight_per_min
+        self.window = 60.0
+        self.events = deque()  # (timestamp, weight)
+        self.lock = threading.Lock()
+
+    def acquire(self, weight):
+        while True:
+            with self.lock:
+                now = time.time()
+                while self.events and now - self.events[0][0] > self.window:
+                    self.events.popleft()
+                used = sum(w for _, w in self.events)
+                if used + weight <= self.max_weight:
+                    self.events.append((now, weight))
+                    return
+                wait = self.window - (now - self.events[0][0]) + 0.05
+            time.sleep(max(wait, 0.05))
+
+
+rate_limiter = WeightRateLimiter(MAX_WEIGHT_PER_MIN)
+
+
+def _kline_weight(limit):
+    if limit <= 100:
+        return 1
+    if limit <= 500:
+        return 2
+    if limit <= 1000:
+        return 5
+    return 10
+
+
+# ══════════════════════════════════════════════════════════════════
 # HTTP + RETRY
 # ══════════════════════════════════════════════════════════════════
-def _request_with_retry(url, params=None):
+def _request_with_retry(url, params=None, weight=1):
+    rate_limiter.acquire(weight)
     last_exc = None
     for attempt in range(MAX_RETRIES + 1):
         try:
@@ -125,7 +179,7 @@ def _request_with_retry(url, params=None):
 def get_symbols():
     if SYMBOLS_OVERRIDE:
         return [s.strip().upper() for s in SYMBOLS_OVERRIDE.split(",") if s.strip()]
-    r = _request_with_retry(f"{BINANCE_BASE}/fapi/v1/exchangeInfo")
+    r = _request_with_retry(f"{BINANCE_BASE}/fapi/v1/exchangeInfo", weight=1)
     data = r.json()
     syms = [s["symbol"] for s in data["symbols"]
             if s["symbol"].endswith("USDT") and s["status"] == "TRADING"]
@@ -138,7 +192,7 @@ def get_symbols():
 def get_24h_volumes():
     # NOT: bu ANLIK 24s hacim - gecmisteki likiditenin yaklasik bir
     # tahmini olarak kullaniliyor, tarihsel olarak kesin degil.
-    r = _request_with_retry(f"{BINANCE_BASE}/fapi/v1/ticker/24hr")
+    r = _request_with_retry(f"{BINANCE_BASE}/fapi/v1/ticker/24hr", weight=40)
     data = r.json()
     return {d["symbol"]: float(d.get("quoteVolume", 0)) for d in data}
 
@@ -163,11 +217,13 @@ def fetch_klines_range(symbol, interval, start_ms, end_ms):
     all_rows = []
     cursor = start_ms
     interval_ms = {"1m": 60_000, "15m": 15 * 60_000}[interval]
+    weight = _kline_weight(KLINE_PAGE_LIMIT)
     while cursor < end_ms:
         r = _request_with_retry(
             f"{BINANCE_BASE}/fapi/v1/klines",
             params={"symbol": symbol, "interval": interval, "startTime": cursor,
-                    "endTime": end_ms, "limit": 1500},
+                    "endTime": end_ms, "limit": KLINE_PAGE_LIMIT},
+            weight=weight,
         )
         raw = r.json()
         if not raw:
@@ -178,9 +234,9 @@ def fetch_klines_range(symbol, interval, start_ms, end_ms):
         if next_cursor <= cursor:
             break
         cursor = next_cursor
-        if len(raw) < 1500:
+        if len(raw) < KLINE_PAGE_LIMIT:
             break
-        time.sleep(0.15)  # rate limit icin nazik ol
+        # sleep yok - paylasimli rate limiter zaten butceyi yonetiyor
 
     if not all_rows:
         return None
@@ -266,12 +322,16 @@ def compute_sup_res(df_1m):
 
 
 # ══════════════════════════════════════════════════════════════════
-# BACKTEST MOTORU (canli scanner'daki "bir seferde tek bekleyen olay"
-# kuralinin gecmis veri uzerinde birebir simulasyonu)
+# BACKTEST MOTORU
+# 15dk verisi TUM sembol icin bir kerede (ucuz) cekilir. 1dk verisi ise
+# SADECE %7 olayi yasanan sembollerde, SADECE o olayin etrafindaki kucuk
+# pencerede cekilir (canli scanner'in FAZ A / FAZ B ayrimiyla birebir
+# ayni mantik) - 400 coin'in 15 gunluk TUM 1dk gecmisini indirmiyoruz.
 # ══════════════════════════════════════════════════════════════════
-def backtest_symbol(symbol, df15, df1m, backtest_end_ms):
-    sup, res = compute_sup_res(df1m)
-    open_times_1m = df1m["open_time"].values
+def process_symbol(symbol, start_ms, end_ms):
+    df15 = fetch_klines_range(symbol, EVENT_TF, start_ms, end_ms)
+    if df15 is None or len(df15) < 2:
+        return []
 
     signals = []
     pending_until_ms = -1
@@ -279,7 +339,7 @@ def backtest_symbol(symbol, df15, df1m, backtest_end_ms):
     for _, row in df15.iterrows():
         open_time = int(row["open_time"])
         close_time = int(row["close_time"])
-        if open_time > backtest_end_ms:
+        if open_time > end_ms:
             break
         if close_time <= pending_until_ms:
             continue  # bekleyen olay cozulmeden yeni olay yok (canliyla ayni)
@@ -293,7 +353,24 @@ def backtest_symbol(symbol, df15, df1m, backtest_end_ms):
         if direction is None:
             continue
 
+        # SADECE bu olay icin kucuk bir 1dk penceresi cek (warmup + arama + ufuk)
         expire_ms = close_time + PULLBACK_SEARCH_CANDLES * 60_000
+        window_start = close_time - WARMUP_MINUTES * 60_000
+        window_end = expire_ms + HORIZON_MINUTES * 60_000
+        df1m = fetch_klines_range(symbol, CONFIRM_TF, window_start, window_end)
+
+        if df1m is None or len(df1m) < WARMUP_MINUTES // 2:
+            pending_until_ms = expire_ms
+            continue
+
+        try:
+            sup, res = compute_sup_res(df1m)
+        except Exception as e:
+            log.debug(f"{symbol} indikator hatasi: {e}")
+            pending_until_ms = expire_ms
+            continue
+
+        open_times_1m = df1m["open_time"].values
         mask = (open_times_1m >= close_time) & (open_times_1m < expire_ms)
         cond = (sup.values if direction == "LONG" else res.values) & mask
         hit_idx = np.flatnonzero(cond)
@@ -347,23 +424,6 @@ def backtest_symbol(symbol, df15, df1m, backtest_end_ms):
         })
 
     return signals
-
-
-def process_symbol(symbol, start_ms, end_ms):
-    fetch_start_1m = start_ms - WARMUP_MINUTES * 60_000
-    fetch_end = end_ms + HORIZON_MINUTES * 60_000
-
-    df15 = fetch_klines_range(symbol, EVENT_TF, start_ms, end_ms)
-    df1m = fetch_klines_range(symbol, CONFIRM_TF, fetch_start_1m, fetch_end)
-
-    if df15 is None or df1m is None or len(df15) < 2 or len(df1m) < WARMUP_MINUTES:
-        return []
-
-    try:
-        return backtest_symbol(symbol, df15, df1m, end_ms)
-    except Exception as e:
-        log.warning(f"{symbol} backtest hatasi: {e}")
-        return []
 
 
 # ══════════════════════════════════════════════════════════════════
