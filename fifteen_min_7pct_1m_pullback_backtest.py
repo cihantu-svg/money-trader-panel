@@ -61,7 +61,7 @@ session.mount("https://", _adapter)
 # AYARLAR
 # ══════════════════════════════════════════════════════════════════
 EVENT_TF = "15m"
-TOP_N_SYMBOLS = 100
+TOP_N_SYMBOLS = 400
 MIN_QUOTE_VOLUME_24H = 3_000_000
 LOOKBACK_DAYS = 20
 
@@ -78,7 +78,7 @@ PIVOT_LEFT_RIGHT = 2            # orijindeki len5=2
 FORWARD_HOURS = 48
 TARGET_PCTS = [5]               # tek hedef: %5
 
-MAX_EVENTS_PER_RUN = int(os.getenv("MAX_EVENTS_PER_RUN", "500"))  # asiri API yukunu sinirla
+MAX_EVENTS_PER_RUN = int(os.getenv("MAX_EVENTS_PER_RUN", "800"))  # asiri API yukunu sinirla
 
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 0.5
