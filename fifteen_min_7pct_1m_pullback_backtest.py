@@ -67,7 +67,7 @@ LOOKBACK_DAYS = 20
 
 BODY_PCT_THRESHOLD = 7.0
 
-PULLBACK_SEARCH_CANDLES = 30    # olay sonrasi ONAY aranacak 1dk mum sayisi (30 mumu asarsa iptal)
+PULLBACK_SEARCH_CANDLES = 45    # olay sonrasi ONAY aranacak 1dk mum sayisi (45 mumu asarsa iptal)
 WARMUP_MINUTES = 90             # indikator warmup icin olay ONCESI 1dk verisi
 
 RSI_PERIOD = 9
