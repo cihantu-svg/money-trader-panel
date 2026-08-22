@@ -77,6 +77,12 @@ KLINES_LIMIT = int(os.getenv("KLINES_LIMIT", "150"))
 # ══════════════════════════════════════════════════════════════════
 session = requests.Session()
 session.headers.update({"Connection": "keep-alive"})
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=MAX_WORKERS + 5,
+    pool_maxsize=MAX_WORKERS + 10,
+)
+session.mount("https://", _adapter)
+session.mount("http://", _adapter)
 
 
 def _request_with_retry(url, params=None, timeout=REQUEST_TIMEOUT):
