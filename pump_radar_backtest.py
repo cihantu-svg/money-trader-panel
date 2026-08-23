@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PUMP RADAR v2.1 - Backtest & Live Scanner (Londra Saati)
+PUMP RADAR v2.2 - Backtest & Live Scanner (Londra Saati)
 Düzeltilmiş versiyon:
 1. Thread-safe event yönetimi (threading.Lock)
 2. Faz B repaint koruması (son canlı mum atılır)
 3. Symbol listesi önbellekleme (rate limit koruma)
 4. Backtest motoru + CSV çıktısı
 5. Telegram entegrasyonu
-6. Tüm zamanlar LONDRA SAATİ (UTC+0/BST otomatik)
+6. Tüm zamanlar LONDRA SAATİ (zoneinfo - kurulum gerektirmez)
 """
 
 import threading
@@ -18,24 +18,29 @@ import csv
 import os
 import sys
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 import requests
 import numpy as np
 import pandas as pd
-import pytz
+
+# zoneinfo fallback (Python 3.9+ standart, 3.8 için backports)
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 # ==================== ZAMAN AYARI (LONDRA) ====================
-LONDON_TZ = pytz.timezone('Europe/London')
-UTC_TZ = pytz.UTC
+LONDON_TZ = ZoneInfo("Europe/London")
+UTC_TZ = timezone.utc
 
 def to_london(dt):
-    """Herhangi bir timezone'lu datetime'ı Londra'ya çevir"""
+    """Herhangi bir datetime'ı Londra'ya çevir"""
     if dt is None:
         return None
     if dt.tzinfo is None:
-        dt = UTC_TZ.localize(dt)
+        dt = dt.replace(tzinfo=UTC_TZ)
     return dt.astimezone(LONDON_TZ)
 
 def format_london(dt, fmt='%Y-%m-%d %H:%M:%S %Z'):
@@ -52,7 +57,7 @@ def now_london():
 def parse_london(date_str):
     """'YYYY-MM-DD' stringini Londra midnight'a çevir"""
     dt = datetime.strptime(date_str, '%Y-%m-%d')
-    return LONDON_TZ.localize(dt)
+    return dt.replace(tzinfo=LONDON_TZ)
 
 # ==================== LOGGING (Londra Saati) ====================
 class LondonFormatter(logging.Formatter):
@@ -104,7 +109,7 @@ _cache_time = 0
 class BinanceAPI:
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({'User-Agent': 'PUMP-RADAR/2.1'})
+        self.session.headers.update({'User-Agent': 'PUMP-RADAR/2.2'})
         self.base = CONFIG['API_BASE']
         self.last_request_time = 0
         self.min_interval = 0.05
@@ -415,7 +420,7 @@ def set_pending_event(symbol, event):
 def clear_pending_event(symbol):
     with event_lock:
         if symbol in pending_events:
-            del pending_events[symbol]
+            del pending_events[sym]
 
 def cleanup_old_events(max_age_hours=168):
     cutoff = now_london() - timedelta(hours=max_age_hours)
@@ -694,8 +699,8 @@ class LiveScanner:
 if __name__ == '__main__':
     print(f"""
     ╔══════════════════════════════════════════════════╗
-    ║          PUMP RADAR v2.1 - Londra Saati          ║
-    ║  Zaman Dilimi: {LONDON_TZ:<36}║
+    ║          PUMP RADAR v2.2 - Londra Saati          ║
+    ║  Zaman Dilimi: {str(LONDON_TZ):<36}║
     ║  Şu An: {format_london(now_london()):<45}║
     ╚══════════════════════════════════════════════════╝
     """)
