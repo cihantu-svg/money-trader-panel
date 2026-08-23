@@ -420,7 +420,7 @@ def set_pending_event(symbol, event):
 def clear_pending_event(symbol):
     with event_lock:
         if symbol in pending_events:
-            del pending_events[sym]
+            del pending_events[symbol]
 
 def cleanup_old_events(max_age_hours=168):
     cutoff = now_london() - timedelta(hours=max_age_hours)
@@ -431,7 +431,7 @@ def cleanup_old_events(max_age_hours=168):
             if evt_time and to_london(evt_time) < cutoff:
                 to_remove.append(sym)
         for sym in to_remove:
-            del pending_events[sym]
+            del pending_events[symbol]
             if sym in last_processed_event_time:
                 del last_processed_event_time[sym]
         if to_remove:
@@ -473,7 +473,51 @@ def send_telegram(message, csv_path=None):
         logger.error(f"Telegram hatası: {e}")
         return False
 
-# ==================== BACKTEST MOTORU (Londra Saati) ====================
+# ==================== TOPLU VERİ ÇEKME ====================
+def fetch_klines_range(symbol, interval, start_dt, end_dt, max_limit=1500):
+    """
+    Belirli bir tarih aralığı için TÜM klines verisini chunk'lar halinde çeker.
+    Binance max 1500 mum döndürür (~25 saatlik 1m veri).
+    """
+    all_dfs = []
+    current = start_dt
+    end_ts = int(end_dt.astimezone(UTC_TZ).timestamp() * 1000)
+    chunk_count = 0
+
+    while current < end_dt:
+        chunk_end_ts = int(current.astimezone(UTC_TZ).timestamp() * 1000) + (max_limit * 60 * 1000)
+        chunk_end_ts = min(chunk_end_ts, end_ts)
+
+        df = api.get_klines(symbol, interval, max_limit, end_time=chunk_end_ts)
+        chunk_count += 1
+
+        if df is None or len(df) == 0:
+            break
+
+        all_dfs.append(df)
+
+        # Son mumun close_time'ından devam et (tekrar çekmemek için)
+        last_close = df['close_time'].iloc[-1]
+        if last_close >= end_dt or len(df) < max_limit:
+            break
+
+        current = last_close + timedelta(minutes=1)
+
+        # Rate limit koruması
+        time.sleep(0.05)
+
+    if not all_dfs:
+        return None
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    combined = combined.drop_duplicates(subset=['open_time']).sort_values('open_time').reset_index(drop=True)
+
+    # Sadece istenen aralıkta kalsın
+    combined = combined[(combined['open_time'] >= start_dt) & (combined['open_time'] <= end_dt)]
+
+    return combined.reset_index(drop=True)
+
+# ==================== BACKTEST MOTORU (Hızlı - Toplu Veri) ====================
 class BacktestEngine:
     def __init__(self):
         self.results = []
@@ -507,12 +551,11 @@ class BacktestEngine:
         logger.info(f"Bitiş (Londra): {format_london(end_dt)}")
 
         for idx, symbol in enumerate(symbols, 1):
-            logger.info(f"[{idx}/{len(symbols)}] {symbol} backtest ediliyor...")
+            logger.info(f"[{idx}/{len(symbols)}] {symbol} verisi çekiliyor...")
             self._backtest_symbol(symbol, start_dt, end_dt)
 
-            if idx % 10 == 0:
-                logger.info("Rate limit koruması - 2 saniye bekleniyor...")
-                time.sleep(2)
+            if idx % 5 == 0:
+                logger.info(f"İlerleme: {idx}/{len(symbols)} sembol tamamlandı")
 
         self._save_csv()
         self._print_stats()
@@ -520,45 +563,82 @@ class BacktestEngine:
         logger.info("BACKTEST TAMAMLANDI")
 
     def _backtest_symbol(self, symbol, start_dt, end_dt):
-        current = start_dt
+        """
+        Sembol bazlı backtest - Tüm veriyi önce çek, sonra DataFrame üzerinde ilerle.
+        5dk kaydırmalı kontrol.
+        """
+        # Tüm veriyi toplu çek (~25 saatlik chunk'lar)
+        df = fetch_klines_range(symbol, '1m', start_dt, end_dt)
+
+        if df is None or len(df) < 90:
+            logger.debug(f"{symbol}: Yetersiz veri ({len(df) if df is not None else 0} mum)")
+            return
+
+        logger.info(f"{symbol}: {len(df)} mum çekildi, tarama başlıyor...")
+
         symbol_signals = 0
 
-        while current < end_dt and symbol_signals < CONFIG['MAX_BACKTEST_SIGNALS_PER_SYMBOL']:
-            # Londra saatini UTC timestamp'e çevir (API UTC bekler)
-            end_ts = int(current.astimezone(UTC_TZ).timestamp() * 1000)
+        # 5dk adımlarla ilerle (index bazlı, API çağrısı YOK)
+        for i in range(90, len(df), 5):
+            self.stats['total_scanned'] += 1
 
             try:
-                phase_a = phase_a_scan(symbol, end_ts)
-                self.stats['total_scanned'] += 1
+                # Faz A penceresi (son 150 mum, sonuncusu hariç = kapalı mum)
+                window = df.iloc[max(0, i-149):i].copy().reset_index(drop=True)
 
-                if phase_a:
+                if len(window) < 90:
+                    continue
+
+                score, details = calculate_score(window)
+
+                if score >= CONFIG['SIGNAL_THRESHOLD_PHASE_A']:
                     self.stats['phase_a_hits'] += 1
 
-                    phase_b = phase_b_confirm(symbol, phase_a['timestamp'], end_ts)
+                    # Faz B: Sonraki 5 mumluk pencereyi kullan
+                    if i + 5 < len(df):
+                        confirm_window = df.iloc[max(0, i-144):i+5].copy().reset_index(drop=True)
+                        # Son canlı mumu at (repaint koruması)
+                        if len(confirm_window) > 1:
+                            confirm_window = confirm_window.iloc[:-1].reset_index(drop=True)
+                    else:
+                        confirm_window = window
 
-                    if phase_b:
+                    if len(confirm_window) < 90:
+                        continue
+
+                    score_b, details_b = calculate_score(confirm_window)
+                    sup, res = compute_sup_res(confirm_window)
+
+                    if score_b >= CONFIG['SIGNAL_THRESHOLD_PHASE_B'] and details_b.get('ema_break') and details_b.get('squeeze'):
                         self.stats['phase_b_hits'] += 1
                         symbol_signals += 1
 
+                        timestamp = confirm_window['close_time'].iloc[-1]
+
                         self.results.append({
                             'symbol': symbol,
-                            'timestamp_london': format_london(phase_b['timestamp']),
-                            'timestamp_utc': phase_b['timestamp'].astimezone(UTC_TZ).strftime('%Y-%m-%d %H:%M:%S UTC'),
-                            'close': round(phase_b['close'], 6),
-                            'score': phase_b['score'],
-                            'support': round(phase_b['support'], 6) if phase_b['support'] else None,
-                            'resistance': round(phase_b['resistance'], 6) if phase_b['resistance'] else None,
-                            'volume': round(phase_b['volume'], 2),
-                            'ema_break': phase_b['details'].get('ema_break', False),
-                            'squeeze': phase_b['details'].get('squeeze', False),
-                            'divergence': phase_b['details'].get('divergence', False),
-                            'volume_ratio': phase_b['details'].get('volume_ratio', 0)
+                            'timestamp_london': format_london(timestamp),
+                            'timestamp_utc': timestamp.astimezone(UTC_TZ).strftime('%Y-%m-%d %H:%M:%S UTC'),
+                            'close': round(float(confirm_window['close'].iloc[-1]), 6),
+                            'score': score_b,
+                            'support': round(sup, 6) if sup else None,
+                            'resistance': round(res, 6) if res else None,
+                            'volume': round(float(confirm_window['volume'].iloc[-1]), 2),
+                            'ema_break': details_b.get('ema_break', False),
+                            'squeeze': details_b.get('squeeze', False),
+                            'divergence': details_b.get('divergence', False),
+                            'volume_ratio': details_b.get('volume_ratio', 0)
                         })
+
+                        if symbol_signals >= CONFIG['MAX_BACKTEST_SIGNALS_PER_SYMBOL']:
+                            break
+
             except Exception as e:
                 self.stats['errors'] += 1
-                logger.error(f"Backtest hata {symbol} @ {format_london(current)}: {e}")
+                logger.error(f"Backtest hata {symbol} @ index {i}: {e}")
 
-            current += timedelta(minutes=5)
+        if symbol_signals > 0:
+            logger.info(f"{symbol}: {symbol_signals} sinyal bulundu")
 
     def _save_csv(self):
         if not self.results:
