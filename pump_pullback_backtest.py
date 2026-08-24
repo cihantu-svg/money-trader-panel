@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PUMP PULLBACK RADAR v1.2 - 300 Coin / 3 Hafta / Rate Limit Güvenli
+PUMP PULLBACK RADAR v1.3 - Verimli Tarama (Kullanıcı kodundan alındı)
 Strateji:
 - 1h mumda %10+ pump tespiti (3M USD hacim)
 - 5m'de S/R pullback (causal pivot, 50 mum)
 - Backtest: %3 SL / %8 TP
 - CSV + Telegram
+
+Tarama mantığı (verimli):
+  1. Önce TÜM coinler için 1h verisi çek
+  2. Pump olan coinleri/olayları filtrele
+  3. SADECE pump olan coinlere 5m verisi çek
+  4. Pullback ara
 """
 
 import time
@@ -62,19 +68,18 @@ CFG = {
     'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID', 'YOUR_CHAT_ID'),
     'BACKTEST_MODE': True,
     'BACKTEST_START': '2024-01-01',
-    'BACKTEST_END': '2024-01-22',     # 3 hafta
+    'BACKTEST_END': '2024-01-22',
     'CSV_OUTPUT': 'pump_pullback_results.csv',
-    'SYMBOL_CACHE_TTL': 3600,
-    'API_DELAY': 0.2,                # 5 req/s = güvenli
+    'API_DELAY': 0.15,
     'RETRY_MAX': 5,
-    'RETRY_BASE': 10,                # 10-20-40-80-160sn
+    'RETRY_BASE': 2,
 }
 
 # ==================== API (Rate Limit + Retry) ====================
 class API:
     def __init__(self):
         self.s = requests.Session()
-        self.s.headers.update({'User-Agent': 'PUMP-PB/1.2'})
+        self.s.headers.update({'User-Agent': 'PUMP-PB/1.3'})
         self.base = CFG['API_BASE']
         self.last = 0
         self.delay = CFG['API_DELAY']
@@ -99,24 +104,28 @@ class API:
                     log.warning(f"429 → {retry_after}sn bekleniyor... ({retries+1}/{CFG['RETRY_MAX']})")
                     time.sleep(retry_after)
                     return self.get(endpoint, params, retries + 1)
-                else:
-                    log.error(f"429 - Max retry aşıldı")
-                    return None
+                log.error("429 - Max retry")
+                return None
 
             if r.status_code == 418:
-                log.error("IP BAN (418) - Çok fazla istek")
+                log.error("IP BAN (418) - 5dk bekleniyor...")
+                time.sleep(300)
+                if retries < CFG['RETRY_MAX']:
+                    return self.get(endpoint, params, retries + 1)
                 return None
 
             r.raise_for_status()
             return r.json()
-        except requests.exceptions.RequestException as e:
+        except Exception as e:
             log.error(f"API {endpoint}: {e}")
             return None
 
-    def klines(self, symbol, interval, limit, endTime=None):
+    def klines(self, symbol, interval, start_ms=None, end_ms=None, limit=1500):
         p = {'symbol': symbol, 'interval': interval, 'limit': limit}
-        if endTime:
-            p['endTime'] = int(endTime)
+        if start_ms:
+            p['startTime'] = int(start_ms)
+        if end_ms:
+            p['endTime'] = int(end_ms)
         d = self.get('/fapi/v1/klines', p)
         if not d or not isinstance(d, list):
             return None
@@ -133,13 +142,13 @@ class API:
 
 api = API()
 
-# ==================== SYMBOLS (Cache) ====================
+# ==================== SYMBOLS ====================
 _sym_cache = None
 _sym_cache_t = 0
 
 def get_symbols():
     global _sym_cache, _sym_cache_t
-    if _sym_cache and (time.time() - _sym_cache_t) < CFG['SYMBOL_CACHE_TTL']:
+    if _sym_cache and (time.time() - _sym_cache_t) < 3600:
         return _sym_cache
 
     info = api.get('/fapi/v1/exchangeInfo')
@@ -154,48 +163,33 @@ def get_symbols():
     log.info(f"{len(syms)} sembol yüklendi")
     return syms
 
-# ==================== TOPLU VERİ ÇEKME ====================
-def fetch_all(symbol, interval, start_dt, end_dt, limit=1500):
-    """Tüm veriyi chunk'lar halinde çeker. Sıralı, thread yok."""
-    chunks = []
-    end_ts = int(end_dt.astimezone(UTC).timestamp() * 1000)
+# ==================== VERIMLI VERI CEKME (startTime ile ileriye) ====================
+def fetch_range(symbol, interval, start_dt, end_dt):
+    """startTime kullanarak ileriye doğru çeker. Daha az chunk, daha verimli."""
+    all_rows = []
+    interval_ms = {'1h': 3600000, '5m': 300000, '1m': 60000}[interval]
+    start_ms = int(start_dt.astimezone(UTC).timestamp() * 1000)
+    end_ms = int(end_dt.astimezone(UTC).timestamp() * 1000)
+    cursor = start_ms
 
-    # Kaç chunk gerek? (Binance max 1500 mum)
-    if interval == '1h':
-        mins_per_candle = 60
-    elif interval == '5m':
-        mins_per_candle = 5
-    else:
-        mins_per_candle = 1
-
-    total_minutes = (end_dt - start_dt).total_seconds() / 60
-    total_candles = int(total_minutes / mins_per_candle)
-    expected_chunks = max(1, (total_candles + limit - 1) // limit)
-
-    cur_end = end_ts
-    chunk_idx = 0
-
-    while chunk_idx < expected_chunks * 2:  # güvenlik limiti
-        chunk_idx += 1
-        df = api.klines(symbol, interval, limit, endTime=cur_end)
-
+    while cursor < end_ms:
+        df = api.klines(symbol, interval, start_ms=cursor, end_ms=end_ms, limit=1500)
         if df is None or len(df) == 0:
             break
 
-        chunks.append(df)
-        first_time = df['open_time'].iloc[0]
+        all_rows.append(df)
+        last_open = int(df['open_time'].iloc[-1].timestamp() * 1000)
+        next_cursor = last_open + interval_ms
 
-        # Başlangıca ulaştık mı?
-        if first_time <= start_dt or len(df) < limit:
+        if next_cursor <= cursor or len(df) < 1500:
             break
+        cursor = next_cursor
+        time.sleep(0.08)
 
-        # Bir sonraki chunk
-        cur_end = int((first_time - timedelta(minutes=1)).astimezone(UTC).timestamp() * 1000)
-
-    if not chunks:
+    if not all_rows:
         return None
 
-    combined = pd.concat(chunks, ignore_index=True)
+    combined = pd.concat(all_rows, ignore_index=True)
     combined = combined.drop_duplicates(subset=['open_time']).sort_values('open_time').reset_index(drop=True)
     combined = combined[(combined['open_time'] >= start_dt) & (combined['open_time'] <= end_dt)]
     return combined.reset_index(drop=True)
@@ -219,7 +213,7 @@ def compute_sr(df, left=5, right=5):
     return (float(sup[-1]) if len(sup) else None,
             float(res[-1]) if len(res) else None)
 
-# ==================== PUMP TESPİTİ ====================
+# ==================== PUMP TESPITI ====================
 def find_pumps(df_1h):
     if df_1h is None or len(df_1h) < 2:
         return []
@@ -241,7 +235,7 @@ def find_pullback(df_5m, window=50):
             return i, sup, w['close'].iloc[i], w['close_time'].iloc[i]
     return None
 
-# ==================== POZİSYON ====================
+# ==================== POZISYON ====================
 def simulate(entry_price, df_after, entry_idx):
     if entry_idx >= len(df_after):
         return False, False, entry_price, None, 0, 0
@@ -286,8 +280,8 @@ def send_tg(msg, csv_path=None):
     if tok == 'YOUR_BOT_TOKEN' or cid == 'YOUR_CHAT_ID':
         return False
     try:
-        r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                          json={'chat_id': cid, 'text': msg, 'parse_mode': 'HTML'}, timeout=15)
+        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                      json={'chat_id': cid, 'text': msg, 'parse_mode': 'HTML'}, timeout=15)
         if csv_path and os.path.exists(csv_path):
             with open(csv_path, 'rb') as f:
                 requests.post(f"https://api.telegram.org/bot{tok}/sendDocument",
@@ -297,7 +291,7 @@ def send_tg(msg, csv_path=None):
         log.error(f"TG: {e}")
         return False
 
-# ==================== BACKTEST ====================
+# ==================== BACKTEST (Verimli) ====================
 class Backtest:
     def __init__(self):
         self.results = []
@@ -308,7 +302,7 @@ class Backtest:
         log.info("="*60)
         log.info("PUMP PULLBACK BACKTEST")
         log.info(f"Zaman: {fmt(now())}")
-        log.info(f"Periyot: {CFG['BACKTEST_START']} - {CFG['BACKTEST_END']} (3 hafta)")
+        log.info(f"Periyot: {CFG['BACKTEST_START']} - {CFG['BACKTEST_END']}")
         log.info(f"Coin: {CFG['MAX_COINS']} | Pump: %{CFG['PUMP_PCT']}+ | SL/TP: %{CFG['SL_PCT']}/%{CFG['TP_PCT']}")
         log.info("="*60)
 
@@ -320,47 +314,72 @@ class Backtest:
         start = datetime.strptime(CFG['BACKTEST_START'], '%Y-%m-%d').replace(tzinfo=LONDON)
         end = datetime.strptime(CFG['BACKTEST_END'], '%Y-%m-%d').replace(tzinfo=LONDON)
 
-        total_api_calls = len(syms) * 6  # ~1h(1) + 5m(5)
-        est_time = total_api_calls * CFG['API_DELAY'] / 60
-        log.info(f"Tahmini API çağrısı: ~{total_api_calls} | Süre: ~{est_time:.0f} dk")
-        log.info("="*60)
+        # ADIM 1: Tüm coinler için 1h verisi çek
+        log.info(f"ADIM 1: {len(syms)} coin için 1h verisi çekiliyor...")
+        df1h_by_sym = {}
+        pump_events = []  # (symbol, pump_idx, pump_time, pump_close, pump_pct, pump_vol)
 
         for idx, sym in enumerate(syms, 1):
-            if idx % 10 == 1:
-                log.info(f"[{idx}/{len(syms)}] {sym} çekiliyor...")
-            self._test(sym, start, end)
+            try:
+                df1h = fetch_range(sym, '1h', start, end)
+                if df1h is not None and len(df1h) > 0:
+                    df1h_by_sym[sym] = df1h
+                    self.stats['scanned'] += len(df1h)
+                    pidxs = find_pumps(df1h)
+                    for pidx in pidxs:
+                        pump_events.append({
+                            'symbol': sym,
+                            'pidx': pidx,
+                            'time': df1h['close_time'].iloc[pidx],
+                            'close': float(df1h['close'].iloc[pidx]),
+                            'pct': float((df1h['close'].iloc[pidx] - df1h['open'].iloc[pidx]) / df1h['open'].iloc[pidx] * 100),
+                            'vol': float(df1h['quote_volume'].iloc[pidx])
+                        })
+            except Exception as e:
+                self.stats['err'] += 1
+                log.error(f"1h hata {sym}: {e}")
 
-        self._save()
-        self._report()
-        send_tg(self._summary(), self.csv)
-        log.info("BACKTEST BİTTİ")
+            if idx % 20 == 0:
+                log.info(f"[{idx}/{len(syms)}] 1h tamamlandı, {len(pump_events)} pump bulundu")
 
-    def _test(self, sym, start, end):
-        try:
-            df1h = fetch_all(sym, '1h', start, end)
-            if df1h is None or len(df1h) < 2:
-                return
+        self.stats['pump'] = len(pump_events)
+        log.info(f"1h tamamlandı: {len(pump_events)} pump olayı ({len(df1h_by_sym)} coin'de veri var)")
 
-            df5m = fetch_all(sym, '5m', start, end)
+        if not pump_events:
+            log.warning("Pump bulunamadı")
+            return
+
+        # ADIM 2: SADECE pump olan coinler için 5m verisi çek
+        log.info("="*60)
+        log.info("ADIM 2: Pump olan coinler için 5m verisi çekiliyor...")
+
+        # Hangi coinlerde pump var?
+        pump_symbols = list(set(e['symbol'] for e in pump_events))
+        log.info(f"{len(pump_symbols)} coin'de pump var, 5m çekiliyor...")
+
+        df5m_by_sym = {}
+        for idx, sym in enumerate(pump_symbols, 1):
+            try:
+                df5m = fetch_range(sym, '5m', start, end)
+                if df5m is not None and len(df5m) > 0:
+                    df5m_by_sym[sym] = df5m
+            except Exception as e:
+                log.error(f"5m hata {sym}: {e}")
+            if idx % 10 == 0:
+                log.info(f"[{idx}/{len(pump_symbols)}] 5m tamamlandı")
+
+        # ADIM 3: Her pump olayı için pullback ara
+        log.info("="*60)
+        log.info("ADIM 3: Pullback aranıyor...")
+
+        for idx, ev in enumerate(pump_events, 1):
+            sym = ev['symbol']
+            df5m = df5m_by_sym.get(sym)
             if df5m is None or len(df5m) < 50:
-                return
+                continue
 
-            self.stats['scanned'] += len(df1h)
-            pumps = find_pumps(df1h)
-
-            if not pumps:
-                return
-
-            self.stats['pump'] += len(pumps)
-
-            for pidx in pumps:
-                p_time = df1h['close_time'].iloc[pidx]
-                p_open = df1h['open'].iloc[pidx]
-                p_close = df1h['close'].iloc[pidx]
-                p_pct = (p_close - p_open) / p_open * 100
-                p_vol = df1h['quote_volume'].iloc[pidx]
-
-                after = df5m[df5m['open_time'] > p_time].copy().reset_index(drop=True)
+            try:
+                after = df5m[df5m['open_time'] > ev['time']].copy().reset_index(drop=True)
                 if len(after) < 10:
                     continue
 
@@ -380,9 +399,9 @@ class Backtest:
 
                 self.results.append({
                     'symbol': sym,
-                    'pump_time': fmt(p_time),
-                    'pump_pct': round(p_pct, 2),
-                    'pump_volume_usd': round(p_vol, 2),
+                    'pump_time': fmt(ev['time']),
+                    'pump_pct': round(ev['pct'], 2),
+                    'pump_volume_usd': round(ev['vol'], 2),
                     'entry_time': fmt(entry_t),
                     'entry_price': round(entry_p, 6),
                     'support': round(sup_level, 6),
@@ -395,9 +414,17 @@ class Backtest:
                     'max_profit_pct': round(max_prof, 2),
                 })
 
-        except Exception as e:
-            self.stats['err'] += 1
-            log.error(f"Hata {sym}: {e}")
+            except Exception as e:
+                self.stats['err'] += 1
+                log.error(f"Pullback hata {sym}: {e}")
+
+            if idx % 50 == 0:
+                log.info(f"[{idx}/{len(pump_events)}] pump işlendi, {self.stats['signal']} sinyal")
+
+        self._save()
+        self._report()
+        send_tg(self._summary(), self.csv)
+        log.info("BACKTEST BİTTİ")
 
     def _save(self):
         if not self.results:
@@ -413,7 +440,7 @@ class Backtest:
         log.info(f"Taranan 1h mum: {self.stats['scanned']}")
         log.info(f"Pump: {self.stats['pump']} | Sinyal: {self.stats['signal']}")
         log.info(f"SL: {self.stats['sl']} | TP: {self.stats['tp']}")
-        log.info(f"Hata: {self.stats['err']} | API çağrısı: {api.req_count}")
+        log.info(f"Hata: {self.stats['err']} | API: {api.req_count}")
         if self.stats['signal'] > 0:
             log.info(f"TP Oranı: {self.stats['tp']/self.stats['signal']*100:.1f}%")
         log.info("="*60)
@@ -429,7 +456,7 @@ class Backtest:
 • TP: {self.stats['tp']} | SL: {self.stats['sl']}
 • TP Oranı: {self.stats['tp']/self.stats['signal']*100:.1f}%
 • Ort. Getiri: {df['result_pct'].mean():.2f}%
-• API Çağrısı: {api.req_count}
+• API: {api.req_count}
 
 📁 CSV ekte."""
 
@@ -437,7 +464,7 @@ class Backtest:
 if __name__ == '__main__':
     print(f"""
     ╔══════════════════════════════════════════════╗
-    ║     PUMP PULLBACK RADAR v1.2                ║
+    ║     PUMP PULLBACK RADAR v1.3                ║
     ║     {fmt(now())}                  ║
     ╚══════════════════════════════════════════════╝
     """)
