@@ -1,22 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PUMP PULLBACK RADAR v1.0
+PUMP PULLBACK RADAR v1.2 - 300 Coin / 3 Hafta / Rate Limit Güvenli
 Strateji:
-- 1h mumda %10+ pump tespiti
+- 1h mumda %10+ pump tespiti (3M USD hacim)
 - 5m'de S/R pullback (causal pivot, 50 mum)
-- Hacim filtresi: 3M USD
 - Backtest: %3 SL / %8 TP
 - CSV + Telegram
 """
 
-import threading
 import time
 import os
 import sys
 import logging
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 import numpy as np
 import pandas as pd
@@ -55,49 +52,64 @@ log = logging.getLogger('PUMP_PB')
 # ==================== CONFIG ====================
 CFG = {
     'API_BASE': 'https://fapi.binance.com',
-    'MAX_COINS': 150,
-    'MIN_VOLUME_USD': 3_000_000,      # 3M USD hacim filtresi
-    'PUMP_PCT': 10.0,                  # 1h'da %10+ pump
-    'PULLBACK_WINDOW': 50,            # 5m'de son 50 mum
-    'SL_PCT': 3.0,                     # %3 stop loss
-    'TP_PCT': 8.0,                     # %8 take profit
-    'MAX_WORKERS': 8,
+    'MAX_COINS': 300,
+    'MIN_VOLUME_USD': 3_000_000,
+    'PUMP_PCT': 10.0,
+    'PULLBACK_WINDOW': 50,
+    'SL_PCT': 3.0,
+    'TP_PCT': 8.0,
     'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN'),
     'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID', 'YOUR_CHAT_ID'),
     'BACKTEST_MODE': True,
     'BACKTEST_START': '2024-01-01',
-    'BACKTEST_END': '2024-01-15',     # 2 haftalık test
+    'BACKTEST_END': '2024-01-22',     # 3 hafta
     'CSV_OUTPUT': 'pump_pullback_results.csv',
     'SYMBOL_CACHE_TTL': 3600,
+    'API_DELAY': 0.2,                # 5 req/s = güvenli
+    'RETRY_MAX': 5,
+    'RETRY_BASE': 10,                # 10-20-40-80-160sn
 }
 
-# ==================== GLOBALS ====================
-_lock = threading.Lock()
-_sym_cache = None
-_sym_cache_t = 0
-
-# ==================== API ====================
+# ==================== API (Rate Limit + Retry) ====================
 class API:
     def __init__(self):
         self.s = requests.Session()
-        self.s.headers.update({'User-Agent': 'PUMP-PB/1.0'})
+        self.s.headers.update({'User-Agent': 'PUMP-PB/1.2'})
         self.base = CFG['API_BASE']
         self.last = 0
-        self.min_int = 0.05
+        self.delay = CFG['API_DELAY']
+        self.req_count = 0
 
     def _rl(self):
         n = time.time()
-        if n - self.last < self.min_int:
-            time.sleep(self.min_int - (n - self.last))
+        wait = self.delay - (n - self.last)
+        if wait > 0:
+            time.sleep(wait)
         self.last = time.time()
+        self.req_count += 1
 
-    def get(self, endpoint, params=None):
+    def get(self, endpoint, params=None, retries=0):
         self._rl()
         try:
-            r = self.s.get(f"{self.base}{endpoint}", params=params, timeout=15)
+            r = self.s.get(f"{self.base}{endpoint}", params=params, timeout=20)
+
+            if r.status_code == 429:
+                retry_after = int(r.headers.get('Retry-After', CFG['RETRY_BASE'] * (2 ** retries)))
+                if retries < CFG['RETRY_MAX']:
+                    log.warning(f"429 → {retry_after}sn bekleniyor... ({retries+1}/{CFG['RETRY_MAX']})")
+                    time.sleep(retry_after)
+                    return self.get(endpoint, params, retries + 1)
+                else:
+                    log.error(f"429 - Max retry aşıldı")
+                    return None
+
+            if r.status_code == 418:
+                log.error("IP BAN (418) - Çok fazla istek")
+                return None
+
             r.raise_for_status()
             return r.json()
-        except Exception as e:
+        except requests.exceptions.RequestException as e:
             log.error(f"API {endpoint}: {e}")
             return None
 
@@ -121,12 +133,14 @@ class API:
 
 api = API()
 
-# ==================== SYMBOLS ====================
+# ==================== SYMBOLS (Cache) ====================
+_sym_cache = None
+_sym_cache_t = 0
+
 def get_symbols():
     global _sym_cache, _sym_cache_t
-    with _lock:
-        if _sym_cache and (time.time() - _sym_cache_t) < CFG['SYMBOL_CACHE_TTL']:
-            return _sym_cache
+    if _sym_cache and (time.time() - _sym_cache_t) < CFG['SYMBOL_CACHE_TTL']:
+        return _sym_cache
 
     info = api.get('/fapi/v1/exchangeInfo')
     if not info:
@@ -135,34 +149,48 @@ def get_symbols():
     syms = [s['symbol'] for s in info.get('symbols', [])
             if s.get('status') == 'TRADING' and s.get('contractType') == 'PERPETUAL' and s['symbol'].endswith('USDT')]
     syms = sorted(syms)[:CFG['MAX_COINS']]
-
-    with _lock:
-        _sym_cache = syms
-        _sym_cache_t = time.time()
+    _sym_cache = syms
+    _sym_cache_t = time.time()
     log.info(f"{len(syms)} sembol yüklendi")
     return syms
 
 # ==================== TOPLU VERİ ÇEKME ====================
 def fetch_all(symbol, interval, start_dt, end_dt, limit=1500):
-    """Belirli aralık için TÜM klines verisini chunk'lar halinde çeker."""
+    """Tüm veriyi chunk'lar halinde çeker. Sıralı, thread yok."""
     chunks = []
-    cur = start_dt
     end_ts = int(end_dt.astimezone(UTC).timestamp() * 1000)
 
-    while cur < end_dt:
-        chunk_end = int(cur.astimezone(UTC).timestamp() * 1000) + (limit * 60 * 1000)
-        chunk_end = min(chunk_end, end_ts)
+    # Kaç chunk gerek? (Binance max 1500 mum)
+    if interval == '1h':
+        mins_per_candle = 60
+    elif interval == '5m':
+        mins_per_candle = 5
+    else:
+        mins_per_candle = 1
 
-        df = api.klines(symbol, interval, limit, endTime=chunk_end)
+    total_minutes = (end_dt - start_dt).total_seconds() / 60
+    total_candles = int(total_minutes / mins_per_candle)
+    expected_chunks = max(1, (total_candles + limit - 1) // limit)
+
+    cur_end = end_ts
+    chunk_idx = 0
+
+    while chunk_idx < expected_chunks * 2:  # güvenlik limiti
+        chunk_idx += 1
+        df = api.klines(symbol, interval, limit, endTime=cur_end)
+
         if df is None or len(df) == 0:
             break
 
         chunks.append(df)
-        last_close = df['close_time'].iloc[-1]
-        if last_close >= end_dt or len(df) < limit:
+        first_time = df['open_time'].iloc[0]
+
+        # Başlangıca ulaştık mı?
+        if first_time <= start_dt or len(df) < limit:
             break
-        cur = last_close + timedelta(minutes=1)
-        time.sleep(0.05)
+
+        # Bir sonraki chunk
+        cur_end = int((first_time - timedelta(minutes=1)).astimezone(UTC).timestamp() * 1000)
 
     if not chunks:
         return None
@@ -172,9 +200,8 @@ def fetch_all(symbol, interval, start_dt, end_dt, limit=1500):
     combined = combined[(combined['open_time'] >= start_dt) & (combined['open_time'] <= end_dt)]
     return combined.reset_index(drop=True)
 
-# ==================== S/R (Causal Pivot) ====================
+# ==================== S/R ====================
 def compute_sr(df, left=5, right=5):
-    """Repaint-siz causal pivot S/R."""
     h = df['high'].values
     l = df['low'].values
     n = len(df)
@@ -193,113 +220,81 @@ def compute_sr(df, left=5, right=5):
             float(res[-1]) if len(res) else None)
 
 # ==================== PUMP TESPİTİ ====================
-def find_pumps(df_1h, min_pct=10.0):
-    """
-    1h DataFrame'de %10+ pump olan mumların indexlerini döndür.
-    Mum yüzdesi: (close - open) / open * 100
-    """
+def find_pumps(df_1h):
     if df_1h is None or len(df_1h) < 2:
         return []
     df = df_1h.copy()
     df['pct'] = (df['close'] - df['open']) / df['open'] * 100
-    df['volume_usd'] = df['quote_volume']
-    pumps = df[(df['pct'] >= min_pct) & (df['volume_usd'] >= CFG['MIN_VOLUME_USD'])]
+    pumps = df[(df['pct'] >= CFG['PUMP_PCT']) & (df['quote_volume'] >= CFG['MIN_VOLUME_USD'])]
     return pumps.index.tolist()
 
-# ==================== PULLBACK SİNYALİ ====================
-def find_pullback(df_5m, entry_price, window=50):
-    """
-    Son `window` mum içinde fiyat S/R desteğine dokunup geri döndü mü?
-    Dönüş: (sinyal_mumu_index, support_seviyesi) veya None
-    """
+# ==================== PULLBACK ====================
+def find_pullback(df_5m, window=50):
     if df_5m is None or len(df_5m) < window:
         return None
-
-    # Son window mum
     w = df_5m.iloc[-window:].copy().reset_index(drop=True)
-    sup, res = compute_sr(w)
-
+    sup, _ = compute_sr(w)
     if sup is None:
         return None
-
-    # Fiyat desteğe dokundu mu ve geri döndü mü?
-    # Kriter: Low <= support VE Close > support (dönüş mumu)
     for i in range(len(w)):
         if w['low'].iloc[i] <= sup * 1.005 and w['close'].iloc[i] > sup:
-            return i, sup
-
+            return i, sup, w['close'].iloc[i], w['close_time'].iloc[i]
     return None
 
-# ==================== POZİSYON YÖNETİMİ ====================
-def simulate_trade(entry_price, df_5m_after, entry_idx):
-    """
-    Entry'den sonraki 5m mumlarında %3 SL / %8 TP takip et.
-    Dönüş: sl_hit, tp_hit, exit_price, exit_time, max_dd, max_profit
-    """
-    if entry_idx >= len(df_5m_after):
+# ==================== POZİSYON ====================
+def simulate(entry_price, df_after, entry_idx):
+    if entry_idx >= len(df_after):
         return False, False, entry_price, None, 0, 0
 
-    sl_price = entry_price * (1 - CFG['SL_PCT'] / 100)
-    tp_price = entry_price * (1 + CFG['TP_PCT'] / 100)
+    sl = entry_price * (1 - CFG['SL_PCT'] / 100)
+    tp = entry_price * (1 + CFG['TP_PCT'] / 100)
+    sl_hit = tp_hit = False
+    exit_p = entry_price
+    exit_t = None
+    max_dd = max_prof = 0
 
-    sl_hit = False
-    tp_hit = False
-    exit_price = entry_price
-    exit_time = None
-    max_dd = 0
-    max_profit = 0
-
-    for i in range(entry_idx, len(df_5m_after)):
-        low = df_5m_after['low'].iloc[i]
-        high = df_5m_after['high'].iloc[i]
-        close = df_5m_after['close'].iloc[i]
-        ts = df_5m_after['close_time'].iloc[i]
+    for i in range(entry_idx, len(df_after)):
+        low = df_after['low'].iloc[i]
+        high = df_after['high'].iloc[i]
+        ts = df_after['close_time'].iloc[i]
 
         dd = (low - entry_price) / entry_price * 100
-        profit = (high - entry_price) / entry_price * 100
+        prof = (high - entry_price) / entry_price * 100
         max_dd = min(max_dd, dd)
-        max_profit = max(max_profit, profit)
+        max_prof = max(max_prof, prof)
 
-        if low <= sl_price:
+        if low <= sl:
             sl_hit = True
-            exit_price = sl_price
-            exit_time = ts
+            exit_p = sl
+            exit_t = ts
             break
-        if high >= tp_price:
+        if high >= tp:
             tp_hit = True
-            exit_price = tp_price
-            exit_time = ts
+            exit_p = tp
+            exit_t = ts
             break
 
     if not sl_hit and not tp_hit:
-        exit_price = df_5m_after['close'].iloc[-1]
-        exit_time = df_5m_after['close_time'].iloc[-1]
+        exit_p = df_after['close'].iloc[-1]
+        exit_t = df_after['close_time'].iloc[-1]
 
-    return sl_hit, tp_hit, exit_price, exit_time, max_dd, max_profit
+    return sl_hit, tp_hit, exit_p, exit_t, max_dd, max_prof
 
 # ==================== TELEGRAM ====================
 def send_tg(msg, csv_path=None):
-    tok = CFG['TELEGRAM_BOT_TOKEN']
-    cid = CFG['TELEGRAM_CHAT_ID']
+    tok, cid = CFG['TELEGRAM_BOT_TOKEN'], CFG['TELEGRAM_CHAT_ID']
     if tok == 'YOUR_BOT_TOKEN' or cid == 'YOUR_CHAT_ID':
-        log.warning("Telegram ayarlanmamış")
         return False
-
     try:
         r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
                           json={'chat_id': cid, 'text': msg, 'parse_mode': 'HTML'}, timeout=15)
-        if r.status_code != 200:
-            log.error(f"TG msg: {r.text}")
-
         if csv_path and os.path.exists(csv_path):
             with open(csv_path, 'rb') as f:
-                r2 = requests.post(f"https://api.telegram.org/bot{tok}/sendDocument",
-                                   files={'document': f}, data={'chat_id': cid}, timeout=60)
-                if r2.status_code == 200:
-                    log.info("CSV Telegram'a gönderildi")
+                requests.post(f"https://api.telegram.org/bot{tok}/sendDocument",
+                             files={'document': f}, data={'chat_id': cid}, timeout=60)
         return True
     except Exception as e:
-        log.error(f"TG hata: {e}")
+        log.error(f"TG: {e}")
         return False
 
 # ==================== BACKTEST ====================
@@ -307,14 +302,14 @@ class Backtest:
     def __init__(self):
         self.results = []
         self.csv = CFG['CSV_OUTPUT']
-        self.stats = {'scanned': 0, 'pump_found': 0, 'signal': 0, 'sl': 0, 'tp': 0, 'errors': 0}
+        self.stats = {'scanned': 0, 'pump': 0, 'signal': 0, 'sl': 0, 'tp': 0, 'err': 0}
 
     def run(self):
         log.info("="*60)
         log.info("PUMP PULLBACK BACKTEST")
         log.info(f"Zaman: {fmt(now())}")
-        log.info(f"Periyot: {CFG['BACKTEST_START']} - {CFG['BACKTEST_END']}")
-        log.info(f"Pump: %{CFG['PUMP_PCT']}+ | SL: %{CFG['SL_PCT']} | TP: %{CFG['TP_PCT']}")
+        log.info(f"Periyot: {CFG['BACKTEST_START']} - {CFG['BACKTEST_END']} (3 hafta)")
+        log.info(f"Coin: {CFG['MAX_COINS']} | Pump: %{CFG['PUMP_PCT']}+ | SL/TP: %{CFG['SL_PCT']}/%{CFG['TP_PCT']}")
         log.info("="*60)
 
         syms = get_symbols()
@@ -325,64 +320,57 @@ class Backtest:
         start = datetime.strptime(CFG['BACKTEST_START'], '%Y-%m-%d').replace(tzinfo=LONDON)
         end = datetime.strptime(CFG['BACKTEST_END'], '%Y-%m-%d').replace(tzinfo=LONDON)
 
+        total_api_calls = len(syms) * 6  # ~1h(1) + 5m(5)
+        est_time = total_api_calls * CFG['API_DELAY'] / 60
+        log.info(f"Tahmini API çağrısı: ~{total_api_calls} | Süre: ~{est_time:.0f} dk")
+        log.info("="*60)
+
         for idx, sym in enumerate(syms, 1):
-            log.info(f"[{idx}/{len(syms)}] {sym} çekiliyor...")
-            self._test_symbol(sym, start, end)
+            if idx % 10 == 1:
+                log.info(f"[{idx}/{len(syms)}] {sym} çekiliyor...")
+            self._test(sym, start, end)
 
         self._save()
         self._report()
-        send_tg(self._summary_msg(), self.csv)
+        send_tg(self._summary(), self.csv)
         log.info("BACKTEST BİTTİ")
 
-    def _test_symbol(self, sym, start, end):
+    def _test(self, sym, start, end):
         try:
-            # 1h verisi çek
             df1h = fetch_all(sym, '1h', start, end)
             if df1h is None or len(df1h) < 2:
                 return
 
-            # 5m verisi çek
             df5m = fetch_all(sym, '5m', start, end)
             if df5m is None or len(df5m) < 50:
                 return
 
-            # Pump tespiti
-            pump_indices = find_pumps(df1h)
             self.stats['scanned'] += len(df1h)
+            pumps = find_pumps(df1h)
 
-            if not pump_indices:
+            if not pumps:
                 return
 
-            self.stats['pump_found'] += len(pump_indices)
-            log.info(f"  {sym}: {len(pump_indices)} pump bulundu")
+            self.stats['pump'] += len(pumps)
 
-            for pidx in pump_indices:
-                pump_time = df1h['close_time'].iloc[pidx]
-                pump_open = df1h['open'].iloc[pidx]
-                pump_close = df1h['close'].iloc[pidx]
-                pump_pct = (pump_close - pump_open) / pump_open * 100
-                pump_vol = df1h['quote_volume'].iloc[pidx]
+            for pidx in pumps:
+                p_time = df1h['close_time'].iloc[pidx]
+                p_open = df1h['open'].iloc[pidx]
+                p_close = df1h['close'].iloc[pidx]
+                p_pct = (p_close - p_open) / p_open * 100
+                p_vol = df1h['quote_volume'].iloc[pidx]
 
-                # Pump'tan sonraki 5m verisi
-                after_pump = df5m[df5m['open_time'] > pump_time].copy().reset_index(drop=True)
-                if len(after_pump) < 10:
+                after = df5m[df5m['open_time'] > p_time].copy().reset_index(drop=True)
+                if len(after) < 10:
                     continue
 
-                # Pullback ara (pump'tan sonraki ilk 50 5m mum)
-                pb = find_pullback(after_pump, pump_close, CFG['PULLBACK_WINDOW'])
+                pb = find_pullback(after, CFG['PULLBACK_WINDOW'])
                 if pb is None:
                     continue
 
-                pb_idx, sup_level = pb
-                entry_price = after_pump['close'].iloc[pb_idx]
-                entry_time = after_pump['close_time'].iloc[pb_idx]
-
-                # Pozisyon simülasyonu
-                sl_hit, tp_hit, exit_p, exit_t, max_dd, max_prof = simulate_trade(
-                    entry_price, after_pump, pb_idx + 1
-                )
-
-                result_pct = (exit_p - entry_price) / entry_price * 100
+                _, sup_level, entry_p, entry_t = pb
+                sl_hit, tp_hit, exit_p, exit_t, max_dd, max_prof = simulate(entry_p, after, pb[0] + 1)
+                result_pct = (exit_p - entry_p) / entry_p * 100
 
                 self.stats['signal'] += 1
                 if sl_hit:
@@ -392,11 +380,11 @@ class Backtest:
 
                 self.results.append({
                     'symbol': sym,
-                    'pump_time': fmt(pump_time),
-                    'pump_pct': round(pump_pct, 2),
-                    'pump_volume_usd': round(pump_vol, 2),
-                    'entry_time': fmt(entry_time),
-                    'entry_price': round(entry_price, 6),
+                    'pump_time': fmt(p_time),
+                    'pump_pct': round(p_pct, 2),
+                    'pump_volume_usd': round(p_vol, 2),
+                    'entry_time': fmt(entry_t),
+                    'entry_price': round(entry_p, 6),
                     'support': round(sup_level, 6),
                     'sl_hit': sl_hit,
                     'tp_hit': tp_hit,
@@ -408,7 +396,7 @@ class Backtest:
                 })
 
         except Exception as e:
-            self.stats['errors'] += 1
+            self.stats['err'] += 1
             log.error(f"Hata {sym}: {e}")
 
     def _save(self):
@@ -423,31 +411,25 @@ class Backtest:
         log.info("="*60)
         log.info("SONUÇLAR")
         log.info(f"Taranan 1h mum: {self.stats['scanned']}")
-        log.info(f"Pump bulunan: {self.stats['pump_found']}")
-        log.info(f"Sinyal: {self.stats['signal']}")
+        log.info(f"Pump: {self.stats['pump']} | Sinyal: {self.stats['signal']}")
         log.info(f"SL: {self.stats['sl']} | TP: {self.stats['tp']}")
-        log.info(f"Hata: {self.stats['errors']}")
+        log.info(f"Hata: {self.stats['err']} | API çağrısı: {api.req_count}")
         if self.stats['signal'] > 0:
-            tp_rate = self.stats['tp'] / self.stats['signal'] * 100
-            log.info(f"TP Oranı: {tp_rate:.1f}%")
+            log.info(f"TP Oranı: {self.stats['tp']/self.stats['signal']*100:.1f}%")
         log.info("="*60)
 
-    def _summary_msg(self):
+    def _summary(self):
         if not self.results:
-            return "<b>PUMP PULLBACK</b>\nSonuç bulunamadı."
+            return "<b>PUMP PULLBACK</b>\nSonuç yok."
         df = pd.DataFrame(self.results)
-        win = self.stats['tp']
-        loss = self.stats['sl']
-        total = self.stats['signal']
-        tp_rate = win / total * 100 if total else 0
-        avg_res = df['result_pct'].mean()
         return f"""<b>🎯 PUMP PULLBACK Backtest</b>
 
 📊 Sonuçlar:
-• Sinyal: {total}
-• TP: {win} | SL: {loss}
-• TP Oranı: {tp_rate:.1f}%
-• Ort. Getiri: {avg_res:.2f}%
+• Sinyal: {self.stats['signal']}
+• TP: {self.stats['tp']} | SL: {self.stats['sl']}
+• TP Oranı: {self.stats['tp']/self.stats['signal']*100:.1f}%
+• Ort. Getiri: {df['result_pct'].mean():.2f}%
+• API Çağrısı: {api.req_count}
 
 📁 CSV ekte."""
 
@@ -455,7 +437,7 @@ class Backtest:
 if __name__ == '__main__':
     print(f"""
     ╔══════════════════════════════════════════════╗
-    ║     PUMP PULLBACK RADAR v1.0                ║
+    ║     PUMP PULLBACK RADAR v1.2                ║
     ║     {fmt(now())}                  ║
     ╚══════════════════════════════════════════════╝
     """)
