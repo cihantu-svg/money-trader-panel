@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PUMP PULLBACK RADAR v1.3 - Verimli Tarama (Kullanıcı kodundan alındı)
+PUMP PULLBACK RADAR v2.0 - Temiz Versiyon
 Strateji:
-- 1h mumda %10+ pump tespiti (3M USD hacim)
-- 5m'de S/R pullback (causal pivot, 50 mum)
-- Backtest: %3 SL / %8 TP
-- CSV + Telegram
+  1. 1h mumda %10+ pump (3M USD hacim)
+  2. 5m'de S/R desteğine pullback
+  3. Backtest: %3 SL / %8 TP
+  4. CSV + Telegram bildirim
 
-Tarama mantığı (verimli):
-  1. Önce TÜM coinler için 1h verisi çek
-  2. Pump olan coinleri/olayları filtrele
-  3. SADECE pump olan coinlere 5m verisi çek
-  4. Pullback ara
+Tarama (verimli):
+  - Once tum coinler icin 1h verisi cek
+  - Pump olanlari filtrele
+  - SADECE pump olan coinlere 5m cek
+  - Pullback ara
 """
 
 import time
@@ -55,7 +55,8 @@ fh.setFormatter(Fmt('%(asctime)s | %(levelname)s | %(message)s'))
 logging.basicConfig(level=logging.INFO, handlers=[h, fh])
 log = logging.getLogger('PUMP_PB')
 
-# ==================== CONFIG ====================
+# ==================== AYARLAR ====================
+# ASAGIDAKI DEGERLERI KENDINE GORE DEGISTIR
 CFG = {
     'API_BASE': 'https://fapi.binance.com',
     'MAX_COINS': 300,
@@ -64,26 +65,26 @@ CFG = {
     'PULLBACK_WINDOW': 50,
     'SL_PCT': 3.0,
     'TP_PCT': 8.0,
-    'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN', 'YOUR_BOT_TOKEN'),
-    'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID', 'YOUR_CHAT_ID'),
+    'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN', ''),  # BOS BIRAKMA
+    'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID', ''),      # BOS BIRAKMA
     'BACKTEST_MODE': True,
     'BACKTEST_START': '2024-01-01',
     'BACKTEST_END': '2024-01-22',
     'CSV_OUTPUT': 'pump_pullback_results.csv',
-    'API_DELAY': 0.15,
+    'API_DELAY': 0.3,        # 0.3sn = guvenli (3 req/s)
     'RETRY_MAX': 5,
-    'RETRY_BASE': 2,
+    'RETRY_BASE': 3,
 }
 
-# ==================== API (Rate Limit + Retry) ====================
+# ==================== API ====================
 class API:
     def __init__(self):
         self.s = requests.Session()
-        self.s.headers.update({'User-Agent': 'PUMP-PB/1.3'})
+        self.s.headers.update({'User-Agent': 'PUMP-PB/2.0'})
         self.base = CFG['API_BASE']
         self.last = 0
         self.delay = CFG['API_DELAY']
-        self.req_count = 0
+        self.count = 0
 
     def _rl(self):
         n = time.time()
@@ -91,7 +92,7 @@ class API:
         if wait > 0:
             time.sleep(wait)
         self.last = time.time()
-        self.req_count += 1
+        self.count += 1
 
     def get(self, endpoint, params=None, retries=0):
         self._rl()
@@ -99,17 +100,17 @@ class API:
             r = self.s.get(f"{self.base}{endpoint}", params=params, timeout=20)
 
             if r.status_code == 429:
-                retry_after = int(r.headers.get('Retry-After', CFG['RETRY_BASE'] * (2 ** retries)))
+                wait = int(r.headers.get('Retry-After', CFG['RETRY_BASE'] * (2 ** retries)))
                 if retries < CFG['RETRY_MAX']:
-                    log.warning(f"429 → {retry_after}sn bekleniyor... ({retries+1}/{CFG['RETRY_MAX']})")
-                    time.sleep(retry_after)
+                    log.warning(f"429 -> {wait}sn bekleniyor ({retries+1}/{CFG['RETRY_MAX']})")
+                    time.sleep(wait)
                     return self.get(endpoint, params, retries + 1)
                 log.error("429 - Max retry")
                 return None
 
             if r.status_code == 418:
-                log.error("IP BAN (418) - 5dk bekleniyor...")
-                time.sleep(300)
+                log.error("IP BAN (418) - 2dk bekleniyor...")
+                time.sleep(120)
                 if retries < CFG['RETRY_MAX']:
                     return self.get(endpoint, params, retries + 1)
                 return None
@@ -117,7 +118,7 @@ class API:
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            log.error(f"API {endpoint}: {e}")
+            log.error(f"API hata: {e}")
             return None
 
     def klines(self, symbol, interval, start_ms=None, end_ms=None, limit=1500):
@@ -142,7 +143,7 @@ class API:
 
 api = API()
 
-# ==================== SYMBOLS ====================
+# ==================== SEMBOLLER ====================
 _sym_cache = None
 _sym_cache_t = 0
 
@@ -160,12 +161,11 @@ def get_symbols():
     syms = sorted(syms)[:CFG['MAX_COINS']]
     _sym_cache = syms
     _sym_cache_t = time.time()
-    log.info(f"{len(syms)} sembol yüklendi")
+    log.info(f"{len(syms)} sembol yuklendi")
     return syms
 
-# ==================== VERIMLI VERI CEKME (startTime ile ileriye) ====================
+# ==================== VERI CEKME ====================
 def fetch_range(symbol, interval, start_dt, end_dt):
-    """startTime kullanarak ileriye doğru çeker. Daha az chunk, daha verimli."""
     all_rows = []
     interval_ms = {'1h': 3600000, '5m': 300000, '1m': 60000}[interval]
     start_ms = int(start_dt.astimezone(UTC).timestamp() * 1000)
@@ -184,7 +184,7 @@ def fetch_range(symbol, interval, start_dt, end_dt):
         if next_cursor <= cursor or len(df) < 1500:
             break
         cursor = next_cursor
-        time.sleep(0.08)
+        time.sleep(0.05)
 
     if not all_rows:
         return None
@@ -275,23 +275,48 @@ def simulate(entry_price, df_after, entry_idx):
     return sl_hit, tp_hit, exit_p, exit_t, max_dd, max_prof
 
 # ==================== TELEGRAM ====================
-def send_tg(msg, csv_path=None):
-    tok, cid = CFG['TELEGRAM_BOT_TOKEN'], CFG['TELEGRAM_CHAT_ID']
-    if tok == 'YOUR_BOT_TOKEN' or cid == 'YOUR_CHAT_ID':
-        return False
-    try:
-        requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
-                      json={'chat_id': cid, 'text': msg, 'parse_mode': 'HTML'}, timeout=15)
-        if csv_path and os.path.exists(csv_path):
-            with open(csv_path, 'rb') as f:
-                requests.post(f"https://api.telegram.org/bot{tok}/sendDocument",
-                             files={'document': f}, data={'chat_id': cid}, timeout=60)
-        return True
-    except Exception as e:
-        log.error(f"TG: {e}")
+def send_tg(text, csv_path=None):
+    tok = CFG['TELEGRAM_BOT_TOKEN']
+    cid = CFG['TELEGRAM_CHAT_ID']
+
+    if not tok or not cid:
+        log.warning("Telegram token/chat_id bos - mesaj atilmadi")
+        log.warning("Ayarlamak icin:")
+        log.warning("  export TELEGRAM_BOT_TOKEN='123456:ABC...'")
+        log.warning("  export TELEGRAM_CHAT_ID='123456789'")
         return False
 
-# ==================== BACKTEST (Verimli) ====================
+    try:
+        # Mesaj gonder
+        r = requests.post(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            json={'chat_id': cid, 'text': text, 'parse_mode': 'HTML'},
+            timeout=15
+        )
+        if r.status_code != 200:
+            log.error(f"TG mesaj hatasi: {r.text}")
+            return False
+        log.info("Telegram mesaji gonderildi")
+
+        # CSV gonder
+        if csv_path and os.path.exists(csv_path):
+            with open(csv_path, 'rb') as f:
+                r2 = requests.post(
+                    f"https://api.telegram.org/bot{tok}/sendDocument",
+                    files={'document': f},
+                    data={'chat_id': cid},
+                    timeout=60
+                )
+                if r2.status_code == 200:
+                    log.info("CSV Telegram'a gonderildi")
+                else:
+                    log.error(f"TG CSV hatasi: {r2.text}")
+        return True
+    except Exception as e:
+        log.error(f"TG hata: {e}")
+        return False
+
+# ==================== BACKTEST ====================
 class Backtest:
     def __init__(self):
         self.results = []
@@ -299,12 +324,12 @@ class Backtest:
         self.stats = {'scanned': 0, 'pump': 0, 'signal': 0, 'sl': 0, 'tp': 0, 'err': 0}
 
     def run(self):
-        log.info("="*60)
+        log.info("=" * 60)
         log.info("PUMP PULLBACK BACKTEST")
         log.info(f"Zaman: {fmt(now())}")
         log.info(f"Periyot: {CFG['BACKTEST_START']} - {CFG['BACKTEST_END']}")
         log.info(f"Coin: {CFG['MAX_COINS']} | Pump: %{CFG['PUMP_PCT']}+ | SL/TP: %{CFG['SL_PCT']}/%{CFG['TP_PCT']}")
-        log.info("="*60)
+        log.info("=" * 60)
 
         syms = get_symbols()
         if not syms:
@@ -314,10 +339,10 @@ class Backtest:
         start = datetime.strptime(CFG['BACKTEST_START'], '%Y-%m-%d').replace(tzinfo=LONDON)
         end = datetime.strptime(CFG['BACKTEST_END'], '%Y-%m-%d').replace(tzinfo=LONDON)
 
-        # ADIM 1: Tüm coinler için 1h verisi çek
-        log.info(f"ADIM 1: {len(syms)} coin için 1h verisi çekiliyor...")
+        # ADIM 1: Tum coinler icin 1h verisi
+        log.info(f"ADIM 1: {len(syms)} coin icin 1h verisi cekiliyor...")
         df1h_by_sym = {}
-        pump_events = []  # (symbol, pump_idx, pump_time, pump_close, pump_pct, pump_vol)
+        pump_events = []
 
         for idx, sym in enumerate(syms, 1):
             try:
@@ -340,22 +365,21 @@ class Backtest:
                 log.error(f"1h hata {sym}: {e}")
 
             if idx % 20 == 0:
-                log.info(f"[{idx}/{len(syms)}] 1h tamamlandı, {len(pump_events)} pump bulundu")
+                log.info(f"[{idx}/{len(syms)}] 1h tamamlandi, {len(pump_events)} pump bulundu")
 
         self.stats['pump'] = len(pump_events)
-        log.info(f"1h tamamlandı: {len(pump_events)} pump olayı ({len(df1h_by_sym)} coin'de veri var)")
+        log.info(f"1h tamamlandi: {len(pump_events)} pump olayi ({len(df1h_by_sym)} coin)")
 
         if not pump_events:
-            log.warning("Pump bulunamadı")
+            log.warning("Pump bulunamadi")
+            send_tg("<b>PUMP PULLBACK</b>
+Sonuc bulunamadi.")
             return
 
-        # ADIM 2: SADECE pump olan coinler için 5m verisi çek
-        log.info("="*60)
-        log.info("ADIM 2: Pump olan coinler için 5m verisi çekiliyor...")
-
-        # Hangi coinlerde pump var?
+        # ADIM 2: Sadece pump olan coinlere 5m cek
+        log.info("=" * 60)
         pump_symbols = list(set(e['symbol'] for e in pump_events))
-        log.info(f"{len(pump_symbols)} coin'de pump var, 5m çekiliyor...")
+        log.info(f"ADIM 2: {len(pump_symbols)} coin icin 5m verisi cekiliyor...")
 
         df5m_by_sym = {}
         for idx, sym in enumerate(pump_symbols, 1):
@@ -366,11 +390,11 @@ class Backtest:
             except Exception as e:
                 log.error(f"5m hata {sym}: {e}")
             if idx % 10 == 0:
-                log.info(f"[{idx}/{len(pump_symbols)}] 5m tamamlandı")
+                log.info(f"[{idx}/{len(pump_symbols)}] 5m tamamlandi")
 
-        # ADIM 3: Her pump olayı için pullback ara
-        log.info("="*60)
-        log.info("ADIM 3: Pullback aranıyor...")
+        # ADIM 3: Pullback ara
+        log.info("=" * 60)
+        log.info(f"ADIM 3: {len(pump_events)} pump icin pullback araniyor...")
 
         for idx, ev in enumerate(pump_events, 1):
             sym = ev['symbol']
@@ -419,53 +443,72 @@ class Backtest:
                 log.error(f"Pullback hata {sym}: {e}")
 
             if idx % 50 == 0:
-                log.info(f"[{idx}/{len(pump_events)}] pump işlendi, {self.stats['signal']} sinyal")
+                log.info(f"[{idx}/{len(pump_events)}] pump islendi, {self.stats['signal']} sinyal")
 
         self._save()
         self._report()
-        send_tg(self._summary(), self.csv)
-        log.info("BACKTEST BİTTİ")
+
+        # Telegram
+        msg = self._summary()
+        send_tg(msg, self.csv)
+
+        log.info("BACKTEST BITTI")
 
     def _save(self):
         if not self.results:
-            log.warning("Sonuç yok")
+            log.warning("Sonuc yok, CSV kaydedilmedi")
             return
         df = pd.DataFrame(self.results)
         df.to_csv(self.csv, index=False, encoding='utf-8-sig')
-        log.info(f"CSV: {self.csv} | {len(self.results)} sinyal")
+        log.info(f"CSV kaydedildi: {self.csv} | {len(self.results)} sinyal")
 
     def _report(self):
-        log.info("="*60)
-        log.info("SONUÇLAR")
+        log.info("=" * 60)
+        log.info("SONUCLAR")
         log.info(f"Taranan 1h mum: {self.stats['scanned']}")
         log.info(f"Pump: {self.stats['pump']} | Sinyal: {self.stats['signal']}")
         log.info(f"SL: {self.stats['sl']} | TP: {self.stats['tp']}")
-        log.info(f"Hata: {self.stats['err']} | API: {api.req_count}")
+        log.info(f"Hata: {self.stats['err']} | API cagrisi: {api.count}")
         if self.stats['signal'] > 0:
-            log.info(f"TP Oranı: {self.stats['tp']/self.stats['signal']*100:.1f}%")
-        log.info("="*60)
+            log.info(f"TP Orani: {self.stats['tp']/self.stats['signal']*100:.1f}%")
+        log.info("=" * 60)
 
     def _summary(self):
         if not self.results:
-            return "<b>PUMP PULLBACK</b>\nSonuç yok."
+            return "<b>PUMP PULLBACK</b>
+Sonuc bulunamadi."
         df = pd.DataFrame(self.results)
-        return f"""<b>🎯 PUMP PULLBACK Backtest</b>
+        win = self.stats['tp']
+        loss = self.stats['sl']
+        total = self.stats['signal']
+        tp_rate = win / total * 100 if total else 0
+        avg_res = df['result_pct'].mean()
+        return f"""<b>PUMP PULLBACK Backtest</b>
 
-📊 Sonuçlar:
-• Sinyal: {self.stats['signal']}
-• TP: {self.stats['tp']} | SL: {self.stats['sl']}
-• TP Oranı: {self.stats['tp']/self.stats['signal']*100:.1f}%
-• Ort. Getiri: {df['result_pct'].mean():.2f}%
-• API: {api.req_count}
+Sinyal: {total}
+TP: {win} | SL: {loss}
+TP Orani: {tp_rate:.1f}%
+Ort. Getiri: {avg_res:.2f}%
+API: {api.count}
 
-📁 CSV ekte."""
+CSV ekte."""
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
     print(f"""
-    ╔══════════════════════════════════════════════╗
-    ║     PUMP PULLBACK RADAR v1.3                ║
-    ║     {fmt(now())}                  ║
-    ╚══════════════════════════════════════════════╝
+    ============================================
+    PUMP PULLBACK RADAR v2.0
+    {fmt(now())}
+    ============================================
     """)
+
+    # Telegram kontrol
+    if not CFG['TELEGRAM_BOT_TOKEN'] or not CFG['TELEGRAM_CHAT_ID']:
+        print("
+[!] UYARI: Telegram token/chat_id ayarlanmamis!")
+        print("    Mesaj gitmeyecek. Ayarlamak icin:")
+        print("    export TELEGRAM_BOT_TOKEN='123456:ABC...'")
+        print("    export TELEGRAM_CHAT_ID='123456789'")
+        print()
+
     Backtest().run()
