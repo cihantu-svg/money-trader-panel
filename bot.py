@@ -8,55 +8,109 @@ Başka HİÇBİR filtre yok (RSI, SMA, trend, breakout vs. YOK).
 Binance Futures üzerinde tüm USDT paritelerini tarar.
 """
 
+import os
 import time
+import logging
 import requests
 from datetime import datetime, timezone
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
+
 # ============ AYARLAR ============
-VOLUME_USDT_MIN = 3_000_000      # minimum GÜNLÜK (24s) hacim ($)
-PRICE_CHANGE_MIN = 7.0           # minimum %7 hareket (15dk mumda)
-CHECK_INTERVAL_SEC = 60          # kaç saniyede bir tarasın
-TELEGRAM_BOT_TOKEN = ""          # kendi token'ını gir
-TELEGRAM_CHAT_ID = ""            # kendi chat id'ni gir
+# Token'lar artik ortam degiskeninden (environment variable) okunuyor,
+# koda hardcode edilmiyor - sunucu panelinde TELEGRAM_BOT_TOKEN ve
+# TELEGRAM_CHAT_ID olarak tanimla.
+VOLUME_USDT_MIN = float(os.getenv("VOLUME_USDT_MIN", "3000000"))   # minimum GÜNLÜK (24s) hacim ($)
+PRICE_CHANGE_MIN = float(os.getenv("PRICE_CHANGE_MIN", "7.0"))     # minimum %7 hareket (15dk mumda)
+CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))    # kaç saniyede bir tarasın
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 0.5
 # ==================================
 
 BINANCE_FAPI = "https://fapi.binance.com"
 
+session = requests.Session()
+
+
+def _get_with_retry(url, params=None, timeout=15):
+    """Gecici ag/API hatalarinda (429/5xx/timeout) otomatik tekrar dener,
+    tek seferlik hatalarda taramanin tamamen bos donmesini engeller."""
+    last_exc = None
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            r = session.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            log.warning(f"HTTP {r.status_code} ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt + 1})")
+            time.sleep(wait)
+            last_exc = Exception(f"HTTP {r.status_code}")
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            time.sleep(wait)
+    raise last_exc if last_exc else Exception("Bilinmeyen istek hatasi")
+
 
 def send_telegram(msg: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[TELEGRAM DEVRE DIŞI]", msg)
+        log.warning("[TELEGRAM DEVRE DIŞI - TOKEN/CHAT_ID env variable olarak tanimli degil] " + msg)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        r = session.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        if r.status_code != 200:
+            log.error(f"Telegram gönderim hatası: HTTP {r.status_code} - {r.text[:200]}")
     except Exception as e:
-        print("Telegram gönderim hatası:", e)
+        log.error(f"Telegram gönderim hatası: {e}")
 
 
 def get_usdt_futures_symbols():
-    url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
-    data = requests.get(url, timeout=15).json()
-    symbols = [
-        s["symbol"] for s in data["symbols"]
-        if s["symbol"].endswith("USDT") and s.get("contractType") == "PERPETUAL"
-        and s.get("status") == "TRADING"
-    ]
-    return symbols
+    try:
+        data = _get_with_retry(f"{BINANCE_FAPI}/fapi/v1/exchangeInfo", timeout=15)
+        symbols = [
+            s["symbol"] for s in data["symbols"]
+            if s["symbol"].endswith("USDT") and s.get("contractType") == "PERPETUAL"
+            and s.get("status") == "TRADING"
+        ]
+        if not symbols:
+            log.error("exchangeInfo bos sembol listesi döndürdü")
+        return symbols
+    except Exception as e:
+        log.error(f"get_usdt_futures_symbols hata (sembol listesi ALINAMADI): {e}")
+        return []
 
 
 def get_24h_volumes():
-    """Tüm semboller için 24 saatlik quote volume (USDT) sözlüğü döndürür."""
-    url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
-    data = requests.get(url, timeout=15).json()
-    return {item["symbol"]: float(item["quoteVolume"]) for item in data}
+    """Tüm semboller için 24 saatlik quote volume (USDT) sözlüğü döndürür.
+    Hata durumunda None döner (bos sözlükten AYIRT edilmesi kritik - yoksa
+    hacim verisi çekilemediginde tüm coinler hacim=0 sanılıp elenir)."""
+    try:
+        data = _get_with_retry(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", timeout=15)
+        vols = {item["symbol"]: float(item["quoteVolume"]) for item in data}
+        if not vols:
+            log.error("24hr ticker API bos veri döndürdü")
+            return None
+        return vols
+    except Exception as e:
+        log.error(f"get_24h_volumes hata (24h hacim verisi ALINAMADI): {e}")
+        return None
 
 
 def get_last_15m_kline(symbol: str):
     """Kapanmış son 15 dakikalık mumu döndürür."""
-    url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": "15m", "limit": 2}
-    r = requests.get(url, params=params, timeout=10).json()
+    try:
+        r = _get_with_retry(
+            f"{BINANCE_FAPI}/fapi/v1/klines",
+            params={"symbol": symbol, "interval": "15m", "limit": 2},
+            timeout=10,
+        )
+    except Exception as e:
+        log.debug(f"{symbol} kline hata: {e}")
+        return None
     if len(r) < 2:
         return None
     # r[-1] genelde henüz kapanmamış olabilir, kapanmış olan bir öncekini alıyoruz
@@ -79,7 +133,17 @@ def get_last_15m_kline(symbol: str):
 def scan_once():
     hits = []
     symbols = get_usdt_futures_symbols()
+    if not symbols:
+        log.error("Sembol listesi BOS - bu turu atlıyorum")
+        return hits
+
     daily_volumes = get_24h_volumes()  # tek seferde tüm sembollerin günlük hacmi
+    if daily_volumes is None:
+        # Hacim verisi çekilemedi - tüm coinleri elemek yerine bu turda
+        # hacim filtresini atla, tüm semboller taransın.
+        log.error(f"24h hacim verisi alınamadı - bu turda hacim filtresi ATLANIYOR, "
+                  f"tüm {len(symbols)} coin filtrelenmeden taranacak")
+        daily_volumes = {s: VOLUME_USDT_MIN for s in symbols}  # hepsi eşiği geçmiş sayılır
 
     for symbol in symbols:
         try:
@@ -103,7 +167,7 @@ def scan_once():
                 "close": k["close"],
             })
         except Exception as e:
-            print(f"{symbol} hata:", e)
+            log.debug(f"{symbol} hata: {e}")
         time.sleep(0.05)  # rate limit için küçük bekleme
 
     return hits
@@ -121,7 +185,11 @@ def format_alert(hit: dict) -> str:
 
 
 def main():
-    print("Tarayıcı başladı. Kriterler: 15dk mum | Günlük Hacim >= $3M | 15dk Değişim >= %7")
+    log.info("Tarayıcı başladı. Kriterler: 15dk mum | Günlük Hacim >= $%s | 15dk Değişim >= %%%s"
+              % (f"{VOLUME_USDT_MIN:,.0f}", PRICE_CHANGE_MIN))
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env variable olarak tanımlı değil! "
+                  "Sunucu panelinden ekle, yoksa Telegram mesajı gitmez.")
     send_telegram(
         "✅ Tarayıcı başladı.\n"
         f"Kriterler: Günlük Hacim >= ${VOLUME_USDT_MIN:,.0f} | 15dk Değişim >= %{PRICE_CHANGE_MIN}\n"
@@ -139,7 +207,7 @@ def main():
                 already_alerted.add(key)
 
                 msg = format_alert(hit)
-                print(msg)
+                log.info(msg)
                 send_telegram(msg)
 
             # aynı mumda tekrar alarm atmasın diye set'i belirli aralıkla temizle
@@ -147,7 +215,7 @@ def main():
                 already_alerted.clear()
 
         except Exception as e:
-            print("Tarama döngüsü hatası:", e)
+            log.error(f"Tarama döngüsü hatası: {e}")
 
         time.sleep(CHECK_INTERVAL_SEC)
 
