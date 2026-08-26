@@ -1,514 +1,367 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PUMP PULLBACK RADAR v2.0 - Temiz Versiyon
-Strateji:
-  1. 1h mumda %10+ pump (3M USD hacim)
-  2. 5m'de S/R desteğine pullback
-  3. Backtest: %3 SL / %8 TP
-  4. CSV + Telegram bildirim
+BACKTEST: 15dk %7+ mum sinyali - MOMENTUM vs MEAN-REVERSION karsilastirma
 
-Tarama (verimli):
-  - Once tum coinler icin 1h verisi cek
-  - Pump olanlari filtrele
-  - SADECE pump olan coinlere 5m cek
-  - Pullback ara
+SINYAL (giris kosulu):
+  - 15 dakikalik kapanmis mumun govdesi (close-open)/open >= %7 (YUKARI olay)
+    veya <= -%7 (ASAGI olay)
+  - O anki trailing 24 saatlik hacim (son 96x15dk mumun toplam quote volume'u)
+    >= 3,000,000 USDT
+
+IKI STRATEJI, AYNI SINYAL SETI UZERINDE, BAGIMSIZ SIMULE EDILIR:
+  MOMENTUM      : mum yukari kapandiysa LONG, asagi kapandiysa SHORT
+  MEAN-REVERSION: mum yukari kapandiysa SHORT, asagi kapandiysa LONG
+
+POZISYON YONETIMI:
+  - Giris fiyati = sinyal mumunun kapanis fiyati
+  - Stop-Loss  : %5 (giris fiyatindan)
+  - Take-Profit: %10 (giris fiyatindan)
+  - Bir coin icin, o STRATEJIDE acik pozisyon varken yeni sinyal ATLANIR
+    (gercek bir bot da ayni coinde ust uste pozisyon acmaz)
+  - Bir sonraki mumlarda intrabar (mum ici) high/low ile TP/SL kontrol edilir.
+    Ayni mum icinde hem TP hem SL'e deginilmisse, KOTUMSER varsayimla SL
+    once tetiklenmis kabul edilir (gercekte hangisinin once oldugu bilinmez,
+    bu backtest'i iyimser sonuc vermekten korur).
+  - Islem fon suresi icinde (test penceresi sonuna kadar) TP/SL'e ulasmazsa
+    "ACIK KALDI" olarak isaretlenir, kapanis fiyatindan gerceklesmemis PNL
+    hesaplanir ama kazanma oranina dahil edilmez.
+
+UCRET: Binance Futures taker ucreti varsayilan %0.04/islem (%0.08 round-trip)
+PNL'den dusulur. 0 yapmak icin TAKER_FEE_PCT_PER_SIDE = 0.0 yap.
+
+ONEMLI: Bu backtest gecmis veriye dayanir, gelecekteki performansi garanti
+etmez. Sadece bilgi/arastirma amaclidir, yatirim tavsiyesi degildir.
 """
-
-import time
 import os
-import sys
+import time
 import logging
-from datetime import datetime, timedelta, timezone
-import requests
+import csv
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import numpy as np
 import pandas as pd
+import requests
 
-try:
-    from zoneinfo import ZoneInfo
-except ImportError:
-    from backports.zoneinfo import ZoneInfo
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
 
-# ==================== ZAMAN ====================
-LONDON = ZoneInfo("Europe/London")
-UTC = timezone.utc
+# ══════════════════════════════════════════════════════════════════
+# AYARLAR
+# ══════════════════════════════════════════════════════════════════
+DAYS_BACK = int(os.getenv("DAYS_BACK", "20"))              # backtest penceresi (gun)
+MAX_COINS = int(os.getenv("MAX_COINS", "300"))              # 24h hacme gore en yuksek N coin
+EVENT_TF = "15m"
 
-def now():
-    return datetime.now(LONDON)
+BODY_PCT_THRESHOLD = float(os.getenv("BODY_PCT_THRESHOLD", "7.0"))
+MIN_QUOTE_VOLUME_24H = float(os.getenv("MIN_QUOTE_VOLUME_24H", "3000000"))
 
-def fmt(dt):
-    if dt is None:
-        return 'N/A'
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(LONDON).strftime('%Y-%m-%d %H:%M:%S %Z')
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "5.0"))
+TAKE_PROFIT_PCT = float(os.getenv("TAKE_PROFIT_PCT", "10.0"))
+TAKER_FEE_PCT_PER_SIDE = float(os.getenv("TAKER_FEE_PCT_PER_SIDE", "0.04"))  # %0 yapmak icin degistir
 
-# ==================== LOGGING ====================
-class Fmt(logging.Formatter):
-    def formatTime(self, record, datefmt=None):
-        return datetime.fromtimestamp(record.created, LONDON).strftime('%Y-%m-%d %H:%M:%S %Z')
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8"))
+REQUEST_TIMEOUT = 15
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 0.5
+KLINES_LIMIT = 1500  # Binance tek istekte max
 
-h = logging.StreamHandler(sys.stdout)
-h.setFormatter(Fmt('%(asctime)s | %(levelname)s | %(message)s'))
-fh = logging.FileHandler('pump_pullback.log', encoding='utf-8')
-fh.setFormatter(Fmt('%(asctime)s | %(levelname)s | %(message)s'))
-logging.basicConfig(level=logging.INFO, handlers=[h, fh])
-log = logging.getLogger('PUMP_PB')
+BINANCE_FAPI = "https://fapi.binance.com"
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", ".")
 
-# ==================== AYARLAR ====================
-# ASAGIDAKI DEGERLERI KENDINE GORE DEGISTIR
-CFG = {
-    'API_BASE': 'https://fapi.binance.com',
-    'MAX_COINS': 300,
-    'MIN_VOLUME_USD': 3_000_000,
-    'PUMP_PCT': 10.0,
-    'PULLBACK_WINDOW': 50,
-    'SL_PCT': 3.0,
-    'TP_PCT': 8.0,
-    'TELEGRAM_BOT_TOKEN': os.getenv('TELEGRAM_BOT_TOKEN', ''),  # BOS BIRAKMA
-    'TELEGRAM_CHAT_ID': os.getenv('TELEGRAM_CHAT_ID', ''),      # BOS BIRAKMA
-    'BACKTEST_MODE': True,
-    'BACKTEST_START': '2024-01-01',
-    'BACKTEST_END': '2024-01-22',
-    'CSV_OUTPUT': 'pump_pullback_results.csv',
-    'API_DELAY': 0.3,        # 0.3sn = guvenli (3 req/s)
-    'RETRY_MAX': 5,
-    'RETRY_BASE': 3,
-}
+session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS + 5, pool_maxsize=MAX_WORKERS + 10)
+session.mount("https://", _adapter)
 
-# ==================== API ====================
-class API:
-    def __init__(self):
-        self.s = requests.Session()
-        self.s.headers.update({'User-Agent': 'PUMP-PB/2.0'})
-        self.base = CFG['API_BASE']
-        self.last = 0
-        self.delay = CFG['API_DELAY']
-        self.count = 0
 
-    def _rl(self):
-        n = time.time()
-        wait = self.delay - (n - self.last)
-        if wait > 0:
-            time.sleep(wait)
-        self.last = time.time()
-        self.count += 1
-
-    def get(self, endpoint, params=None, retries=0):
-        self._rl()
+# ══════════════════════════════════════════════════════════════════
+# BINANCE VERI CEKME (retry'li)
+# ══════════════════════════════════════════════════════════════════
+def _get_with_retry(url, params=None, timeout=REQUEST_TIMEOUT):
+    last_exc = None
+    for attempt in range(MAX_RETRIES + 1):
         try:
-            r = self.s.get(f"{self.base}{endpoint}", params=params, timeout=20)
+            r = session.get(url, params=params, timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            log.warning(f"HTTP {r.status_code} ({url}), {wait:.1f}sn sonra tekrar")
+            time.sleep(wait)
+            last_exc = Exception(f"HTTP {r.status_code}")
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+    raise last_exc if last_exc else Exception("Bilinmeyen istek hatasi")
 
-            if r.status_code == 429:
-                wait = int(r.headers.get('Retry-After', CFG['RETRY_BASE'] * (2 ** retries)))
-                if retries < CFG['RETRY_MAX']:
-                    log.warning(f"429 -> {wait}sn bekleniyor ({retries+1}/{CFG['RETRY_MAX']})")
-                    time.sleep(wait)
-                    return self.get(endpoint, params, retries + 1)
-                log.error("429 - Max retry")
-                return None
 
-            if r.status_code == 418:
-                log.error("IP BAN (418) - 2dk bekleniyor...")
-                time.sleep(120)
-                if retries < CFG['RETRY_MAX']:
-                    return self.get(endpoint, params, retries + 1)
-                return None
+def get_top_symbols(n):
+    """24h hacme gore en yuksek N USDT-M perpetual sembolu doner."""
+    info = _get_with_retry(f"{BINANCE_FAPI}/fapi/v1/exchangeInfo", timeout=10)
+    perpetual_usdt = {
+        s["symbol"] for s in info["symbols"]
+        if s["symbol"].endswith("USDT") and s.get("contractType") == "PERPETUAL"
+        and s.get("status") == "TRADING"
+    }
+    tickers = _get_with_retry(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", timeout=15)
+    rows = [(t["symbol"], float(t.get("quoteVolume", 0))) for t in tickers if t["symbol"] in perpetual_usdt]
+    rows.sort(key=lambda x: x[1], reverse=True)
+    return [sym for sym, _ in rows[:n]]
 
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            log.error(f"API hata: {e}")
-            return None
 
-    def klines(self, symbol, interval, start_ms=None, end_ms=None, limit=1500):
-        p = {'symbol': symbol, 'interval': interval, 'limit': limit}
-        if start_ms:
-            p['startTime'] = int(start_ms)
-        if end_ms:
-            p['endTime'] = int(end_ms)
-        d = self.get('/fapi/v1/klines', p)
-        if not d or not isinstance(d, list):
-            return None
-        df = pd.DataFrame(d, columns=[
-            'open_time','open','high','low','close','volume',
-            'close_time','quote_volume','trades','taker_buy_base',
-            'taker_buy_quote','ignore'
-        ])
-        df['open_time'] = pd.to_datetime(df['open_time'], unit='ms', utc=True).dt.tz_convert(LONDON)
-        df['close_time'] = pd.to_datetime(df['close_time'], unit='ms', utc=True).dt.tz_convert(LONDON)
-        for c in ['open','high','low','close','volume','quote_volume']:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-        return df.dropna()
-
-api = API()
-
-# ==================== SEMBOLLER ====================
-_sym_cache = None
-_sym_cache_t = 0
-
-def get_symbols():
-    global _sym_cache, _sym_cache_t
-    if _sym_cache and (time.time() - _sym_cache_t) < 3600:
-        return _sym_cache
-
-    info = api.get('/fapi/v1/exchangeInfo')
-    if not info:
-        return []
-
-    syms = [s['symbol'] for s in info.get('symbols', [])
-            if s.get('status') == 'TRADING' and s.get('contractType') == 'PERPETUAL' and s['symbol'].endswith('USDT')]
-    syms = sorted(syms)[:CFG['MAX_COINS']]
-    _sym_cache = syms
-    _sym_cache_t = time.time()
-    log.info(f"{len(syms)} sembol yuklendi")
-    return syms
-
-# ==================== VERI CEKME ====================
-def fetch_range(symbol, interval, start_dt, end_dt):
+def fetch_klines_range(symbol, interval, start_ms, end_ms):
+    """start_ms - end_ms arasindaki tum mumlari sayfalayarak ceker."""
     all_rows = []
-    interval_ms = {'1h': 3600000, '5m': 300000, '1m': 60000}[interval]
-    start_ms = int(start_dt.astimezone(UTC).timestamp() * 1000)
-    end_ms = int(end_dt.astimezone(UTC).timestamp() * 1000)
     cursor = start_ms
-
     while cursor < end_ms:
-        df = api.klines(symbol, interval, start_ms=cursor, end_ms=end_ms, limit=1500)
-        if df is None or len(df) == 0:
+        try:
+            batch = _get_with_retry(
+                f"{BINANCE_FAPI}/fapi/v1/klines",
+                params={"symbol": symbol, "interval": interval, "startTime": cursor,
+                        "endTime": end_ms, "limit": KLINES_LIMIT},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except Exception as e:
+            log.debug(f"{symbol} klines hata: {e}")
             break
-
-        all_rows.append(df)
-        last_open = int(df['open_time'].iloc[-1].timestamp() * 1000)
-        next_cursor = last_open + interval_ms
-
-        if next_cursor <= cursor or len(df) < 1500:
+        if not batch:
             break
-        cursor = next_cursor
+        all_rows.extend(batch)
+        last_open_time = batch[-1][0]
+        if len(batch) < KLINES_LIMIT:
+            break
+        cursor = last_open_time + 1
         time.sleep(0.05)
 
     if not all_rows:
         return None
 
-    combined = pd.concat(all_rows, ignore_index=True)
-    combined = combined.drop_duplicates(subset=['open_time']).sort_values('open_time').reset_index(drop=True)
-    combined = combined[(combined['open_time'] >= start_dt) & (combined['open_time'] <= end_dt)]
-    return combined.reset_index(drop=True)
+    df = pd.DataFrame(all_rows, columns=[
+        "open_time", "open", "high", "low", "close", "volume", "close_time",
+        "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"])
+    for c in ["open", "high", "low", "close", "volume", "quote_volume"]:
+        df[c] = df[c].astype(float)
+    df["open_time"] = df["open_time"].astype(np.int64)
+    df["close_time"] = df["close_time"].astype(np.int64)
+    return df.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
 
-# ==================== S/R ====================
-def compute_sr(df, left=5, right=5):
-    h = df['high'].values
-    l = df['low'].values
-    n = len(df)
-    ph = np.zeros(n, dtype=bool)
-    pl = np.zeros(n, dtype=bool)
 
-    for i in range(left, n - right):
-        if h[i] >= np.max(h[i-left:i]) and h[i] >= np.max(h[i+1:i+right+1]):
-            ph[i] = True
-        if l[i] <= np.min(l[i-left:i]) and l[i] <= np.min(l[i+1:i+right+1]):
-            pl[i] = True
-
-    res = df.loc[ph, 'high'].tail(3).values
-    sup = df.loc[pl, 'low'].tail(3).values
-    return (float(sup[-1]) if len(sup) else None,
-            float(res[-1]) if len(res) else None)
-
-# ==================== PUMP TESPITI ====================
-def find_pumps(df_1h):
-    if df_1h is None or len(df_1h) < 2:
+# ══════════════════════════════════════════════════════════════════
+# TEK COIN ICIN: SINYALLERI BUL + IKI STRATEJIYI SIMULE ET
+# ══════════════════════════════════════════════════════════════════
+def simulate_symbol(symbol, test_start_ms, fetch_start_ms, now_ms):
+    df = fetch_klines_range(symbol, EVENT_TF, fetch_start_ms, now_ms)
+    if df is None or len(df) < 100:
         return []
-    df = df_1h.copy()
-    df['pct'] = (df['close'] - df['open']) / df['open'] * 100
-    pumps = df[(df['pct'] >= CFG['PUMP_PCT']) & (df['quote_volume'] >= CFG['MIN_VOLUME_USD'])]
-    return pumps.index.tolist()
 
-# ==================== PULLBACK ====================
-def find_pullback(df_5m, window=50):
-    if df_5m is None or len(df_5m) < window:
-        return None
-    w = df_5m.iloc[-window:].copy().reset_index(drop=True)
-    sup, _ = compute_sr(w)
-    if sup is None:
-        return None
-    for i in range(len(w)):
-        if w['low'].iloc[i] <= sup * 1.005 and w['close'].iloc[i] > sup:
-            return i, sup, w['close'].iloc[i], w['close_time'].iloc[i]
-    return None
+    df["body_pct"] = (df["close"] - df["open"]) / df["open"] * 100
+    df["rolling_24h_vol"] = df["quote_volume"].rolling(96, min_periods=96).sum()
 
-# ==================== POZISYON ====================
-def simulate(entry_price, df_after, entry_idx):
-    if entry_idx >= len(df_after):
-        return False, False, entry_price, None, 0, 0
+    trades = []
+    # her strateji icin ayri "acik pozisyon" takibi (ayni coinde ust uste islem yok)
+    open_trade = {"MOMENTUM": None, "REVERSION": None}
 
-    sl = entry_price * (1 - CFG['SL_PCT'] / 100)
-    tp = entry_price * (1 + CFG['TP_PCT'] / 100)
-    sl_hit = tp_hit = False
-    exit_p = entry_price
-    exit_t = None
-    max_dd = max_prof = 0
+    n = len(df)
+    for i in range(n):
+        row = df.iloc[i]
 
-    for i in range(entry_idx, len(df_after)):
-        low = df_after['low'].iloc[i]
-        high = df_after['high'].iloc[i]
-        ts = df_after['close_time'].iloc[i]
-
-        dd = (low - entry_price) / entry_price * 100
-        prof = (high - entry_price) / entry_price * 100
-        max_dd = min(max_dd, dd)
-        max_prof = max(max_prof, prof)
-
-        if low <= sl:
-            sl_hit = True
-            exit_p = sl
-            exit_t = ts
-            break
-        if high >= tp:
-            tp_hit = True
-            exit_p = tp
-            exit_t = ts
-            break
-
-    if not sl_hit and not tp_hit:
-        exit_p = df_after['close'].iloc[-1]
-        exit_t = df_after['close_time'].iloc[-1]
-
-    return sl_hit, tp_hit, exit_p, exit_t, max_dd, max_prof
-
-# ==================== TELEGRAM ====================
-def send_tg(text, csv_path=None):
-    tok = CFG['TELEGRAM_BOT_TOKEN']
-    cid = CFG['TELEGRAM_CHAT_ID']
-
-    if not tok or not cid:
-        log.warning("Telegram token/chat_id bos - mesaj atilmadi")
-        log.warning("Ayarlamak icin:")
-        log.warning("  export TELEGRAM_BOT_TOKEN='123456:ABC...'")
-        log.warning("  export TELEGRAM_CHAT_ID='123456789'")
-        return False
-
-    try:
-        # Mesaj gonder
-        r = requests.post(
-            f"https://api.telegram.org/bot{tok}/sendMessage",
-            json={'chat_id': cid, 'text': text, 'parse_mode': 'HTML'},
-            timeout=15
-        )
-        if r.status_code != 200:
-            log.error(f"TG mesaj hatasi: {r.text}")
-            return False
-        log.info("Telegram mesaji gonderildi")
-
-        # CSV gonder
-        if csv_path and os.path.exists(csv_path):
-            with open(csv_path, 'rb') as f:
-                r2 = requests.post(
-                    f"https://api.telegram.org/bot{tok}/sendDocument",
-                    files={'document': f},
-                    data={'chat_id': cid},
-                    timeout=60
-                )
-                if r2.status_code == 200:
-                    log.info("CSV Telegram'a gonderildi")
-                else:
-                    log.error(f"TG CSV hatasi: {r2.text}")
-        return True
-    except Exception as e:
-        log.error(f"TG hata: {e}")
-        return False
-
-# ==================== BACKTEST ====================
-class Backtest:
-    def __init__(self):
-        self.results = []
-        self.csv = CFG['CSV_OUTPUT']
-        self.stats = {'scanned': 0, 'pump': 0, 'signal': 0, 'sl': 0, 'tp': 0, 'err': 0}
-
-    def run(self):
-        log.info("=" * 60)
-        log.info("PUMP PULLBACK BACKTEST")
-        log.info(f"Zaman: {fmt(now())}")
-        log.info(f"Periyot: {CFG['BACKTEST_START']} - {CFG['BACKTEST_END']}")
-        log.info(f"Coin: {CFG['MAX_COINS']} | Pump: %{CFG['PUMP_PCT']}+ | SL/TP: %{CFG['SL_PCT']}/%{CFG['TP_PCT']}")
-        log.info("=" * 60)
-
-        syms = get_symbols()
-        if not syms:
-            log.error("Sembol yok")
-            return
-
-        start = datetime.strptime(CFG['BACKTEST_START'], '%Y-%m-%d').replace(tzinfo=LONDON)
-        end = datetime.strptime(CFG['BACKTEST_END'], '%Y-%m-%d').replace(tzinfo=LONDON)
-
-        # ADIM 1: Tum coinler icin 1h verisi
-        log.info(f"ADIM 1: {len(syms)} coin icin 1h verisi cekiliyor...")
-        df1h_by_sym = {}
-        pump_events = []
-
-        for idx, sym in enumerate(syms, 1):
-            try:
-                df1h = fetch_range(sym, '1h', start, end)
-                if df1h is not None and len(df1h) > 0:
-                    df1h_by_sym[sym] = df1h
-                    self.stats['scanned'] += len(df1h)
-                    pidxs = find_pumps(df1h)
-                    for pidx in pidxs:
-                        pump_events.append({
-                            'symbol': sym,
-                            'pidx': pidx,
-                            'time': df1h['close_time'].iloc[pidx],
-                            'close': float(df1h['close'].iloc[pidx]),
-                            'pct': float((df1h['close'].iloc[pidx] - df1h['open'].iloc[pidx]) / df1h['open'].iloc[pidx] * 100),
-                            'vol': float(df1h['quote_volume'].iloc[pidx])
-                        })
-            except Exception as e:
-                self.stats['err'] += 1
-                log.error(f"1h hata {sym}: {e}")
-
-            if idx % 20 == 0:
-                log.info(f"[{idx}/{len(syms)}] 1h tamamlandi, {len(pump_events)} pump bulundu")
-
-        self.stats['pump'] = len(pump_events)
-        log.info(f"1h tamamlandi: {len(pump_events)} pump olayi ({len(df1h_by_sym)} coin)")
-
-        if not pump_events:
-            log.warning("Pump bulunamadi")
-            send_tg("<b>PUMP PULLBACK</b>
-Sonuc bulunamadi.")
-            return
-
-        # ADIM 2: Sadece pump olan coinlere 5m cek
-        log.info("=" * 60)
-        pump_symbols = list(set(e['symbol'] for e in pump_events))
-        log.info(f"ADIM 2: {len(pump_symbols)} coin icin 5m verisi cekiliyor...")
-
-        df5m_by_sym = {}
-        for idx, sym in enumerate(pump_symbols, 1):
-            try:
-                df5m = fetch_range(sym, '5m', start, end)
-                if df5m is not None and len(df5m) > 0:
-                    df5m_by_sym[sym] = df5m
-            except Exception as e:
-                log.error(f"5m hata {sym}: {e}")
-            if idx % 10 == 0:
-                log.info(f"[{idx}/{len(pump_symbols)}] 5m tamamlandi")
-
-        # ADIM 3: Pullback ara
-        log.info("=" * 60)
-        log.info(f"ADIM 3: {len(pump_events)} pump icin pullback araniyor...")
-
-        for idx, ev in enumerate(pump_events, 1):
-            sym = ev['symbol']
-            df5m = df5m_by_sym.get(sym)
-            if df5m is None or len(df5m) < 50:
+        # --- once acik pozisyonlari kontrol et (TP/SL tetiklendi mi) ---
+        for strat in ("MOMENTUM", "REVERSION"):
+            ot = open_trade[strat]
+            if ot is None:
                 continue
+            high, low = float(row["high"]), float(row["low"])
+            if ot["direction"] == "LONG":
+                tp_price = ot["entry_price"] * (1 + TAKE_PROFIT_PCT / 100)
+                sl_price = ot["entry_price"] * (1 - STOP_LOSS_PCT / 100)
+                hit_tp, hit_sl = high >= tp_price, low <= sl_price
+            else:  # SHORT
+                tp_price = ot["entry_price"] * (1 - TAKE_PROFIT_PCT / 100)
+                sl_price = ot["entry_price"] * (1 + STOP_LOSS_PCT / 100)
+                hit_tp, hit_sl = low <= tp_price, high >= sl_price
 
+            if hit_tp and hit_sl:
+                result = "SL"   # kotumser varsayim: ayni mumda ikisi de degdiyse SL once
+            elif hit_sl:
+                result = "SL"
+            elif hit_tp:
+                result = "TP"
+            else:
+                continue  # bu mumda kapanmadi, acik kalmaya devam
+
+            raw_pnl = TAKE_PROFIT_PCT if result == "TP" else -STOP_LOSS_PCT
+            pnl_pct = raw_pnl - (2 * TAKER_FEE_PCT_PER_SIDE)  # giris+cikis ucreti
+            trades.append({
+                "symbol": symbol, "strategy": strat, "direction": ot["direction"],
+                "entry_time": ot["entry_time"], "entry_price": ot["entry_price"],
+                "exit_time": int(row["close_time"]), "exit_price": float(row["close"]),
+                "result": result, "pnl_pct": pnl_pct,
+                "event_body_pct": ot["event_body_pct"],
+            })
+            open_trade[strat] = None
+
+        # --- test penceresinden onceyse (sadece warmup icin var), yeni sinyal aramaya gecme ---
+        if row["open_time"] < test_start_ms:
+            continue
+
+        vol24 = row["rolling_24h_vol"]
+        if pd.isna(vol24) or vol24 < MIN_QUOTE_VOLUME_24H:
+            continue
+
+        body_pct = row["body_pct"]
+        if abs(body_pct) < BODY_PCT_THRESHOLD:
+            continue
+
+        entry_price = float(row["close"])
+        entry_time = int(row["close_time"])
+
+        # MOMENTUM: mum yonunde
+        if open_trade["MOMENTUM"] is None:
+            direction = "LONG" if body_pct > 0 else "SHORT"
+            open_trade["MOMENTUM"] = {
+                "direction": direction, "entry_price": entry_price,
+                "entry_time": entry_time, "event_body_pct": body_pct,
+            }
+
+        # REVERSION: mumun tersi
+        if open_trade["REVERSION"] is None:
+            direction = "SHORT" if body_pct > 0 else "LONG"
+            open_trade["REVERSION"] = {
+                "direction": direction, "entry_price": entry_price,
+                "entry_time": entry_time, "event_body_pct": body_pct,
+            }
+
+    # test suresi bitince hala acik olanlar -> gerceklesmemis (OPEN) olarak kaydet
+    last_close = float(df.iloc[-1]["close"])
+    last_time = int(df.iloc[-1]["close_time"])
+    for strat in ("MOMENTUM", "REVERSION"):
+        ot = open_trade[strat]
+        if ot is None:
+            continue
+        if ot["direction"] == "LONG":
+            raw_pnl = (last_close - ot["entry_price"]) / ot["entry_price"] * 100
+        else:
+            raw_pnl = (ot["entry_price"] - last_close) / ot["entry_price"] * 100
+        pnl_pct = raw_pnl - (2 * TAKER_FEE_PCT_PER_SIDE)
+        trades.append({
+            "symbol": symbol, "strategy": strat, "direction": ot["direction"],
+            "entry_time": ot["entry_time"], "entry_price": ot["entry_price"],
+            "exit_time": last_time, "exit_price": last_close,
+            "result": "OPEN", "pnl_pct": pnl_pct, "event_body_pct": ot["event_body_pct"],
+        })
+
+    return trades
+
+
+# ══════════════════════════════════════════════════════════════════
+# OZET ISTATISTIK
+# ══════════════════════════════════════════════════════════════════
+def summarize(trades, strategy_name):
+    rows = [t for t in trades if t["strategy"] == strategy_name]
+    closed = [t for t in rows if t["result"] in ("TP", "SL")]
+    open_ = [t for t in rows if t["result"] == "OPEN"]
+
+    wins = [t for t in closed if t["result"] == "TP"]
+    losses = [t for t in closed if t["result"] == "SL"]
+
+    n_closed = len(closed)
+    win_rate = (len(wins) / n_closed * 100) if n_closed else 0.0
+    total_pnl = sum(t["pnl_pct"] for t in closed)
+    avg_pnl = (total_pnl / n_closed) if n_closed else 0.0
+
+    long_trades = [t for t in rows if t["direction"] == "LONG"]
+    short_trades = [t for t in rows if t["direction"] == "SHORT"]
+
+    print(f"\n{'=' * 60}")
+    print(f"STRATEJI: {strategy_name}")
+    print(f"{'=' * 60}")
+    print(f"Toplam sinyal (islem)      : {len(rows)}  (LONG: {len(long_trades)} | SHORT: {len(short_trades)})")
+    print(f"Kapanan islem              : {n_closed}   (hala acik: {len(open_)})")
+    print(f"Kazanan (TP)               : {len(wins)}")
+    print(f"Kaybeden (SL)              : {len(losses)}")
+    print(f"Kazanma orani              : %{win_rate:.2f}")
+    print(f"Toplam getiri (basit toplam, compounding YOK) : %{total_pnl:.2f}")
+    print(f"Islem basi ortalama getiri : %{avg_pnl:.2f}")
+    if n_closed:
+        avg_days = DAYS_BACK
+        print(f"Gunluk ortalama sinyal     : {len(rows) / avg_days:.2f}")
+    return {
+        "strategy": strategy_name, "total_trades": len(rows), "closed": n_closed,
+        "open": len(open_), "wins": len(wins), "losses": len(losses),
+        "win_rate": win_rate, "total_pnl_pct": total_pnl, "avg_pnl_pct": avg_pnl,
+    }
+
+
+def save_csv(trades, path):
+    if not trades:
+        return
+    fieldnames = ["symbol", "strategy", "direction", "entry_time", "entry_price",
+                  "exit_time", "exit_price", "result", "pnl_pct", "event_body_pct"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for t in trades:
+            row = dict(t)
+            row["entry_time"] = datetime.fromtimestamp(row["entry_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            row["exit_time"] = datetime.fromtimestamp(row["exit_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            writer.writerow(row)
+    log.info(f"Tum islemler CSV'ye yazildi: {path}")
+
+
+# ══════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════
+def main():
+    now_ms = int(time.time() * 1000)
+    test_start_ms = now_ms - DAYS_BACK * 24 * 60 * 60 * 1000
+    fetch_start_ms = test_start_ms - 1 * 24 * 60 * 60 * 1000  # 1 gunluk warmup (rolling 24h hacim icin)
+
+    log.info(f"Backtest penceresi: son {DAYS_BACK} gun")
+    log.info(f"Kriterler: govde >= %{BODY_PCT_THRESHOLD} | 24h hacim >= ${MIN_QUOTE_VOLUME_24H:,.0f} | "
+              f"SL %{STOP_LOSS_PCT} | TP %{TAKE_PROFIT_PCT} | ucret %{TAKER_FEE_PCT_PER_SIDE}/islem")
+
+    log.info(f"En yuksek {MAX_COINS} coin (24h hacme gore) cekiliyor...")
+    symbols = get_top_symbols(MAX_COINS)
+    log.info(f"{len(symbols)} coin bulundu, mum verisi cekiliyor ve simule ediliyor "
+              f"({MAX_WORKERS} paralel worker)...")
+
+    all_trades = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(simulate_symbol, s, test_start_ms, fetch_start_ms, now_ms): s
+            for s in symbols
+        }
+        for future in as_completed(futures):
+            sym = futures[future]
             try:
-                after = df5m[df5m['open_time'] > ev['time']].copy().reset_index(drop=True)
-                if len(after) < 10:
-                    continue
-
-                pb = find_pullback(after, CFG['PULLBACK_WINDOW'])
-                if pb is None:
-                    continue
-
-                _, sup_level, entry_p, entry_t = pb
-                sl_hit, tp_hit, exit_p, exit_t, max_dd, max_prof = simulate(entry_p, after, pb[0] + 1)
-                result_pct = (exit_p - entry_p) / entry_p * 100
-
-                self.stats['signal'] += 1
-                if sl_hit:
-                    self.stats['sl'] += 1
-                if tp_hit:
-                    self.stats['tp'] += 1
-
-                self.results.append({
-                    'symbol': sym,
-                    'pump_time': fmt(ev['time']),
-                    'pump_pct': round(ev['pct'], 2),
-                    'pump_volume_usd': round(ev['vol'], 2),
-                    'entry_time': fmt(entry_t),
-                    'entry_price': round(entry_p, 6),
-                    'support': round(sup_level, 6),
-                    'sl_hit': sl_hit,
-                    'tp_hit': tp_hit,
-                    'exit_price': round(exit_p, 6),
-                    'exit_time': fmt(exit_t),
-                    'result_pct': round(result_pct, 2),
-                    'max_dd_pct': round(max_dd, 2),
-                    'max_profit_pct': round(max_prof, 2),
-                })
-
+                trades = future.result()
+                all_trades.extend(trades)
             except Exception as e:
-                self.stats['err'] += 1
-                log.error(f"Pullback hata {sym}: {e}")
+                log.warning(f"{sym} simulasyon hatasi: {e}")
+            done += 1
+            if done % 25 == 0:
+                log.info(f"{done}/{len(symbols)} coin tamamlandi...")
 
-            if idx % 50 == 0:
-                log.info(f"[{idx}/{len(pump_events)}] pump islendi, {self.stats['signal']} sinyal")
+    log.info(f"Tum coinler tamamlandi. Toplam kayitli islem: {len(all_trades)}")
 
-        self._save()
-        self._report()
+    momentum_summary = summarize(all_trades, "MOMENTUM")
+    reversion_summary = summarize(all_trades, "REVERSION")
 
-        # Telegram
-        msg = self._summary()
-        send_tg(msg, self.csv)
+    csv_path = os.path.join(OUTPUT_DIR, f"backtest_trades_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    save_csv(all_trades, csv_path)
 
-        log.info("BACKTEST BITTI")
+    print(f"\n{'=' * 60}")
+    print("SONUC")
+    print(f"{'=' * 60}")
+    print(f"MOMENTUM       -> Kazanma: %{momentum_summary['win_rate']:.2f} | "
+          f"Toplam getiri: %{momentum_summary['total_pnl_pct']:.2f} | "
+          f"Islem: {momentum_summary['total_trades']}")
+    print(f"MEAN-REVERSION -> Kazanma: %{reversion_summary['win_rate']:.2f} | "
+          f"Toplam getiri: %{reversion_summary['total_pnl_pct']:.2f} | "
+          f"Islem: {reversion_summary['total_trades']}")
+    print("\nNot: Bu sonuclar gecmis veriye dayanir, gelecek performansi garanti etmez.")
+    print(f"Detayli islem listesi: {csv_path}")
 
-    def _save(self):
-        if not self.results:
-            log.warning("Sonuc yok, CSV kaydedilmedi")
-            return
-        df = pd.DataFrame(self.results)
-        df.to_csv(self.csv, index=False, encoding='utf-8-sig')
-        log.info(f"CSV kaydedildi: {self.csv} | {len(self.results)} sinyal")
 
-    def _report(self):
-        log.info("=" * 60)
-        log.info("SONUCLAR")
-        log.info(f"Taranan 1h mum: {self.stats['scanned']}")
-        log.info(f"Pump: {self.stats['pump']} | Sinyal: {self.stats['signal']}")
-        log.info(f"SL: {self.stats['sl']} | TP: {self.stats['tp']}")
-        log.info(f"Hata: {self.stats['err']} | API cagrisi: {api.count}")
-        if self.stats['signal'] > 0:
-            log.info(f"TP Orani: {self.stats['tp']/self.stats['signal']*100:.1f}%")
-        log.info("=" * 60)
-
-    def _summary(self):
-        if not self.results:
-            return "<b>PUMP PULLBACK</b>
-Sonuc bulunamadi."
-        df = pd.DataFrame(self.results)
-        win = self.stats['tp']
-        loss = self.stats['sl']
-        total = self.stats['signal']
-        tp_rate = win / total * 100 if total else 0
-        avg_res = df['result_pct'].mean()
-        return f"""<b>PUMP PULLBACK Backtest</b>
-
-Sinyal: {total}
-TP: {win} | SL: {loss}
-TP Orani: {tp_rate:.1f}%
-Ort. Getiri: {avg_res:.2f}%
-API: {api.count}
-
-CSV ekte."""
-
-# ==================== MAIN ====================
-if __name__ == '__main__':
-    print(f"""
-    ============================================
-    PUMP PULLBACK RADAR v2.0
-    {fmt(now())}
-    ============================================
-    """)
-
-    # Telegram kontrol
-    if not CFG['TELEGRAM_BOT_TOKEN'] or not CFG['TELEGRAM_CHAT_ID']:
-        print("
-[!] UYARI: Telegram token/chat_id ayarlanmamis!")
-        print("    Mesaj gitmeyecek. Ayarlamak icin:")
-        print("    export TELEGRAM_BOT_TOKEN='123456:ABC...'")
-        print("    export TELEGRAM_CHAT_ID='123456789'")
-        print()
-
-    Backtest().run()
+if __name__ == "__main__":
+    main()
