@@ -19,12 +19,12 @@ log = logging.getLogger(__name__)
 
 # ============ AYARLAR ============
 # Token'lar artik ortam degiskeninden (environment variable) okunuyor,
-# koda hardcode edilmiyor - sunucu panelinde TELEGRAM_BOT_TOKEN ve
+# koda hardcode edilmiyor - sunucu panelinde TELEGRAM_TOKEN ve
 # TELEGRAM_CHAT_ID olarak tanimla.
 VOLUME_USDT_MIN = float(os.getenv("VOLUME_USDT_MIN", "3000000"))   # minimum GÜNLÜK (24s) hacim ($)
 PRICE_CHANGE_MIN = float(os.getenv("PRICE_CHANGE_MIN", "7.0"))     # minimum %7 hareket (15dk mumda)
-CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))    # kaç saniyede bir tarasın
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHECK_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", os.getenv("CHECK_INTERVAL_SEC", "60")))    # kaç saniyede bir tarasın
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 0.5
@@ -33,6 +33,23 @@ RETRY_BACKOFF_BASE = 0.5
 BINANCE_FAPI = "https://fapi.binance.com"
 
 session = requests.Session()
+
+
+def _debug_env_check():
+    """Render'in gercekte hangi isimle ne enjekte ettigini gormek icin
+    tanı amaçlı log - deger sizdirmadan sadece degisken adlarini ve
+    uzunluklarini gosterir. Sorun cozulunce bu fonksiyon kaldirilabilir."""
+    all_keys = sorted(os.environ.keys())
+    telegram_related = [k for k in all_keys if "TELEGRAM" in k.upper()]
+    log.info(f"[TANI] Ortamda TELEGRAM icin gecen degisken adlari: {telegram_related}")
+    log.info(f"[TANI] TELEGRAM_TOKEN uzunlugu: {len(TELEGRAM_TOKEN)} karakter "
+              f"(0 ise degisken bos ya da hic yok)")
+    log.info(f"[TANI] TELEGRAM_CHAT_ID uzunlugu: {len(TELEGRAM_CHAT_ID)} karakter")
+    if not telegram_related:
+        log.error("[TANI] Ortamda 'TELEGRAM' geçen HİÇBİR değişken bulunamadı. "
+                  "Bu, değişkenlerin bu servise hiç ulaşmadığını gösterir - "
+                  "yanlış servise eklenmiş, farklı bir Environment Group'a "
+                  "bağlanmış, ya da isim/yazım hatası olabilir.")
 
 
 def _get_with_retry(url, params=None, timeout=15):
@@ -56,10 +73,10 @@ def _get_with_retry(url, params=None, timeout=15):
 
 
 def send_telegram(msg: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("[TELEGRAM DEVRE DIŞI - TOKEN/CHAT_ID env variable olarak tanimli degil] " + msg)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = session.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
         if r.status_code != 200:
@@ -185,10 +202,11 @@ def format_alert(hit: dict) -> str:
 
 
 def main():
+    _debug_env_check()
     log.info("Tarayıcı başladı. Kriterler: 15dk mum | Günlük Hacim >= $%s | 15dk Değişim >= %%%s"
               % (f"{VOLUME_USDT_MIN:,.0f}", PRICE_CHANGE_MIN))
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID env variable olarak tanımlı değil! "
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env variable olarak tanımlı değil! "
                   "Sunucu panelinden ekle, yoksa Telegram mesajı gitmez.")
     send_telegram(
         "✅ Tarayıcı başladı.\n"
