@@ -122,6 +122,11 @@ def format_alert(hit: dict) -> str:
 
 def main():
     print("Tarayıcı başladı. Kriterler: 15dk mum | Günlük Hacim >= $3M | 15dk Değişim >= %7")
+    send_telegram(
+        "✅ Tarayıcı başladı.\n"
+        f"Kriterler: Günlük Hacim >= ${VOLUME_USDT_MIN:,.0f} | 15dk Değişim >= %{PRICE_CHANGE_MIN}\n"
+        "Herhangi bir değişiklik yok, sadece bu 2 kriter aktif."
+    )
     already_alerted = set()
 
     while True:
