@@ -2,10 +2,24 @@
 Basit Tarayıcı Bot - SADECE 3 KRİTER:
 1) 15 dakikalık mum
 2) GÜNLÜK (24 saatlik) hacim >= 3,000,000 USDT
-3) Son 15dk fiyat değişimi >= %7 (mutlak değer, yani hem yükseliş hem düşüş)
+3) AÇIK (henüz kapanmamış) 15dk mumun o ana kadarki değişimi >= %7
+   (mutlak değer, yani hem yükseliş hem düşüş)
 
 Başka HİÇBİR filtre yok (RSI, SMA, trend, breakout vs. YOK).
 Binance Futures üzerinde tüm USDT paritelerini tarar.
+
+────────────────────────────────────────────────────────────────────
+DUZELTME: eskiden SADECE KAPANMIŞ mum kontrol ediliyordu (r[-2]).
+Bu, fiyatın mum İÇİNDE %7'yi geçip mum kapanmadan geri çekildiği
+durumları TAMAMEN KAÇIRIYORDU - kapanışta %7'nin altında kaldığı
+için hiç sinyal gelmiyordu. Şimdi HENÜZ OLUŞMAKTA OLAN mum (r[-1])
+kontrol ediliyor; eşik ilk geçildiği anda, mum kapanmasını
+beklemeden sinyal geliyor.
+
+Ayrıca artık coinler PARALEL (ThreadPoolExecutor) taranıyor - eskiden
+tek tek sıralı tarama ~400 coin için tek başına 30-60 saniye
+sürüyordu, bu da "canlı" sinyal için çok yavaştı.
+────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -13,6 +27,7 @@ import time
 import logging
 import requests
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -22,8 +37,9 @@ log = logging.getLogger(__name__)
 # koda hardcode edilmiyor - sunucu panelinde TELEGRAM_TOKEN ve
 # TELEGRAM_CHAT_ID olarak tanimla.
 VOLUME_USDT_MIN = float(os.getenv("VOLUME_USDT_MIN", "3000000"))   # minimum GÜNLÜK (24s) hacim ($)
-PRICE_CHANGE_MIN = float(os.getenv("PRICE_CHANGE_MIN", "7.0"))     # minimum %7 hareket (15dk mumda)
-CHECK_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", os.getenv("CHECK_INTERVAL_SEC", "60")))    # kaç saniyede bir tarasın
+PRICE_CHANGE_MIN = float(os.getenv("PRICE_CHANGE_MIN", "7.0"))     # minimum %7 hareket (açık mumda)
+CHECK_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", os.getenv("CHECK_INTERVAL_SEC", "10")))    # kaç saniyede bir tarasın (acik mum icin sik taranmali)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "15"))   # paralel coin tarama sayisi
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MAX_RETRIES = 3
@@ -33,6 +49,8 @@ RETRY_BACKOFF_BASE = 0.5
 BINANCE_FAPI = "https://fapi.binance.com"
 
 session = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS + 5, pool_maxsize=MAX_WORKERS + 10)
+session.mount("https://", _adapter)
 
 
 def _debug_env_check():
@@ -117,33 +135,55 @@ def get_24h_volumes():
         return None
 
 
-def get_last_15m_kline(symbol: str):
-    """Kapanmış son 15 dakikalık mumu döndürür."""
+def get_current_15m_candle(symbol: str):
+    """HENUZ KAPANMAMIS (su an olusmakta olan) 15 dakikalik mumu döndürür.
+    Eskiden r[-2] (kapanmis onceki mum) kullaniliyordu - bu, fiyatin mum
+    icinde esigi gecip mum kapanmadan geri cekildigi durumlari kaciriyordu.
+    Simdi r[-1] (acik/canli mum) kullaniliyor."""
     try:
         r = _get_with_retry(
             f"{BINANCE_FAPI}/fapi/v1/klines",
-            params={"symbol": symbol, "interval": "15m", "limit": 2},
+            params={"symbol": symbol, "interval": "15m", "limit": 1},
             timeout=10,
         )
     except Exception as e:
         log.debug(f"{symbol} kline hata: {e}")
         return None
-    if len(r) < 2:
+    if not r or len(r) < 1:
         return None
-    # Son mum (canli/kapanmamis dahil)
-    kline = r[-1]
+    kline = r[-1]  # su an acik olan mum
+    open_time = int(kline[0])
     open_price = float(kline[1])
     high_price = float(kline[2])
     low_price = float(kline[3])
-    close_price = float(kline[4])
-    volume_base = float(kline[5])
-    quote_volume = float(kline[7])  # USDT cinsinden hacim
+    close_price = float(kline[4])  # "close" alani, kapanmamis mumda GUNCEL fiyattir
+    quote_volume = float(kline[7])
     return {
+        "open_time": open_time,
         "open": open_price,
         "high": high_price,
         "low": low_price,
         "close": close_price,
         "quote_volume": quote_volume,
+    }
+
+
+def _check_symbol(symbol, daily_vol):
+    """Tek bir coin icin: acik mumu ceker, esigi kontrol eder."""
+    k = get_current_15m_candle(symbol)
+    if k is None:
+        return None
+
+    change_pct = (k["close"] - k["open"]) / k["open"] * 100
+    if abs(change_pct) < PRICE_CHANGE_MIN:
+        return None
+
+    return {
+        "symbol": symbol,
+        "window_open_time": k["open_time"],
+        "change_pct": change_pct,
+        "volume_usdt_24h": daily_vol,
+        "close": k["close"],
     }
 
 
@@ -162,30 +202,17 @@ def scan_once():
                   f"tüm {len(symbols)} coin filtrelenmeden taranacak")
         daily_volumes = {s: VOLUME_USDT_MIN for s in symbols}  # hepsi eşiği geçmiş sayılır
 
-    for symbol in symbols:
-        try:
-            daily_vol = daily_volumes.get(symbol, 0.0)
-            if daily_vol < VOLUME_USDT_MIN:
-                continue  # günlük hacim yetersizse mum verisine bile bakma
+    candidates = [s for s in symbols if daily_volumes.get(s, 0.0) >= VOLUME_USDT_MIN]
 
-            k = get_last_15m_kline(symbol)
-            if k is None:
-                continue
-
-            change_pct = (k["high"] - k["low"]) / k["open"] * 100
-
-            if abs(change_pct) < PRICE_CHANGE_MIN:
-                continue
-
-            hits.append({
-                "symbol": symbol,
-                "change_pct": change_pct,
-                "volume_usdt_24h": daily_vol,
-                "close": k["close"],
-            })
-        except Exception as e:
-            log.debug(f"{symbol} hata: {e}")
-        time.sleep(0.05)  # rate limit için küçük bekleme
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_check_symbol, s, daily_volumes.get(s, 0.0)): s for s in candidates}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    hits.append(result)
+            except Exception as e:
+                log.debug(f"{futures[future]} hata: {e}")
 
     return hits
 
@@ -193,7 +220,7 @@ def scan_once():
 def format_alert(hit: dict) -> str:
     direction = "🟢 YÜKSELİŞ" if hit["change_pct"] > 0 else "🔴 DÜŞÜŞ"
     return (
-        f"{direction} | {hit['symbol']}\n"
+        f"{direction} | {hit['symbol']}  (AÇIK MUM - henüz kapanmadı)\n"
         f"15dk Değişim: {hit['change_pct']:.2f}%\n"
         f"Günlük Hacim: ${hit['volume_usdt_24h']:,.0f}\n"
         f"Fiyat: {hit['close']}\n"
@@ -203,34 +230,33 @@ def format_alert(hit: dict) -> str:
 
 def main():
     _debug_env_check()
-    log.info("Tarayıcı başladı. Kriterler: 15dk mum | Günlük Hacim >= $%s | 15dk Değişim >= %%%s"
-              % (f"{VOLUME_USDT_MIN:,.0f}", PRICE_CHANGE_MIN))
+    log.info("Tarayıcı başladı. Kriterler: AÇIK 15dk mum | Günlük Hacim >= $%s | Değişim >= %%%s | Tarama: %ss"
+              % (f"{VOLUME_USDT_MIN:,.0f}", PRICE_CHANGE_MIN, CHECK_INTERVAL_SEC))
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.error("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env variable olarak tanımlı değil! "
                   "Sunucu panelinden ekle, yoksa Telegram mesajı gitmez.")
     send_telegram(
-        "✅ Tarayıcı başladı.\n"
-        f"Kriterler: Günlük Hacim >= ${VOLUME_USDT_MIN:,.0f} | 15dk Değişim >= %{PRICE_CHANGE_MIN}\n"
-        "Herhangi bir değişiklik yok, sadece bu 2 kriter aktif."
+        "✅ Tarayıcı başladı (AÇIK MUM modu).\n"
+        f"Kriterler: Günlük Hacim >= ${VOLUME_USDT_MIN:,.0f} | Değişim >= %{PRICE_CHANGE_MIN}\n"
+        f"Mum kapanmasını beklemeden, eşik geçilir geçilmez sinyal gelir."
     )
-    already_alerted = set()
+    # symbol -> son sinyal verilen pencerenin open_time'i (ayni pencerede tekrar
+    # alarm atmasin, ama pencere degisince yeni sinyal verebilsin diye)
+    alerted_window = {}
 
     while True:
         try:
             hits = scan_once()
             for hit in hits:
-                key = (hit["symbol"], round(hit["change_pct"], 1))
-                if key in already_alerted:
-                    continue
-                already_alerted.add(key)
+                symbol = hit["symbol"]
+                window = hit["window_open_time"]
+                if alerted_window.get(symbol) == window:
+                    continue  # bu pencerede zaten uyarildik
+                alerted_window[symbol] = window
 
                 msg = format_alert(hit)
                 log.info(msg)
                 send_telegram(msg)
-
-            # aynı mumda tekrar alarm atmasın diye set'i belirli aralıkla temizle
-            if len(already_alerted) > 500:
-                already_alerted.clear()
 
         except Exception as e:
             log.error(f"Tarama döngüsü hatası: {e}")
