@@ -130,8 +130,8 @@ def get_last_15m_kline(symbol: str):
         return None
     if len(r) < 2:
         return None
-    # r[-1] genelde henüz kapanmamış olabilir, kapanmış olan bir öncekini alıyoruz
-    kline = r[-2]
+    # Son mum (canli/kapanmamis dahil)
+    kline = r[-1]
     open_price = float(kline[1])
     high_price = float(kline[2])
     low_price = float(kline[3])
@@ -172,7 +172,7 @@ def scan_once():
             if k is None:
                 continue
 
-            change_pct = (k["close"] - k["open"]) / k["open"] * 100
+            change_pct = (k["high"] - k["low"]) / k["open"] * 100
 
             if abs(change_pct) < PRICE_CHANGE_MIN:
                 continue
