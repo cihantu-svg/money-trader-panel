@@ -42,6 +42,40 @@ CFG = {
 
 session = requests.Session()
 
+# ==================== TELEGRAM ====================
+def send_telegram(msg: str, csv_path: str = None):
+    tok = os.getenv('TELEGRAM_BOT_TOKEN', '')
+    cid = os.getenv('TELEGRAM_CHAT_ID', '')
+    if not tok or not cid:
+        log.warning('Telegram token/chat_id bos - mesaj atilmadi')
+        return False
+    try:
+        r = session.post(
+            f"https://api.telegram.org/bot{tok}/sendMessage",
+            data={"chat_id": cid, "text": msg},
+            timeout=10
+        )
+        if r.status_code != 200:
+            log.error(f"TG mesaj hatasi: {r.text[:200]}")
+            return False
+        if csv_path and os.path.exists(csv_path):
+            with open(csv_path, 'rb') as f:
+                r2 = session.post(
+                    f"https://api.telegram.org/bot{tok}/sendDocument",
+                    files={"document": f},
+                    data={"chat_id": cid},
+                    timeout=60
+                )
+                if r2.status_code == 200:
+                    log.info("CSV Telegram'a gonderildi")
+                else:
+                    log.error(f"TG CSV hatasi: {r2.text[:200]}")
+        return True
+    except Exception as e:
+        log.error(f"TG hata: {e}")
+        return False
+
+
 # ==================== API ====================
 def api_get(endpoint, params=None, retries=0):
     try:
@@ -121,7 +155,7 @@ def find_events(df15):
     return events
 
 def check_fib50(df15, event):
-    """Olaydan sonraki mumlarda fib 0.50 kirildi mi?"""
+    """Olaydan sonraki mumlarda fib 0.50 kirildi mi? Kirilinca TP/SL takip et."""
     if df15 is None or len(df15) < event['idx'] + 2:
         return None
 
@@ -130,37 +164,83 @@ def check_fib50(df15, event):
     limit = min(CFG['FIB_WINDOW'], len(after))
     window = after.iloc[:limit]
 
-    if event['direction'] == 'LONG':
-        # LONG olay: fib 0.50 altina dusus aranir
-        for i in range(len(window)):
-            if window['low'].iloc[i] <= fib50:
-                return {
-                    'fib50': fib50,
-                    'break_price': float(window['low'].iloc[i]),
-                    'break_time': int(window['close_time'].iloc[i]),
-                    'mum_index': i + 1,
-                    'kirildi': True,
-                }
-    else:
-        # SHORT olay: fib 0.50 ustune cikis aranir
-        for i in range(len(window)):
-            if window['high'].iloc[i] >= fib50:
-                return {
-                    'fib50': fib50,
-                    'break_price': float(window['high'].iloc[i]),
-                    'break_time': int(window['close_time'].iloc[i]),
-                    'mum_index': i + 1,
-                    'kirildi': True,
-                }
-
-    # Kirilma yok
-    return {
+    result = {
         'fib50': fib50,
         'break_price': None,
         'break_time': None,
         'mum_index': None,
         'kirildi': False,
+        'sl3_hit': False,
+        'tp6_hit': False,
+        'tp10_hit': False,
+        'tp15_hit': False,
+        'first_target': None,
     }
+
+    if event['direction'] == 'LONG':
+        # LONG: fib altina dusus = kirilma
+        for i in range(len(window)):
+            if window['low'].iloc[i] <= fib50 and not result['kirildi']:
+                result['kirildi'] = True
+                result['break_price'] = float(window['low'].iloc[i])
+                result['break_time'] = int(window['close_time'].iloc[i])
+                result['mum_index'] = i + 1
+
+            if result['kirildi']:
+                # Kirilma sonrasi TP/SL takip
+                high = float(window['high'].iloc[i])
+                low = float(window['low'].iloc[i])
+                entry = result['break_price']
+                if entry:
+                    if not result['sl3_hit'] and low <= entry * 0.97:
+                        result['sl3_hit'] = True
+                        if not result['first_target']:
+                            result['first_target'] = 'SL3'
+                    if not result['tp6_hit'] and high >= entry * 1.06:
+                        result['tp6_hit'] = True
+                        if not result['first_target']:
+                            result['first_target'] = 'TP6'
+                    if not result['tp10_hit'] and high >= entry * 1.10:
+                        result['tp10_hit'] = True
+                        if not result['first_target']:
+                            result['first_target'] = 'TP10'
+                    if not result['tp15_hit'] and high >= entry * 1.15:
+                        result['tp15_hit'] = True
+                        if not result['first_target']:
+                            result['first_target'] = 'TP15'
+    else:
+        # SHORT: fib ustune cikis = kirilma
+        for i in range(len(window)):
+            if window['high'].iloc[i] >= fib50 and not result['kirildi']:
+                result['kirildi'] = True
+                result['break_price'] = float(window['high'].iloc[i])
+                result['break_time'] = int(window['close_time'].iloc[i])
+                result['mum_index'] = i + 1
+
+            if result['kirildi']:
+                # Kirilma sonrasi TP/SL takip
+                high = float(window['high'].iloc[i])
+                low = float(window['low'].iloc[i])
+                entry = result['break_price']
+                if entry:
+                    if not result['sl3_hit'] and high >= entry * 1.03:
+                        result['sl3_hit'] = True
+                        if not result['first_target']:
+                            result['first_target'] = 'SL3'
+                    if not result['tp6_hit'] and low <= entry * 0.94:
+                        result['tp6_hit'] = True
+                        if not result['first_target']:
+                            result['first_target'] = 'TP6'
+                    if not result['tp10_hit'] and low <= entry * 0.90:
+                        result['tp10_hit'] = True
+                        if not result['first_target']:
+                            result['first_target'] = 'TP10'
+                    if not result['tp15_hit'] and low <= entry * 0.85:
+                        result['tp15_hit'] = True
+                        if not result['first_target']:
+                            result['first_target'] = 'TP15'
+
+    return result
 
 # ==================== BACKTEST ====================
 def run_backtest():
@@ -215,6 +295,11 @@ def run_backtest():
                     'break_mum': fib['mum_index'],
                     'break_time': datetime.fromtimestamp(fib['break_time'] / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M') if fib['break_time'] else None,
                     'break_price': round(fib['break_price'], 6) if fib['break_price'] else None,
+                    'sl3': fib['sl3_hit'],
+                    'tp6': fib['tp6_hit'],
+                    'tp10': fib['tp10_hit'],
+                    'tp15': fib['tp15_hit'],
+                    'first_target': fib['first_target'],
                 })
 
         except Exception as e:
@@ -244,6 +329,13 @@ def run_backtest():
         print(f"Toplam kirilma orani: {total_kirildi}/{total_events} = %{total_kirildi/total_events*100:.1f}")
     print(f"Hata: {stats['err']}")
     print("=" * 60)
+
+    # Telegram
+    total_events = stats['long_events'] + stats['short_events']
+    total_kirildi = stats['long_kirildi'] + stats['short_kirildi']
+    kirilma = f"%{total_kirildi/total_events*100:.1f}" if total_events > 0 else "N/A"
+    msg = "FIB 0.50 Backtest Sonuc\n" +           f"LONG: {stats['long_events']} olay | Kirildi: {stats['long_kirildi']}\n" +           f"SHORT: {stats['short_events']} olay | Kirildi: {stats['short_kirildi']}\n" +           f"Toplam kirilma: {total_kirildi}/{total_events} = {kirilma}\n" +           f"Hata: {stats['err']}"
+    send_telegram(msg, CFG['CSV_OUTPUT'])
 
     return results
 
