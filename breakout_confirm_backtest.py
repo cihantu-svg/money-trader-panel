@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FIB 0.50 KIRILIM BACKTEST
+FIB 0.50 KIRILIM BACKTESt
 
 Senaryo:
   1. 15dk kapanmis mumda (high-low)/open >= %7 (yukari veya asagi)
