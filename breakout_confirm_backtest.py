@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-%7 KIRILIM + 1dk ONAY BACKTEST
+FIB 0.50 KIRILIM BACKTEST
 
 Senaryo:
-  1. 15dk mumda govde (close-open)/open >= %7  -> LONG olay
-     15dk mumda govde <= -%7                     -> SHORT olay
-  2. Olaydan sonraki 1dk veride (30 mum / 30dk icinde):
-     LONG:  olay close'unun %2 USTUNE cikti mi?
-     SHORT: olay close'unun %2 ALTINA dustu mu?
-  3. Onay gelirse -> sinyal (entry = onay mumunun close'u)
-     Onay gelmezse -> elenir
+  1. 15dk kapanmis mumda (high-low)/open >= %7 (yukari veya asagi)
+  2. 24h hacim >= 3M USD
+  3. Olay mumunun fib 0.50 = (high + low) / 2
+  4. Sonraki 30 mum (7.5 saat) icinde:
+     LONG olay (%7 yukari): fiyat fib 0.50'nin ALTINA duserse -> kirildi
+     SHORT olay (%7 asagi): fiyat fib 0.50'nin USTUNE cikarsa -> kirildi
+  5. Kirilma zamani, mum sirasi, fiyat kaydet
 
 Cikti: CSV + konsol ozeti
 """
 
 import time
 import os
-import sys
 import logging
-import csv
 from datetime import datetime, timezone
 import requests
 import numpy as np
@@ -32,12 +30,11 @@ log = logging.getLogger(__name__)
 CFG = {
     'API_BASE': 'https://fapi.binance.com',
     'MAX_COINS': 300,
-    'BODY_PCT': 7.0,          # %7 esik
-    'CONFIRM_PCT': 2.0,       # onay icin %2
-    'CONFIRM_CANDLES': 30,    # 30 mum (30dk) icinde onay ara
+    'BODY_PCT': 7.0,          # %7 esik (mumun tamami)
+    'FIB_WINDOW': 30,         # sonraki 30 mum (7.5 saat)
     'MIN_VOLUME_24H': 3_000_000,
-    'DAYS_BACK': 20,
-    'CSV_OUTPUT': 'breakout_confirm_backtest.csv',
+    'DAYS_BACK': 15,
+    'CSV_OUTPUT': 'fib50_backtest.csv',
     'API_DELAY': 0.25,
     'RETRY_MAX': 3,
     'RETRY_BASE': 1.0,
@@ -100,77 +97,86 @@ def fetch_klines(symbol, interval, start_ms, end_ms):
 
 # ==================== SINYAL MOTORU ====================
 def find_events(df15):
-    """15dk'da %7+ veya %7- olaylari bul"""
+    """15dk kapanmis mumda (high-low)/open >= %7 olanlari bul."""
     if df15 is None or len(df15) < 5:
         return []
     df = df15.copy()
-    df['body_pct'] = (df['close'] - df['open']) / df['open'] * 100
+    df['mum_pct'] = (df['high'] - df['low']) / df['open'] * 100
     events = []
-    for i in range(len(df)):
-        bp = df['body_pct'].iloc[i]
-        if bp >= CFG['BODY_PCT']:
-            events.append({'idx': i, 'direction': 'LONG', 'close': float(df['close'].iloc[i]),
-                           'open_time': int(df['open_time'].iloc[i]),
-                           'close_time': int(df['close_time'].iloc[i]), 'pct': float(bp)})
-        elif bp <= -CFG['BODY_PCT']:
-            events.append({'idx': i, 'direction': 'SHORT', 'close': float(df['close'].iloc[i]),
-                           'open_time': int(df['open_time'].iloc[i]),
-                           'close_time': int(df['close_time'].iloc[i]), 'pct': float(bp)})
+    for i in range(len(df) - 1):  # son mum haric (kapanmamis olabilir)
+        mp = df['mum_pct'].iloc[i]
+        if mp >= CFG['BODY_PCT']:
+            direction = 'LONG' if df['close'].iloc[i] >= df['open'].iloc[i] else 'SHORT'
+            events.append({
+                'idx': i,
+                'direction': direction,
+                'open': float(df['open'].iloc[i]),
+                'high': float(df['high'].iloc[i]),
+                'low': float(df['low'].iloc[i]),
+                'close': float(df['close'].iloc[i]),
+                'open_time': int(df['open_time'].iloc[i]),
+                'close_time': int(df['close_time'].iloc[i]),
+                'pct': float(mp),
+            })
     return events
 
-def check_confirm(df1m, event):
-    """Olaydan sonraki 30 mumda %2 onay var mi?"""
-    if df1m is None or len(df1m) < 2:
-        return None
-    after = df1m[df1m['open_time'] > event['close_time']].copy().reset_index(drop=True)
-    if len(after) == 0:
+def check_fib50(df15, event):
+    """Olaydan sonraki mumlarda fib 0.50 kirildi mi?"""
+    if df15 is None or len(df15) < event['idx'] + 2:
         return None
 
-    limit = min(CFG['CONFIRM_CANDLES'], len(after))
+    fib50 = (event['high'] + event['low']) / 2
+    after = df15.iloc[event['idx'] + 1:].copy().reset_index(drop=True)
+    limit = min(CFG['FIB_WINDOW'], len(after))
     window = after.iloc[:limit]
 
-    event_close = event['close']
-
     if event['direction'] == 'LONG':
-        # %2 ustune cikti mi?
-        target = event_close * (1 + CFG['CONFIRM_PCT'] / 100)
+        # LONG olay: fib 0.50 altina dusus aranir
         for i in range(len(window)):
-            if window['high'].iloc[i] >= target:
+            if window['low'].iloc[i] <= fib50:
                 return {
-                    'entry_price': float(window['close'].iloc[i]),
-                    'entry_time': int(window['close_time'].iloc[i]),
-                    'confirm_high': float(window['high'].iloc[i]),
+                    'fib50': fib50,
+                    'break_price': float(window['low'].iloc[i]),
+                    'break_time': int(window['close_time'].iloc[i]),
                     'mum_index': i + 1,
+                    'kirildi': True,
                 }
     else:
-        # %2 altina dustu mu?
-        target = event_close * (1 - CFG['CONFIRM_PCT'] / 100)
+        # SHORT olay: fib 0.50 ustune cikis aranir
         for i in range(len(window)):
-            if window['low'].iloc[i] <= target:
+            if window['high'].iloc[i] >= fib50:
                 return {
-                    'entry_price': float(window['close'].iloc[i]),
-                    'entry_time': int(window['close_time'].iloc[i]),
-                    'confirm_low': float(window['low'].iloc[i]),
+                    'fib50': fib50,
+                    'break_price': float(window['high'].iloc[i]),
+                    'break_time': int(window['close_time'].iloc[i]),
                     'mum_index': i + 1,
+                    'kirildi': True,
                 }
-    return None
+
+    # Kirilma yok
+    return {
+        'fib50': fib50,
+        'break_price': None,
+        'break_time': None,
+        'mum_index': None,
+        'kirildi': False,
+    }
 
 # ==================== BACKTEST ====================
 def run_backtest():
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - CFG['DAYS_BACK'] * 24 * 60 * 60 * 1000
 
-    log.info(f"Backtest: son {CFG['DAYS_BACK']} gun | %7 esik | %2 onay | 30 mum pencere")
+    log.info(f"Backtest: son {CFG['DAYS_BACK']} gun | fib 0.50 kirilim | {CFG['FIB_WINDOW']} mum pencere")
 
     symbols = get_symbols()
     log.info(f"{len(symbols)} sembol bulundu")
 
     results = []
-    stats = {'long_events': 0, 'short_events': 0, 'long_confirmed': 0, 'short_confirmed': 0, 'err': 0}
+    stats = {'long_events': 0, 'short_events': 0, 'long_kirildi': 0, 'short_kirildi': 0, 'err': 0}
 
     for idx, sym in enumerate(symbols, 1):
         try:
-            # 15dk verisi
             df15 = fetch_klines(sym, '15m', start_ms, now_ms)
             if df15 is None or len(df15) < 10:
                 continue
@@ -185,62 +191,57 @@ def run_backtest():
                 else:
                     stats['short_events'] += 1
 
-            # Olay olan coinlere 1dk verisi cek (olay zamani +- 1 saat yeterli)
-            if events:
-                first_event = min(e['close_time'] for e in events)
-                last_event = max(e['close_time'] for e in events)
-                fetch_start = first_event - 60 * 60 * 1000  # 1 saat once
-                fetch_end = last_event + 60 * 60 * 1000     # 1 saat sonra
-                df1m = fetch_klines(sym, '1m', fetch_start, fetch_end)
-
-                if df1m is None:
+                fib = check_fib50(df15, ev)
+                if fib is None:
                     continue
 
-                for ev in events:
-                    confirm = check_confirm(df1m, ev)
-                    if confirm:
-                        if ev['direction'] == 'LONG':
-                            stats['long_confirmed'] += 1
-                        else:
-                            stats['short_confirmed'] += 1
+                if fib['kirildi']:
+                    if ev['direction'] == 'LONG':
+                        stats['long_kirildi'] += 1
+                    else:
+                        stats['short_kirildi'] += 1
 
-                        results.append({
-                            'symbol': sym,
-                            'direction': ev['direction'],
-                            'event_time': datetime.fromtimestamp(ev['close_time'] / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M'),
-                            'event_pct': round(ev['pct'], 2),
-                            'event_close': round(ev['close'], 6),
-                            'entry_time': datetime.fromtimestamp(confirm['entry_time'] / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M'),
-                            'entry_price': round(confirm['entry_price'], 6),
-                            'confirm_mum': confirm['mum_index'],
-                        })
+                results.append({
+                    'symbol': sym,
+                    'direction': ev['direction'],
+                    'event_time': datetime.fromtimestamp(ev['close_time'] / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M'),
+                    'event_pct': round(ev['pct'], 2),
+                    'event_open': round(ev['open'], 6),
+                    'event_high': round(ev['high'], 6),
+                    'event_low': round(ev['low'], 6),
+                    'event_close': round(ev['close'], 6),
+                    'fib50': round(fib['fib50'], 6),
+                    'kirildi': fib['kirildi'],
+                    'break_mum': fib['mum_index'],
+                    'break_time': datetime.fromtimestamp(fib['break_time'] / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M') if fib['break_time'] else None,
+                    'break_price': round(fib['break_price'], 6) if fib['break_price'] else None,
+                })
 
         except Exception as e:
             stats['err'] += 1
             log.error(f"Hata {sym}: {e}")
 
         if idx % 25 == 0:
-            log.info(f"[{idx}/{len(symbols)}] tamamlandi | Onaylanan: {len(results)}")
+            log.info(f"[{idx}/{len(symbols)}] tamamlandi | Olay: {len(results)}")
 
-    # CSV kaydet
     if results:
         df = pd.DataFrame(results)
         df.to_csv(CFG['CSV_OUTPUT'], index=False, encoding='utf-8-sig')
-        log.info(f"CSV kaydedildi: {CFG['CSV_OUTPUT']} | {len(results)} sinyal")
+        log.info(f"CSV kaydedildi: {CFG['CSV_OUTPUT']} | {len(results)} olay")
     else:
         log.warning("Sonuc bulunamadi")
 
-    # Ozet
+    total_events = stats['long_events'] + stats['short_events']
+    total_kirildi = stats['long_kirildi'] + stats['short_kirildi']
+
     print("\n" + "=" * 60)
-    print("BACKTEST SONUC")
+    print("FIB 0.50 KIRILIM BACKTEST SONUC")
     print("=" * 60)
     print(f"Taranan coin: {idx}")
-    print(f"LONG olay: {stats['long_events']} | Onay: {stats['long_confirmed']}")
-    print(f"SHORT olay: {stats['short_events']} | Onay: {stats['short_confirmed']}")
-    total_events = stats['long_events'] + stats['short_events']
-    total_confirmed = stats['long_confirmed'] + stats['short_confirmed']
+    print(f"LONG olay: {stats['long_events']} | Kirildi: {stats['long_kirildi']}")
+    print(f"SHORT olay: {stats['short_events']} | Kirildi: {stats['short_kirildi']}")
     if total_events > 0:
-        print(f"Onay orani: {total_confirmed}/{total_events} = %{total_confirmed/total_events*100:.1f}")
+        print(f"Toplam kirilma orani: {total_kirildi}/{total_events} = %{total_kirildi/total_events*100:.1f}")
     print(f"Hata: {stats['err']}")
     print("=" * 60)
 
@@ -249,6 +250,6 @@ def run_backtest():
 # ==================== MAIN ====================
 if __name__ == '__main__':
     print("=" * 60)
-    print("%7 KIRILIM + 1dk %2 ONAY BACKTEST")
+    print("FIB 0.50 KIRILIM BACKTEST")
     print("=" * 60)
     run_backtest()
