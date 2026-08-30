@@ -9,38 +9,16 @@ Başka HİÇBİR filtre yok (RSI, SMA, trend, breakout vs. YOK).
 Binance Futures üzerinde tüm USDT paritelerini tarar.
 
 ────────────────────────────────────────────────────────────────────
-DUZELTME 1 (onceki): eskiden SADECE KAPANMIŞ mum kontrol ediliyordu.
-Şimdi HENÜZ OLUŞMAKTA OLAN mum (açık mum) kontrol ediliyor.
+DUZELTME: eskiden SADECE KAPANMIŞ mum kontrol ediliyordu (r[-2]).
+Bu, fiyatın mum İÇİNDE %7'yi geçip mum kapanmadan geri çekildiği
+durumları TAMAMEN KAÇIRIYORDU - kapanışta %7'nin altında kaldığı
+için hiç sinyal gelmiyordu. Şimdi HENÜZ OLUŞMAKTA OLAN mum (r[-1])
+kontrol ediliyor; eşik ilk geçildiği anda, mum kapanmasını
+beklemeden sinyal geliyor.
 
-DUZELTME 2 (BU SURUM) - "bazı coinler kaçıyor" sorunu:
-İki gercek sebep bulundu:
-
-  a) Hata loglari log.debug() ile yaziliyordu ama logger INFO
-     seviyesinde kuruluydu - yani basarisiz coin istekleri HİÇ
-     GORUNMUYORDU. Simdi log.warning() kullaniliyor ve her turda
-     kac coin'in basarisiz oldugu ozetle raporlaniyor.
-
-  b) ASIL SEBEP: eskiden her coin icin AYRI bir /fapi/v1/klines
-     istegi atiliyordu, 10 saniyede bir, ~400 coin icin. Bu dakikada
-     2400+ istek demekti - Binance Futures agirlik limitine (dakikada
-     ~2400) TAM SINIRDA/USTUNDE. Limit asilinca 429/418 donuyor,
-     retry'ler tukenince o coin sessizce (yukaridaki a sebebiyle
-     GORUNMEDEN) atlaniyordu. "Bazi coinlerin es gecilmesi" tam olarak
-     boyle rastgele/araliksiz bir desenle ortaya cikar.
-
-     COZUM: Artik her coin icin ayri istek YOK. Binance'in TEK istekte
-     TUM sembollerin GUNCEL fiyatini donduren /fapi/v1/ticker/price
-     endpoint'i kullaniliyor (tek cagri, tum coinler). Her 15dk
-     penceresinin "acilis fiyati", o pencerede ilk gorulen bulk fiyat
-     olarak yerelde (hafizada) saklaniyor - boylece degisim yuzdesi
-     sonraki her turda ekstra istek atmadan hesaplanabiliyor.
-
-     ONEMLI VARSAYIM: pencere "acilisi" olarak GERCEK 15dk mum
-     acilisi degil, o pencerede ILK GOZLEMLENEN bulk fiyat kullanilir
-     (en fazla CHECK_INTERVAL_SEC kadar gecikmeli olabilir - orn. 5sn
-     tarama araliginda en fazla 5sn'lik sapma). %7 gibi buyuk bir
-     esik icin bu sapma pratikte onemsizdir, ama bilinmesi gereken bir
-     yaklastirmadir.
+Ayrıca artık coinler PARALEL (ThreadPoolExecutor) taranıyor - eskiden
+tek tek sıralı tarama ~400 coin için tek başına 30-60 saniye
+sürüyordu, bu da "canlı" sinyal için çok yavaştı.
 ────────────────────────────────────────────────────────────────────
 """
 
@@ -49,6 +27,7 @@ import time
 import logging
 import requests
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
@@ -59,24 +38,19 @@ log = logging.getLogger(__name__)
 # TELEGRAM_CHAT_ID olarak tanimla.
 VOLUME_USDT_MIN = float(os.getenv("VOLUME_USDT_MIN", "3000000"))   # minimum GÜNLÜK (24s) hacim ($)
 PRICE_CHANGE_MIN = float(os.getenv("PRICE_CHANGE_MIN", "7.0"))     # minimum %7 hareket (açık mumda)
-CHECK_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", os.getenv("CHECK_INTERVAL_SEC", "5")))    # kaç saniyede bir tarasın
+CHECK_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", os.getenv("CHECK_INTERVAL_SEC", "10")))    # kaç saniyede bir tarasın (acik mum icin sik taranmali)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "15"))   # paralel coin tarama sayisi
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 0.5
-WINDOW_MS = 15 * 60 * 1000
 # ==================================
 
 BINANCE_FAPI = "https://fapi.binance.com"
 
 session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS + 5, pool_maxsize=MAX_WORKERS + 10)
 session.mount("https://", _adapter)
-
-# symbol -> (window_start_ms, o pencerede ilk gozlemlenen fiyat)
-# artik her coin icin ayri istek atilmadigindan, "acilis" fiyati burada
-# yerelde takip edilir.
-_window_open_price = {}
 
 
 def _debug_env_check():
@@ -97,65 +71,23 @@ def _debug_env_check():
 
 
 def _get_with_retry(url, params=None, timeout=15):
-    """Gecici ag/API hatalarinda (429/5xx/timeout) otomatik tekrar dener.
-
-    HTTP 418 ozel durumdur: Binance'de bu, IP'nin GECICI OLARAK BANLANDIGI
-    anlamina gelir (429'u tekrar tekrar gormezden gelince tetiklenir).
-    Bu bir "az bekle tekrar dene" durumu DEGILDIR - ban suresi genelde
-    dakikalar (bazen saatler) surer ve ban aktifken tekrar istek atmak
-    BANI DAHA DA UZATABILIR. Bu yuzden 418 geldiginde MAX_RETRIES'a
-    tabi degildir - Binance'in Retry-After header'inda belirttigi sureye
-    TAM olarak uyulup o kadar beklenir, sonra sayac sifirlanip taze
-    baslanir."""
-    attempt = 0
-    while True:
+    """Gecici ag/API hatalarinda (429/5xx/timeout) otomatik tekrar dener,
+    tek seferlik hatalarda taramanin tamamen bos donmesini engeller."""
+    last_exc = None
+    for attempt in range(MAX_RETRIES + 1):
         try:
             r = session.get(url, params=params, timeout=timeout)
-        except requests.exceptions.RequestException as e:
-            attempt += 1
-            if attempt > MAX_RETRIES:
-                raise e
-            time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
-            continue
-
-        if r.status_code == 200:
-            return r.json()
-
-        if r.status_code == 418:
-            retry_after = r.headers.get('Retry-After')
-            try:
-                wait = float(retry_after) if retry_after else 60.0
-            except ValueError:
-                wait = 60.0
-            log.error(f"HTTP 418 - IP GECICI BANLANDI ({url}). "
-                      f"Ban suresine tam uyularak {wait:.0f} saniye bekleniyor "
-                      f"(bu sure icinde HICBIR istek atilmiyor)...")
-            time.sleep(wait + 2)  # +2sn guvenlik payi
-            attempt = 0  # ban gectikten sonra sayaci sifirla
-            continue
-
-        if r.status_code == 429:
+            if r.status_code == 200:
+                return r.json()
             wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-            retry_after = r.headers.get('Retry-After')
-            if retry_after:
-                try:
-                    wait = max(wait, float(retry_after))
-                except ValueError:
-                    pass
-            attempt += 1
-            log.warning(f"HTTP 429 ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt})")
+            log.warning(f"HTTP {r.status_code} ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt + 1})")
             time.sleep(wait)
-            if attempt > MAX_RETRIES:
-                raise Exception("HTTP 429 - retry limiti asildi")
-            continue
-
-        # diger hata kodlari (5xx vs.)
-        attempt += 1
-        wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-        log.warning(f"HTTP {r.status_code} ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt})")
-        time.sleep(wait)
-        if attempt > MAX_RETRIES:
-            raise Exception(f"HTTP {r.status_code}")
+            last_exc = Exception(f"HTTP {r.status_code}")
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            time.sleep(wait)
+    raise last_exc if last_exc else Exception("Bilinmeyen istek hatasi")
 
 
 def send_telegram(msg: str):
@@ -203,21 +135,56 @@ def get_24h_volumes():
         return None
 
 
-def get_all_prices():
-    """TUM sembollerin GUNCEL fiyatini TEK istekte doner (bulk).
-    Kritik: boylece her coin icin ayri ayri kline istegi atmaya gerek
-    kalmiyor - hem cok daha hizli hem de rate-limit riskini ortadan
-    kaldiriyor. Hata durumunda None doner."""
+def get_current_15m_candle(symbol: str):
+    """HENUZ KAPANMAMIS (su an olusmakta olan) 15 dakikalik mumu döndürür.
+    Eskiden r[-2] (kapanmis onceki mum) kullaniliyordu - bu, fiyatin mum
+    icinde esigi gecip mum kapanmadan geri cekildigi durumlari kaciriyordu.
+    Simdi r[-1] (acik/canli mum) kullaniliyor."""
     try:
-        data = _get_with_retry(f"{BINANCE_FAPI}/fapi/v1/ticker/price", timeout=15)
-        prices = {item["symbol"]: float(item["price"]) for item in data}
-        if not prices:
-            log.error("ticker/price API bos veri döndürdü")
-            return None
-        return prices
+        r = _get_with_retry(
+            f"{BINANCE_FAPI}/fapi/v1/klines",
+            params={"symbol": symbol, "interval": "15m", "limit": 1},
+            timeout=10,
+        )
     except Exception as e:
-        log.error(f"get_all_prices hata (fiyat verisi ALINAMADI): {e}")
+        log.debug(f"{symbol} kline hata: {e}")
         return None
+    if not r or len(r) < 1:
+        return None
+    kline = r[-1]  # su an acik olan mum
+    open_time = int(kline[0])
+    open_price = float(kline[1])
+    high_price = float(kline[2])
+    low_price = float(kline[3])
+    close_price = float(kline[4])  # "close" alani, kapanmamis mumda GUNCEL fiyattir
+    quote_volume = float(kline[7])
+    return {
+        "open_time": open_time,
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+        "quote_volume": quote_volume,
+    }
+
+
+def _check_symbol(symbol, daily_vol):
+    """Tek bir coin icin: acik mumu ceker, esigi kontrol eder."""
+    k = get_current_15m_candle(symbol)
+    if k is None:
+        return None
+
+    change_pct = (k["close"] - k["open"]) / k["open"] * 100
+    if abs(change_pct) < PRICE_CHANGE_MIN:
+        return None
+
+    return {
+        "symbol": symbol,
+        "window_open_time": k["open_time"],
+        "change_pct": change_pct,
+        "volume_usdt_24h": daily_vol,
+        "close": k["close"],
+    }
 
 
 def scan_once():
@@ -229,59 +196,23 @@ def scan_once():
 
     daily_volumes = get_24h_volumes()  # tek seferde tüm sembollerin günlük hacmi
     if daily_volumes is None:
+        # Hacim verisi çekilemedi - tüm coinleri elemek yerine bu turda
+        # hacim filtresini atla, tüm semboller taransın.
         log.error(f"24h hacim verisi alınamadı - bu turda hacim filtresi ATLANIYOR, "
                   f"tüm {len(symbols)} coin filtrelenmeden taranacak")
-        daily_volumes = {s: VOLUME_USDT_MIN for s in symbols}
+        daily_volumes = {s: VOLUME_USDT_MIN for s in symbols}  # hepsi eşiği geçmiş sayılır
 
-    candidates = set(s for s in symbols if daily_volumes.get(s, 0.0) >= VOLUME_USDT_MIN)
+    candidates = [s for s in symbols if daily_volumes.get(s, 0.0) >= VOLUME_USDT_MIN]
 
-    prices = get_all_prices()
-    if prices is None:
-        log.error("Fiyat verisi alınamadı (ticker/price) - bu turu atlıyorum")
-        return hits
-
-    now_ms = int(time.time() * 1000)
-    current_window_start = (now_ms // WINDOW_MS) * WINDOW_MS
-
-    missing_price = 0
-    for symbol in candidates:
-        price = prices.get(symbol)
-        if price is None:
-            missing_price += 1
-            continue
-
-        prev = _window_open_price.get(symbol)
-        if prev is None or prev[0] != current_window_start:
-            # yeni pencere basladi (ya da bu coini ilk kez goruyoruz) -
-            # acilis fiyati olarak bu ilk gozlemi kaydet, bu turda
-            # henuz karsilastirma yapilmaz
-            _window_open_price[symbol] = (current_window_start, price)
-            continue
-
-        open_price = prev[1]
-        if open_price == 0:
-            continue
-        change_pct = (price - open_price) / open_price * 100
-        if abs(change_pct) < PRICE_CHANGE_MIN:
-            continue
-
-        hits.append({
-            "symbol": symbol,
-            "window_open_time": current_window_start,
-            "change_pct": change_pct,
-            "volume_usdt_24h": daily_volumes.get(symbol, 0.0),
-            "close": price,
-        })
-
-    if missing_price:
-        log.warning(f"{missing_price} coin icin fiyat verisi bulunamadi (ticker/price listesinde yoktu)")
-
-    # eski pencerelere ait kayitlari temizle (bellek sismesin diye) -
-    # 2+ pencere (30dk+) once kalmis kayitlar artik kullanilmayacaktir
-    if _window_open_price:
-        very_stale = [s for s, (w, _) in _window_open_price.items() if current_window_start - w >= 2 * WINDOW_MS]
-        for s in very_stale:
-            del _window_open_price[s]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(_check_symbol, s, daily_volumes.get(s, 0.0)): s for s in candidates}
+        for future in as_completed(futures):
+            try:
+                result = future.result()
+                if result is not None:
+                    hits.append(result)
+            except Exception as e:
+                log.debug(f"{futures[future]} hata: {e}")
 
     return hits
 
@@ -305,10 +236,9 @@ def main():
         log.error("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env variable olarak tanımlı değil! "
                   "Sunucu panelinden ekle, yoksa Telegram mesajı gitmez.")
     send_telegram(
-        "✅ Tarayıcı başladı (AÇIK MUM + TEK-İSTEK/bulk fiyat modu).\n"
+        "✅ Tarayıcı başladı (AÇIK MUM modu).\n"
         f"Kriterler: Günlük Hacim >= ${VOLUME_USDT_MIN:,.0f} | Değişim >= %{PRICE_CHANGE_MIN}\n"
-        f"Mum kapanmasını beklemeden, eşik geçilir geçilmez sinyal gelir. "
-        f"Artık coin başına ayrı istek atılmıyor - rate-limit riski ortadan kalktı."
+        f"Mum kapanmasını beklemeden, eşik geçilir geçilmez sinyal gelir."
     )
     # symbol -> son sinyal verilen pencerenin open_time'i (ayni pencerede tekrar
     # alarm atmasin, ama pencere degisince yeni sinyal verebilsin diye)
