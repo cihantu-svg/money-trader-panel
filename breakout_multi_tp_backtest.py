@@ -22,18 +22,23 @@ A) TEST EDILMIS SEVIYE SKORU
    %1.0 tolerans, 3 dokunus) makul bir baslangic noktasi ama kesin dogru
    degil; sonuclara bakip ayarlanabilir.
 
-B) TP/SL SIMULASYONU
-   Onay geldikten sonra (entry = onay mumunun close'u), STOP_LOSS_PCT (%5)
-   ve TAKE_PROFIT_PCT (%10) ile 1dk veride ileri dogru TP/SL takibi yapilir
-   (ayni mumda ikisi de tetiklenirse kotumser varsayimla SL kabul edilir).
-   Sonuclar TESTED / UNTESTED kirilimina gore AYRI raporlanir - boylece
-   "test edilmis seviye" hipotezinin gercekten TP oranini yukseltip
-   yukseltmedigi somut rakamla gorulur.
+B) TP/SL SIMULASYONU - UC AYRI KAR HEDEFI
+   Onay geldikten sonra (entry = onay mumunun close'u), ayni sabit
+   STOP_LOSS_PCT (%5) ile TAKE_PROFIT_LEVELS listesindeki ([5, 10, 15])
+   HER BIR kar hedefi BAGIMSIZ olarak 1dk veride simule edilir (ayni
+   mumda hem TP hem SL tetiklenirse kotumser varsayimla SL kabul edilir).
+   Her TP seviyesinin kendi "acik pozisyon" takibi vardir (biri hedefe
+   ulasip kapanirken digeri hala acik olabilir - birbirinden bagimsiz
+   3 ayri sanal hesap gibi dusunulebilir).
 
-Aym coinde bir islem acikken (entry'den TRADE_MAX_HOURS'a kadar TP/SL
-beklenirken) yeni sinyal aranmaz.
+Aym coinde, HER TP SEVIYESI ICIN AYRI AYRI, bir islem acikken
+(entry'den TRADE_MAX_HOURS'a kadar TP/SL beklenirken) yeni sinyal o
+seviye icin atlanir ('SKIPPED' olarak isaretlenir).
 
-Cikti: CSV (her sinyalin TESTED/UNTESTED etiketi + TP/SL sonucu ile) + konsol ozeti
+Cikti: CSV (her sinyalin TESTED/UNTESTED etiketi + her 3 TP seviyesi
+icin ayri result/pnl sutunlariyla) + konsol ozeti + Telegram'a hem
+ozet metin hem de CSV dosyasi (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env
+degiskenleri tanimliysa).
 """
 
 import time
@@ -55,9 +60,9 @@ CFG = {
     'BODY_PCT': 7.0,               # %7 esik (acik mumda kontrol edilir)
     'CONFIRM_PCT': 2.0,            # onay icin %2
     'CONFIRM_CANDLES': 30,         # 30 mum (30dk) icinde onay ara
-    'MIN_VOLUME_24H': 1_000_000,   # trailing 24h (1440x1dk) hacim esigi
+    'MIN_VOLUME_24H': 3_000_000,   # trailing 24h (1440x1dk) hacim esigi
     'DAYS_BACK': 20,
-    'CSV_OUTPUT': 'breakout_level_test_backtest.csv',
+    'CSV_OUTPUT': 'breakout_multi_tp_backtest.csv',
     'API_DELAY': 0.12,
     'RETRY_MAX': 5,
     'RETRY_BASE': 1.0,
@@ -70,11 +75,15 @@ CFG = {
     'PIVOT_LEFT_RIGHT': 2,           # pivot tespiti icin sol/sag bar
     'MIN_TOUCH_SEPARATION_CANDLES': 5,  # ayni dokunus sayilmamasi icin min. mum araligi
 
-    # --- YENI: TP/SL ---
+    # --- YENI: TP/SL (uc ayri kar hedefi, ayni %5 stop) ---
     'STOP_LOSS_PCT': 5.0,
-    'TAKE_PROFIT_PCT': 10.0,
+    'TAKE_PROFIT_LEVELS': [5.0, 10.0, 15.0],   # her biri BAGIMSIZ simule edilir
     'TAKER_FEE_PCT_PER_SIDE': 0.04,
     'TRADE_MAX_HOURS': 72,           # bu sureye kadar TP/SL gelmezse "OPEN"
+
+    # --- YENI: Telegram ---
+    'TELEGRAM_TOKEN': os.getenv("TELEGRAM_TOKEN", ""),
+    'TELEGRAM_CHAT_ID': os.getenv("TELEGRAM_CHAT_ID", ""),
 }
 
 WINDOW_MS = 15 * 60 * 1000
@@ -326,19 +335,21 @@ def compute_level_test(df15, event_window_start_ms, direction):
     return touch_count, touch_count >= CFG['LEVEL_MIN_TOUCHES']
 
 
-# ==================== YENI: TP/SL SIMULASYONU ====================
-def simulate_trade_exit(df1m, direction, entry_price, entry_time_ms):
-    """Onay entry'sinden sonra 1dk veride TP/SL takibi. Ayni mumda
-    ikisi de tetiklenirse kotumser varsayimla SL kabul edilir."""
+# ==================== YENI: TP/SL SIMULASYONU (coklu TP seviyesi) ====================
+def simulate_trade_exit(df1m, direction, entry_price, entry_time_ms, take_profit_pct):
+    """Onay entry'sinden sonra 1dk veride, VERILEN tek bir TP seviyesi ve
+    sabit STOP_LOSS_PCT ile ileri dogru takip yapar. Ayni mumda ikisi de
+    tetiklenirse kotumser varsayimla SL kabul edilir."""
     cutoff_ms = entry_time_ms + CFG['TRADE_MAX_HOURS'] * 3600 * 1000
     after = df1m[(df1m['open_time'] > entry_time_ms) & (df1m['open_time'] <= cutoff_ms)]
+    sl_pct = CFG['STOP_LOSS_PCT']
 
     if direction == 'LONG':
-        tp_price = entry_price * (1 + CFG['TAKE_PROFIT_PCT'] / 100)
-        sl_price = entry_price * (1 - CFG['STOP_LOSS_PCT'] / 100)
+        tp_price = entry_price * (1 + take_profit_pct / 100)
+        sl_price = entry_price * (1 - sl_pct / 100)
     else:
-        tp_price = entry_price * (1 - CFG['TAKE_PROFIT_PCT'] / 100)
-        sl_price = entry_price * (1 + CFG['STOP_LOSS_PCT'] / 100)
+        tp_price = entry_price * (1 - take_profit_pct / 100)
+        sl_price = entry_price * (1 + sl_pct / 100)
 
     for _, row in after.iterrows():
         hi, lo = float(row['high']), float(row['low'])
@@ -354,7 +365,7 @@ def simulate_trade_exit(df1m, direction, entry_price, entry_time_ms):
         else:
             continue
 
-        raw = CFG['TAKE_PROFIT_PCT'] if result == 'TP' else -CFG['STOP_LOSS_PCT']
+        raw = take_profit_pct if result == 'TP' else -sl_pct
         pnl = raw - 2 * CFG['TAKER_FEE_PCT_PER_SIDE']
         return result, pnl, int(row['close_time'])
 
@@ -368,6 +379,46 @@ def simulate_trade_exit(df1m, direction, entry_price, entry_time_ms):
         raw = (entry_price - last_close) / entry_price * 100
     pnl = raw - 2 * CFG['TAKER_FEE_PCT_PER_SIDE']
     return 'OPEN', pnl, int(last['close_time'])
+
+
+# ==================== TELEGRAM ====================
+def send_telegram_message(text):
+    if not CFG['TELEGRAM_TOKEN'] or not CFG['TELEGRAM_CHAT_ID']:
+        log.warning("[TELEGRAM DEVRE DIŞI - TOKEN/CHAT_ID env variable olarak tanimli degil]\n" + text)
+        return False
+    url = f"https://api.telegram.org/bot{CFG['TELEGRAM_TOKEN']}/sendMessage"
+    try:
+        r = session.post(url, data={"chat_id": CFG['TELEGRAM_CHAT_ID'], "text": text}, timeout=15)
+        if r.status_code != 200:
+            log.error(f"Telegram mesaj hatasi: HTTP {r.status_code} - {r.text[:200]}")
+            return False
+        return True
+    except Exception as e:
+        log.error(f"Telegram mesaj hatasi: {e}")
+        return False
+
+
+def send_telegram_document(file_path, caption=""):
+    if not CFG['TELEGRAM_TOKEN'] or not CFG['TELEGRAM_CHAT_ID']:
+        log.warning(f"[TELEGRAM DEVRE DIŞI] CSV gonderilemedi: {file_path}")
+        return False
+    url = f"https://api.telegram.org/bot{CFG['TELEGRAM_TOKEN']}/sendDocument"
+    try:
+        with open(file_path, 'rb') as f:
+            r = session.post(
+                url,
+                data={"chat_id": CFG['TELEGRAM_CHAT_ID'], "caption": caption[:1024]},
+                files={"document": f},
+                timeout=60,
+            )
+        if r.status_code != 200:
+            log.error(f"Telegram dosya gonderim hatasi: HTTP {r.status_code} - {r.text[:300]}")
+            return False
+        log.info("CSV Telegram'a gonderildi")
+        return True
+    except Exception as e:
+        log.error(f"Telegram dosya gonderim hatasi: {e}")
+        return False
 
 
 # ==================== TEK COIN ====================
@@ -385,23 +436,19 @@ def process_symbol(sym, fetch_start_ms, test_start_ms, now_ms):
     df15 = build_15m_ohlc(df1m)
     stats = {'events': len(events), 'confirmed': 0}
     results = []
-    busy_until_ms = 0
+    # HER TP SEVIYESI icin AYRI "acik pozisyon" takibi - biri hedefe
+    # ulasip kapanirken digeri hala acik olabilir, birbirinden bagimsizlar
+    busy_until = {tp: 0 for tp in CFG['TAKE_PROFIT_LEVELS']}
 
     for ev in events:
-        if ev['event_time'] < busy_until_ms:
-            continue  # onceki islem hala "acik" - yeni sinyal atlanir
-
         confirm = check_confirm(df1m, ev)
         if not confirm:
             continue
 
         stats['confirmed'] += 1
         touch_count, is_tested = compute_level_test(df15, ev['window_start'], ev['direction'])
-        result, pnl_pct, exit_time_ms = simulate_trade_exit(
-            df1m, ev['direction'], confirm['entry_price'], confirm['entry_time'])
-        busy_until_ms = exit_time_ms
 
-        results.append({
+        row = {
             'symbol': sym,
             'direction': ev['direction'],
             'window_start': datetime.fromtimestamp(ev['window_start'] / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M'),
@@ -410,28 +457,47 @@ def process_symbol(sym, fetch_start_ms, test_start_ms, now_ms):
             'entry_price': round(confirm['entry_price'], 6),
             'touch_count': touch_count,
             'is_tested': is_tested,
-            'result': result,
-            'pnl_pct': round(pnl_pct, 2),
-        })
+        }
+
+        for tp in CFG['TAKE_PROFIT_LEVELS']:
+            tp_key = str(int(tp)) if tp == int(tp) else str(tp)
+            if confirm['entry_time'] < busy_until[tp]:
+                row[f'result_tp{tp_key}'] = 'SKIPPED'
+                row[f'pnl_tp{tp_key}'] = None
+                continue
+            result, pnl_pct, exit_time_ms = simulate_trade_exit(
+                df1m, ev['direction'], confirm['entry_price'], confirm['entry_time'], tp)
+            busy_until[tp] = exit_time_ms
+            row[f'result_tp{tp_key}'] = result
+            row[f'pnl_tp{tp_key}'] = round(pnl_pct, 2)
+
+        results.append(row)
 
     return results, stats, incomplete
 
 
 # ==================== OZET ====================
-def summarize(results, label, subset_filter):
-    rows = [r for r in results if subset_filter(r)]
-    closed = [r for r in rows if r['result'] in ('TP', 'SL')]
-    wins = [r for r in closed if r['result'] == 'TP']
+def summarize_tp(results, tp):
+    """Belirli bir TP seviyesi icin ozet (SKIPPED olanlar haric)."""
+    tp_key = str(int(tp)) if tp == int(tp) else str(tp)
+    rkey, pkey = f'result_tp{tp_key}', f'pnl_tp{tp_key}'
+    rows = [r for r in results if r.get(rkey) not in (None, 'SKIPPED')]
+    closed = [r for r in rows if r[rkey] in ('TP', 'SL')]
+    wins = [r for r in closed if r[rkey] == 'TP']
     n_closed = len(closed)
     win_rate = (len(wins) / n_closed * 100) if n_closed else 0.0
-    total_pnl = sum(r['pnl_pct'] for r in closed)
+    total_pnl = sum(r[pkey] for r in closed)
     avg_pnl = (total_pnl / n_closed) if n_closed else 0.0
+    skipped = sum(1 for r in results if r.get(rkey) == 'SKIPPED')
 
-    print(f"\n--- {label} ---")
-    print(f"Toplam sinyal: {len(rows)} | Kapanan: {n_closed} | Kazanan(TP): {len(wins)}")
-    print(f"Kazanma orani: %{win_rate:.1f} | Toplam getiri: %{total_pnl:.1f} | Islem basi ort.: %{avg_pnl:.2f}")
-    return {'label': label, 'total': len(rows), 'closed': n_closed, 'wins': len(wins),
-            'win_rate': win_rate, 'total_pnl': total_pnl, 'avg_pnl': avg_pnl}
+    line = (f"TP %{tp:g} (SL %{CFG['STOP_LOSS_PCT']:g}) -> "
+            f"Sinyal: {len(rows)} | Kapanan: {n_closed} | Kazanan: {len(wins)} | "
+            f"Kazanma orani: %{win_rate:.1f} | Toplam getiri: %{total_pnl:.1f} | "
+            f"Islem basi ort.: %{avg_pnl:.2f} | Atlanan(pozisyon dolu): {skipped}")
+    print(line)
+    return {'tp': tp, 'total': len(rows), 'closed': n_closed, 'wins': len(wins),
+            'win_rate': win_rate, 'total_pnl': total_pnl, 'avg_pnl': avg_pnl,
+            'skipped': skipped, 'line': line}
 
 
 # ==================== BACKTEST ====================
@@ -446,7 +512,8 @@ def run_backtest():
               f"%{CFG['CONFIRM_PCT']} onay | min hacim ${CFG['MIN_VOLUME_24H']:,.0f}")
     log.info(f"Test edilmis seviye: son {CFG['LEVEL_LOOKBACK_CANDLES']} mum | "
               f"tolerans %{CFG['LEVEL_TOLERANCE_PCT']} | min {CFG['LEVEL_MIN_TOUCHES']} dokunus")
-    log.info(f"TP/SL: SL %{CFG['STOP_LOSS_PCT']} | TP %{CFG['TAKE_PROFIT_PCT']}")
+    log.info(f"TP seviyeleri (her biri BAGIMSIZ, ayni SL %{CFG['STOP_LOSS_PCT']}): "
+              f"{CFG['TAKE_PROFIT_LEVELS']}")
 
     symbols = get_all_symbols()
     log.info(f"{len(symbols)} sembol bulundu - bu islem uzun surebilir, sabirla bekleyin.")
@@ -491,13 +558,31 @@ def run_backtest():
     print(f"Taranan coin: {len(symbols)}")
     print(f"Toplam olay: {total_events} | Onaylanan: {total_confirmed}")
 
-    summarize(all_results, "TUM ONAYLANAN SINYALLER", lambda r: True)
-    summarize(all_results, f"TESTED (>={CFG['LEVEL_MIN_TOUCHES']} dokunus)", lambda r: r['is_tested'])
-    summarize(all_results, f"UNTESTED (<{CFG['LEVEL_MIN_TOUCHES']} dokunus)", lambda r: not r['is_tested'])
+    tp_summaries = [summarize_tp(all_results, tp) for tp in CFG['TAKE_PROFIT_LEVELS']]
 
     if incomplete_symbols:
         print(f"\n1dk verisi EKSIK KALAN coinler ({len(incomplete_symbols)}): {incomplete_symbols}")
     print("=" * 60)
+
+    # --- Telegram: once ozet metni, sonra CSV dosyasi ---
+    summary_lines = [
+        f"📊 Backtest tamamlandi ({CFG['DAYS_BACK']} gun, min hacim ${CFG['MIN_VOLUME_24H']:,.0f})",
+        f"Taranan coin: {len(symbols)} | Toplam olay: {total_events} | Onaylanan: {total_confirmed}",
+        "",
+    ]
+    summary_lines.extend(s['line'] for s in tp_summaries)
+    if incomplete_symbols:
+        summary_lines.append(f"\n⚠️ 1dk verisi eksik kalan coin sayisi: {len(incomplete_symbols)}")
+    summary_text = "\n".join(summary_lines)
+
+    send_telegram_message(summary_text)
+    if all_results:
+        send_telegram_document(
+            CFG['CSV_OUTPUT'],
+            caption=f"Backtest CSV - {len(all_results)} sinyal, {CFG['DAYS_BACK']} gun"
+        )
+    else:
+        send_telegram_message("CSV gonderilmedi - hic sonuc bulunamadi.")
 
     return all_results
 
