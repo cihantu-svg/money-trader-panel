@@ -97,23 +97,65 @@ def _debug_env_check():
 
 
 def _get_with_retry(url, params=None, timeout=15):
-    """Gecici ag/API hatalarinda (429/5xx/timeout) otomatik tekrar dener,
-    tek seferlik hatalarda taramanin tamamen bos donmesini engeller."""
-    last_exc = None
-    for attempt in range(MAX_RETRIES + 1):
+    """Gecici ag/API hatalarinda (429/5xx/timeout) otomatik tekrar dener.
+
+    HTTP 418 ozel durumdur: Binance'de bu, IP'nin GECICI OLARAK BANLANDIGI
+    anlamina gelir (429'u tekrar tekrar gormezden gelince tetiklenir).
+    Bu bir "az bekle tekrar dene" durumu DEGILDIR - ban suresi genelde
+    dakikalar (bazen saatler) surer ve ban aktifken tekrar istek atmak
+    BANI DAHA DA UZATABILIR. Bu yuzden 418 geldiginde MAX_RETRIES'a
+    tabi degildir - Binance'in Retry-After header'inda belirttigi sureye
+    TAM olarak uyulup o kadar beklenir, sonra sayac sifirlanip taze
+    baslanir."""
+    attempt = 0
+    while True:
         try:
             r = session.get(url, params=params, timeout=timeout)
-            if r.status_code == 200:
-                return r.json()
-            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-            log.warning(f"HTTP {r.status_code} ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt + 1})")
-            time.sleep(wait)
-            last_exc = Exception(f"HTTP {r.status_code}")
         except requests.exceptions.RequestException as e:
-            last_exc = e
+            attempt += 1
+            if attempt > MAX_RETRIES:
+                raise e
+            time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+            continue
+
+        if r.status_code == 200:
+            return r.json()
+
+        if r.status_code == 418:
+            retry_after = r.headers.get('Retry-After')
+            try:
+                wait = float(retry_after) if retry_after else 60.0
+            except ValueError:
+                wait = 60.0
+            log.error(f"HTTP 418 - IP GECICI BANLANDI ({url}). "
+                      f"Ban suresine tam uyularak {wait:.0f} saniye bekleniyor "
+                      f"(bu sure icinde HICBIR istek atilmiyor)...")
+            time.sleep(wait + 2)  # +2sn guvenlik payi
+            attempt = 0  # ban gectikten sonra sayaci sifirla
+            continue
+
+        if r.status_code == 429:
             wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+            retry_after = r.headers.get('Retry-After')
+            if retry_after:
+                try:
+                    wait = max(wait, float(retry_after))
+                except ValueError:
+                    pass
+            attempt += 1
+            log.warning(f"HTTP 429 ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt})")
             time.sleep(wait)
-    raise last_exc if last_exc else Exception("Bilinmeyen istek hatasi")
+            if attempt > MAX_RETRIES:
+                raise Exception("HTTP 429 - retry limiti asildi")
+            continue
+
+        # diger hata kodlari (5xx vs.)
+        attempt += 1
+        wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+        log.warning(f"HTTP {r.status_code} ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt})")
+        time.sleep(wait)
+        if attempt > MAX_RETRIES:
+            raise Exception(f"HTTP {r.status_code}")
 
 
 def send_telegram(msg: str):
