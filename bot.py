@@ -1,49 +1,3 @@
-"""
-Basit Tarayıcı Bot - SADECE 3 KRİTER:
-1) 15 dakikalık mum
-2) GÜNLÜK (24 saatlik) hacim >= 3,000,000 USDT
-3) AÇIK (henüz kapanmamış) 15dk mumun o ana kadarki değişimi >= %7
-   (mutlak değer, yani hem yükseliş hem düşüş)
-
-Başka HİÇBİR filtre yok (RSI, SMA, trend, breakout vs. YOK).
-Binance Futures üzerinde tüm USDT paritelerini tarar.
-
-────────────────────────────────────────────────────────────────────
-DUZELTME 1 (onceki): eskiden SADECE KAPANMIŞ mum kontrol ediliyordu.
-Şimdi HENÜZ OLUŞMAKTA OLAN mum (açık mum) kontrol ediliyor.
-
-DUZELTME 2 (BU SURUM) - "bazı coinler kaçıyor" sorunu:
-İki gercek sebep bulundu:
-
-  a) Hata loglari log.debug() ile yaziliyordu ama logger INFO
-     seviyesinde kuruluydu - yani basarisiz coin istekleri HİÇ
-     GORUNMUYORDU. Simdi log.warning() kullaniliyor ve her turda
-     kac coin'in basarisiz oldugu ozetle raporlaniyor.
-
-  b) ASIL SEBEP: eskiden her coin icin AYRI bir /fapi/v1/klines
-     istegi atiliyordu, 10 saniyede bir, ~400 coin icin. Bu dakikada
-     2400+ istek demekti - Binance Futures agirlik limitine (dakikada
-     ~2400) TAM SINIRDA/USTUNDE. Limit asilinca 429/418 donuyor,
-     retry'ler tukenince o coin sessizce (yukaridaki a sebebiyle
-     GORUNMEDEN) atlaniyordu. "Bazi coinlerin es gecilmesi" tam olarak
-     boyle rastgele/araliksiz bir desenle ortaya cikar.
-
-     COZUM: Artik her coin icin ayri istek YOK. Binance'in TEK istekte
-     TUM sembollerin GUNCEL fiyatini donduren /fapi/v1/ticker/price
-     endpoint'i kullaniliyor (tek cagri, tum coinler). Her 15dk
-     penceresinin "acilis fiyati", o pencerede ilk gorulen bulk fiyat
-     olarak yerelde (hafizada) saklaniyor - boylece degisim yuzdesi
-     sonraki her turda ekstra istek atmadan hesaplanabiliyor.
-
-     ONEMLI VARSAYIM: pencere "acilisi" olarak GERCEK 15dk mum
-     acilisi degil, o pencerede ILK GOZLEMLENEN bulk fiyat kullanilir
-     (en fazla CHECK_INTERVAL_SEC kadar gecikmeli olabilir - orn. 5sn
-     tarama araliginda en fazla 5sn'lik sapma). %7 gibi buyuk bir
-     esik icin bu sapma pratikte onemsizdir, ama bilinmesi gereken bir
-     yaklastirmadir.
-────────────────────────────────────────────────────────────────────
-"""
-
 import sys
 import os
 import time
@@ -51,308 +5,1048 @@ import logging
 import requests
 from datetime import datetime, timezone
 
-# Render/Docker gibi ortamlarda Python ciktisi bazen buffer'lanip GEC
-# gorunebilir ("sistem donmus" gibi bir izlenim yaratir, aslinda calisiyordur).
-# StreamHandler'i stdout'a baglayip her log satirindan sonra flush ederek
-# ciktinin ANLIK gorunmesini garanti ediyoruz. (Render Start Command'ina
-# "python -u bot.py" yazmak da ayni sorunu cozer, ikisi birden zarar vermez.)
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 _handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+)
 _handler.flush = sys.stdout.flush
-logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[_handler],
+    force=True
+)
+
 log = logging.getLogger(__name__)
 
-# ============ AYARLAR ============
-# Token'lar artik ortam degiskeninden (environment variable) okunuyor,
-# koda hardcode edilmiyor - sunucu panelinde TELEGRAM_TOKEN ve
-# TELEGRAM_CHAT_ID olarak tanimla.
-VOLUME_USDT_MIN = float(os.getenv("VOLUME_USDT_MIN", "3000000"))   # minimum GÜNLÜK (24s) hacim ($)
-PRICE_CHANGE_MIN = float(os.getenv("PRICE_CHANGE_MIN", "7.0"))     # minimum %7 hareket (açık mumda)
-CHECK_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", os.getenv("CHECK_INTERVAL_SEC", "5")))    # kaç saniyede bir tarasın
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 0.5
-WINDOW_MS = 15 * 60 * 1000
-# ==================================
 
+# ============================================================
+# ENV SETTINGS
+# ============================================================
+
+# Minimum 24h USDT quote volume
+VOLUME_USDT_MIN = float(
+    os.getenv("VOLUME_USDT_MIN", "1000000")
+)
+
+# Breakout / breakdown minimum percentage
+BREAKOUT_THRESHOLD = float(
+    os.getenv("BREAKOUT_THRESHOLD", "5")
+)
+
+# Main scanner interval
+SCAN_INTERVAL_SEC = int(
+    os.getenv(
+        "SCAN_INTERVAL_SEC",
+        os.getenv("CHECK_INTERVAL_SEC", "10")
+    )
+)
+
+# How often major levels are recalculated
+LEVEL_REFRESH_SEC = int(
+    os.getenv("LEVEL_REFRESH_SEC", "60")
+)
+
+# Number of closed 15m candles used
+# 96 = 24 hours
+MAJOR_LOOKBACK = int(
+    os.getenv("MAJOR_LOOKBACK", "96")
+)
+
+# Minimum number of touches required
+MAJOR_TOUCHES = int(
+    os.getenv("MAJOR_TOUCHES", "2")
+)
+
+# 0.003 = 0.3%
+MAJOR_TOLERANCE = float(
+    os.getenv("MAJOR_TOLERANCE", "0.003")
+)
+
+# Number of recent candles used to detect pivot
+PIVOT_LEFT = int(
+    os.getenv("PIVOT_LEFT", "2")
+)
+
+PIVOT_RIGHT = int(
+    os.getenv("PIVOT_RIGHT", "2")
+)
+
+# How often 15m klines are refreshed
+KLINE_REFRESH_SEC = int(
+    os.getenv("KLINE_REFRESH_SEC", "60")
+)
+
+# Telegram
+TELEGRAM_TOKEN = os.getenv(
+    "TELEGRAM_TOKEN",
+    ""
+)
+
+TELEGRAM_CHAT_ID = os.getenv(
+    "TELEGRAM_CHAT_ID",
+    ""
+)
+
+# Binance
 BINANCE_FAPI = "https://fapi.binance.com"
 
+WINDOW_MS = 15 * 60 * 1000
+
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 0.5
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
 session = requests.Session()
-_adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=10)
+
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=20,
+    pool_maxsize=20
+)
+
 session.mount("https://", _adapter)
 
-# symbol -> (window_start_ms, o pencerede ilk gozlemlenen fiyat)
-# artik her coin icin ayri istek atilmadigindan, "acilis" fiyati burada
-# yerelde takip edilir.
-_window_open_price = {}
+
+# ============================================================
+# MEMORY
+# ============================================================
+
+# symbol -> {
+#   "support": float,
+#   "resistance": float,
+#   "updated": timestamp
+# }
+major_levels = {}
+
+# symbol -> last price
+previous_prices = {}
+
+# symbol -> last 15m window where alert was sent
+alerted_support = {}
+alerted_resistance = {}
+
+# symbol -> last kline refresh time
+last_kline_refresh = {}
 
 
-def _debug_env_check():
-    """Render'in gercekte hangi isimle ne enjekte ettigini gormek icin
-    tanı amaçlı log - deger sizdirmadan sadece degisken adlarini ve
-    uzunluklarini gosterir. Sorun cozulunce bu fonksiyon kaldirilabilir."""
-    all_keys = sorted(os.environ.keys())
-    telegram_related = [k for k in all_keys if "TELEGRAM" in k.upper()]
-    log.info(f"[TANI] Ortamda TELEGRAM icin gecen degisken adlari: {telegram_related}")
-    log.info(f"[TANI] TELEGRAM_TOKEN uzunlugu: {len(TELEGRAM_TOKEN)} karakter "
-              f"(0 ise degisken bos ya da hic yok)")
-    log.info(f"[TANI] TELEGRAM_CHAT_ID uzunlugu: {len(TELEGRAM_CHAT_ID)} karakter")
-    if not telegram_related:
-        log.error("[TANI] Ortamda 'TELEGRAM' geçen HİÇBİR değişken bulunamadı. "
-                  "Bu, değişkenlerin bu servise hiç ulaşmadığını gösterir - "
-                  "yanlış servise eklenmiş, farklı bir Environment Group'a "
-                  "bağlanmış, ya da isim/yazım hatası olabilir.")
-
+# ============================================================
+# HTTP
+# ============================================================
 
 def _get_with_retry(url, params=None, timeout=15):
-    """Gecici ag/API hatalarinda (429/5xx/timeout) otomatik tekrar dener.
 
-    HTTP 418 ozel durumdur: Binance'de bu, IP'nin GECICI OLARAK BANLANDIGI
-    anlamina gelir (429'u tekrar tekrar gormezden gelince tetiklenir).
-    Bu bir "az bekle tekrar dene" durumu DEGILDIR - ban suresi genelde
-    dakikalar (bazen saatler) surer ve ban aktifken tekrar istek atmak
-    BANI DAHA DA UZATABILIR. Bu yuzden 418 geldiginde MAX_RETRIES'a
-    tabi degildir - Binance'in Retry-After header'inda belirttigi sureye
-    TAM olarak uyulup o kadar beklenir, sonra sayac sifirlanip taze
-    baslanir."""
     attempt = 0
+
     while True:
+
         try:
-            r = session.get(url, params=params, timeout=timeout)
+
+            response = session.get(
+                url,
+                params=params,
+                timeout=timeout
+            )
+
         except requests.exceptions.RequestException as e:
+
             attempt += 1
+
             if attempt > MAX_RETRIES:
                 raise e
-            time.sleep(RETRY_BACKOFF_BASE * (2 ** attempt))
+
+            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+
+            log.warning(
+                f"Network error: {e} | "
+                f"{wait:.1f}s sonra tekrar"
+            )
+
+            time.sleep(wait)
+
             continue
 
-        if r.status_code == 200:
-            return r.json()
+        # ----------------------------------------------------
+        # SUCCESS
+        # ----------------------------------------------------
 
-        if r.status_code == 418:
-            retry_after = r.headers.get('Retry-After')
+        if response.status_code == 200:
+            return response.json()
+
+        # ----------------------------------------------------
+        # 418 BAN
+        # ----------------------------------------------------
+
+        if response.status_code == 418:
+
+            retry_after = response.headers.get(
+                "Retry-After"
+            )
+
             try:
                 wait = float(retry_after) if retry_after else 60.0
             except ValueError:
                 wait = 60.0
-            wait += 2  # guvenlik payi
-            log.error(f"HTTP 418 - IP GECICI BANLANDI ({url}). "
-                      f"Ban suresine tam uyularak {wait:.0f} saniye bekleniyor "
-                      f"(bu sure icinde HICBIR istek atilmiyor)...")
-            # TEK SEFERDE uzun sleep yerine PARCALI bekleme - boylece
-            # sistem "donmus" gibi gorunmez, her 20sn'de bir "hala
-            # bekliyorum" logu basilir (Render/log paneli canli gorunur)
+
+            wait += 2
+
+            log.error(
+                f"HTTP 418 Binance IP BAN. "
+                f"{wait:.0f}s bekleniyor."
+            )
+
             remaining = wait
-            heartbeat = 20.0
+
             while remaining > 0:
-                chunk = min(heartbeat, remaining)
+
+                chunk = min(20, remaining)
+
                 time.sleep(chunk)
+
                 remaining -= chunk
+
                 if remaining > 0:
-                    log.info(f"[418 BAN BEKLENIYOR] kalan sure: ~{remaining:.0f} saniye...")
-            attempt = 0  # ban gectikten sonra sayaci sifirla
+                    log.info(
+                        f"[418] kalan ~{remaining:.0f}s"
+                    )
+
+            attempt = 0
+
             continue
 
-        if r.status_code == 429:
-            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-            retry_after = r.headers.get('Retry-After')
+        # ----------------------------------------------------
+        # 429 RATE LIMIT
+        # ----------------------------------------------------
+
+        if response.status_code == 429:
+
+            retry_after = response.headers.get(
+                "Retry-After"
+            )
+
+            wait = RETRY_BACKOFF_BASE * (
+                2 ** attempt
+            )
+
             if retry_after:
+
                 try:
-                    wait = max(wait, float(retry_after))
+                    wait = max(
+                        wait,
+                        float(retry_after)
+                    )
                 except ValueError:
                     pass
+
             attempt += 1
-            log.warning(f"HTTP 429 ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt})")
+
+            log.warning(
+                f"HTTP 429 | {wait:.1f}s bekleniyor | "
+                f"deneme {attempt}"
+            )
+
             time.sleep(wait)
+
             if attempt > MAX_RETRIES:
-                raise Exception("HTTP 429 - retry limiti asildi")
+                raise Exception(
+                    "HTTP 429 - retry limiti aşıldı"
+                )
+
             continue
 
-        # diger hata kodlari (5xx vs.)
+        # ----------------------------------------------------
+        # OTHER ERRORS
+        # ----------------------------------------------------
+
         attempt += 1
-        wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-        log.warning(f"HTTP {r.status_code} ({url}), {wait:.1f}sn sonra tekrar (deneme {attempt})")
+
+        wait = RETRY_BACKOFF_BASE * (
+            2 ** attempt
+        )
+
+        log.warning(
+            f"HTTP {response.status_code} | "
+            f"{wait:.1f}s sonra tekrar"
+        )
+
         time.sleep(wait)
+
         if attempt > MAX_RETRIES:
-            raise Exception(f"HTTP {r.status_code}")
+
+            raise Exception(
+                f"HTTP {response.status_code}"
+            )
 
 
-def send_telegram(msg: str):
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram(msg):
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("[TELEGRAM DEVRE DIŞI - TOKEN/CHAT_ID env variable olarak tanimli degil] " + msg)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        r = session.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-        if r.status_code != 200:
-            log.error(f"Telegram gönderim hatası: HTTP {r.status_code} - {r.text[:200]}")
-    except Exception as e:
-        log.error(f"Telegram gönderim hatası: {e}")
 
+        log.warning(
+            "[TELEGRAM DEVRE DIŞI] "
+            "TOKEN veya CHAT_ID yok"
+        )
+
+        return
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    try:
+
+        response = session.post(
+            url,
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg
+            },
+            timeout=10
+        )
+
+        if response.status_code != 200:
+
+            log.error(
+                f"Telegram hata: "
+                f"HTTP {response.status_code}"
+            )
+
+    except Exception as e:
+
+        log.error(
+            f"Telegram gönderim hatası: {e}"
+        )
+
+
+# ============================================================
+# SYMBOLS
+# ============================================================
 
 def get_usdt_futures_symbols():
-    try:
-        data = _get_with_retry(f"{BINANCE_FAPI}/fapi/v1/exchangeInfo", timeout=15)
-        symbols = [
-            s["symbol"] for s in data["symbols"]
-            if s["symbol"].endswith("USDT") and s.get("contractType") == "PERPETUAL"
-            and s.get("status") == "TRADING"
-        ]
-        if not symbols:
-            log.error("exchangeInfo bos sembol listesi döndürdü")
-        return symbols
-    except Exception as e:
-        log.error(f"get_usdt_futures_symbols hata (sembol listesi ALINAMADI): {e}")
-        return []
 
+    data = _get_with_retry(
+        f"{BINANCE_FAPI}/fapi/v1/exchangeInfo",
+        timeout=15
+    )
+
+    symbols = [
+
+        s["symbol"]
+
+        for s in data["symbols"]
+
+        if (
+            s["symbol"].endswith("USDT")
+            and s.get("contractType") == "PERPETUAL"
+            and s.get("status") == "TRADING"
+        )
+    ]
+
+    return symbols
+
+
+# ============================================================
+# 24H VOLUME
+# ============================================================
 
 def get_24h_volumes():
-    """Tüm semboller için 24 saatlik quote volume (USDT) sözlüğü döndürür.
-    Hata durumunda None döner (bos sözlükten AYIRT edilmesi kritik - yoksa
-    hacim verisi çekilemediginde tüm coinler hacim=0 sanılıp elenir)."""
-    try:
-        data = _get_with_retry(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", timeout=15)
-        vols = {item["symbol"]: float(item["quoteVolume"]) for item in data}
-        if not vols:
-            log.error("24hr ticker API bos veri döndürdü")
-            return None
-        return vols
-    except Exception as e:
-        log.error(f"get_24h_volumes hata (24h hacim verisi ALINAMADI): {e}")
-        return None
 
+    data = _get_with_retry(
+        f"{BINANCE_FAPI}/fapi/v1/ticker/24hr",
+        timeout=15
+    )
+
+    return {
+        item["symbol"]:
+        float(item["quoteVolume"])
+
+        for item in data
+    }
+
+
+# ============================================================
+# BULK PRICE
+# ============================================================
 
 def get_all_prices():
-    """TUM sembollerin GUNCEL fiyatini TEK istekte doner (bulk).
-    Kritik: boylece her coin icin ayri ayri kline istegi atmaya gerek
-    kalmiyor - hem cok daha hizli hem de rate-limit riskini ortadan
-    kaldiriyor. Hata durumunda None doner."""
-    try:
-        data = _get_with_retry(f"{BINANCE_FAPI}/fapi/v1/ticker/price", timeout=15)
-        prices = {item["symbol"]: float(item["price"]) for item in data}
-        if not prices:
-            log.error("ticker/price API bos veri döndürdü")
-            return None
-        return prices
-    except Exception as e:
-        log.error(f"get_all_prices hata (fiyat verisi ALINAMADI): {e}")
-        return None
 
+    data = _get_with_retry(
+        f"{BINANCE_FAPI}/fapi/v1/ticker/price",
+        timeout=15
+    )
+
+    return {
+        item["symbol"]:
+        float(item["price"])
+
+        for item in data
+    }
+
+
+# ============================================================
+# 15M KLINES
+# ============================================================
+
+def get_15m_klines(symbol):
+
+    data = _get_with_retry(
+        f"{BINANCE_FAPI}/fapi/v1/klines",
+        params={
+            "symbol": symbol,
+            "interval": "15m",
+            "limit": MAJOR_LOOKBACK + 5
+        },
+        timeout=15
+    )
+
+    return data
+
+
+# ============================================================
+# PIVOT DETECTION
+# ============================================================
+
+def is_pivot_low(
+    candles,
+    index
+):
+
+    left = PIVOT_LEFT
+    right = PIVOT_RIGHT
+
+    if index - left < 0:
+        return False
+
+    if index + right >= len(candles):
+        return False
+
+    low = float(candles[index][3])
+
+    for i in range(
+        index - left,
+        index + right + 1
+    ):
+
+        if i == index:
+            continue
+
+        if float(candles[i][3]) <= low:
+            return False
+
+    return True
+
+
+def is_pivot_high(
+    candles,
+    index
+):
+
+    left = PIVOT_LEFT
+    right = PIVOT_RIGHT
+
+    if index - left < 0:
+        return False
+
+    if index + right >= len(candles):
+        return False
+
+    high = float(candles[index][2])
+
+    for i in range(
+        index - left,
+        index + right + 1
+    ):
+
+        if i == index:
+            continue
+
+        if float(candles[i][2]) >= high:
+            return False
+
+    return True
+
+
+# ============================================================
+# CLUSTER PIVOTS
+# ============================================================
+
+def cluster_levels(levels):
+
+    if not levels:
+        return []
+
+    levels = sorted(levels)
+
+    clusters = []
+
+    current = [levels[0]]
+
+    for price in levels[1:]:
+
+        average = sum(current) / len(current)
+
+        if (
+            abs(price - average) / average
+            <= MAJOR_TOLERANCE
+        ):
+
+            current.append(price)
+
+        else:
+
+            clusters.append(current)
+
+            current = [price]
+
+    clusters.append(current)
+
+    return clusters
+
+
+# ============================================================
+# MAJOR LEVEL CALCULATION
+# ============================================================
+
+def calculate_major_levels(candles):
+
+    # Son mum açık olduğu için onu kullanmıyoruz.
+    closed = candles[:-1]
+
+    if len(closed) < 20:
+        return None, None
+
+    support_pivots = []
+    resistance_pivots = []
+
+    start = max(
+        PIVOT_LEFT,
+        0
+    )
+
+    end = len(closed) - PIVOT_RIGHT
+
+    for i in range(start, end):
+
+        if is_pivot_low(
+            closed,
+            i
+        ):
+
+            support_pivots.append(
+                float(closed[i][3])
+            )
+
+        if is_pivot_high(
+            closed,
+            i
+        ):
+
+            resistance_pivots.append(
+                float(closed[i][2])
+            )
+
+    support_clusters = cluster_levels(
+        support_pivots
+    )
+
+    resistance_clusters = cluster_levels(
+        resistance_pivots
+    )
+
+    # --------------------------------------------------------
+    # Only levels with enough touches
+    # --------------------------------------------------------
+
+    support_candidates = [
+
+        sum(cluster) / len(cluster)
+
+        for cluster in support_clusters
+
+        if len(cluster) >= MAJOR_TOUCHES
+    ]
+
+    resistance_candidates = [
+
+        sum(cluster) / len(cluster)
+
+        for cluster in resistance_clusters
+
+        if len(cluster) >= MAJOR_TOUCHES
+    ]
+
+    if not support_candidates:
+        support = None
+    else:
+        support = support_candidates[-1]
+
+    if not resistance_candidates:
+        resistance = None
+    else:
+        resistance = resistance_candidates[0]
+
+    return support, resistance
+
+
+# ============================================================
+# REFRESH MAJOR LEVELS
+# ============================================================
+
+def refresh_major_levels(
+    candidates
+):
+
+    now = time.time()
+
+    updated = 0
+    failed = 0
+
+    for symbol in candidates:
+
+        last_update = last_kline_refresh.get(
+            symbol,
+            0
+        )
+
+        if (
+            now - last_update
+            < KLINE_REFRESH_SEC
+        ):
+            continue
+
+        try:
+
+            candles = get_15m_klines(
+                symbol
+            )
+
+            support, resistance = (
+                calculate_major_levels(
+                    candles
+                )
+            )
+
+            major_levels[symbol] = {
+                "support": support,
+                "resistance": resistance,
+                "updated": now
+            }
+
+            last_kline_refresh[symbol] = now
+
+            updated += 1
+
+        except Exception as e:
+
+            failed += 1
+
+            log.warning(
+                f"{symbol} major level alınamadı: {e}"
+            )
+
+    if updated or failed:
+
+        log.info(
+            f"Major level güncelleme | "
+            f"güncellenen: {updated} | "
+            f"hatalı: {failed}"
+        )
+
+
+# ============================================================
+# BREAKOUT CHECK
+# ============================================================
+
+def check_signal(
+    symbol,
+    price,
+    volume,
+    window
+):
+
+    result = []
+
+    levels = major_levels.get(symbol)
+
+    if not levels:
+        return result
+
+    support = levels.get("support")
+    resistance = levels.get("resistance")
+
+    previous_price = previous_prices.get(
+        symbol
+    )
+
+    # İlk gözlemde crossing kontrolü yapma
+    if previous_price is None:
+
+        previous_prices[symbol] = price
+
+        return result
+
+    # ========================================================
+    # MAJOR SUPPORT BREAKDOWN
+    # ========================================================
+
+    if support and support > 0:
+
+        breakdown_pct = (
+            (support - price)
+            / support
+            * 100
+        )
+
+        crossed_support = (
+            previous_price >= support
+            and price < support
+        )
+
+        # Hem crossing hem %5 şartı
+        if (
+            crossed_support
+            and breakdown_pct >= BREAKOUT_THRESHOLD
+        ):
+
+            if alerted_support.get(symbol) != window:
+
+                result.append({
+
+                    "type": "SUPPORT_BREAKDOWN",
+
+                    "symbol": symbol,
+
+                    "level": support,
+
+                    "price": price,
+
+                    "change_pct": -breakdown_pct,
+
+                    "volume": volume,
+
+                    "window": window
+                })
+
+                alerted_support[symbol] = window
+
+    # ========================================================
+    # MAJOR RESISTANCE BREAKOUT
+    # ========================================================
+
+    if resistance and resistance > 0:
+
+        breakout_pct = (
+            (price - resistance)
+            / resistance
+            * 100
+        )
+
+        crossed_resistance = (
+            previous_price <= resistance
+            and price > resistance
+        )
+
+        if (
+            crossed_resistance
+            and breakout_pct >= BREAKOUT_THRESHOLD
+        ):
+
+            if alerted_resistance.get(symbol) != window:
+
+                result.append({
+
+                    "type": "RESISTANCE_BREAKOUT",
+
+                    "symbol": symbol,
+
+                    "level": resistance,
+
+                    "price": price,
+
+                    "change_pct": breakout_pct,
+
+                    "volume": volume,
+
+                    "window": window
+                })
+
+                alerted_resistance[symbol] = window
+
+    previous_prices[symbol] = price
+
+    return result
+
+
+# ============================================================
+# ALERT FORMAT
+# ============================================================
+
+def format_alert(hit):
+
+    if hit["type"] == "SUPPORT_BREAKDOWN":
+
+        title = "🔴 MAJOR SUPPORT BREAKDOWN"
+
+        movement = (
+            f"Support kırılımı: "
+            f"{hit['change_pct']:.2f}%"
+        )
+
+    else:
+
+        title = "🟢 MAJOR RESISTANCE BREAKOUT"
+
+        movement = (
+            f"Resistance kırılımı: "
+            f"+{hit['change_pct']:.2f}%"
+        )
+
+    return (
+        f"{title}\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"Coin: {hit['symbol']}\n"
+        f"Major Level: {hit['level']}\n"
+        f"Fiyat: {hit['price']}\n"
+        f"{movement}\n"
+        f"24h Hacim: "
+        f"${hit['volume']:,.0f}\n"
+        f"Timeframe: 15m\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
+    )
+
+
+# ============================================================
+# SCAN
+# ============================================================
 
 def scan_once():
-    hits = []
+
     symbols = get_usdt_futures_symbols()
+
     if not symbols:
-        log.error("Sembol listesi BOS - bu turu atlıyorum")
-        return hits
 
-    daily_volumes = get_24h_volumes()  # tek seferde tüm sembollerin günlük hacmi
-    if daily_volumes is None:
-        log.error(f"24h hacim verisi alınamadı - bu turda hacim filtresi ATLANIYOR, "
-                  f"tüm {len(symbols)} coin filtrelenmeden taranacak")
-        daily_volumes = {s: VOLUME_USDT_MIN for s in symbols}
+        log.error(
+            "USDT futures sembolleri alınamadı."
+        )
 
-    candidates = set(s for s in symbols if daily_volumes.get(s, 0.0) >= VOLUME_USDT_MIN)
+        return []
+
+    volumes = get_24h_volumes()
+
+    candidates = [
+
+        symbol
+
+        for symbol in symbols
+
+        if volumes.get(
+            symbol,
+            0
+        ) >= VOLUME_USDT_MIN
+    ]
+
+    log.info(
+        f"Market: {len(symbols)} | "
+        f"24h >= ${VOLUME_USDT_MIN:,.0f}: "
+        f"{len(candidates)}"
+    )
+
+    if not candidates:
+        return []
+
+    # --------------------------------------------------------
+    # Major levels
+    # --------------------------------------------------------
+
+    refresh_major_levels(
+        candidates
+    )
+
+    # --------------------------------------------------------
+    # Bulk current prices
+    # --------------------------------------------------------
 
     prices = get_all_prices()
-    if prices is None:
-        log.error("Fiyat verisi alınamadı (ticker/price) - bu turu atlıyorum")
-        return hits
 
-    now_ms = int(time.time() * 1000)
-    current_window_start = (now_ms // WINDOW_MS) * WINDOW_MS
+    if not prices:
 
-    missing_price = 0
+        log.error(
+            "Bulk fiyat verisi alınamadı."
+        )
+
+        return []
+
+    now_ms = int(
+        time.time() * 1000
+    )
+
+    current_window = (
+        now_ms // WINDOW_MS
+    ) * WINDOW_MS
+
+    hits = []
+
     for symbol in candidates:
-        price = prices.get(symbol)
+
+        price = prices.get(
+            symbol
+        )
+
         if price is None:
-            missing_price += 1
             continue
 
-        prev = _window_open_price.get(symbol)
-        if prev is None or prev[0] != current_window_start:
-            # yeni pencere basladi (ya da bu coini ilk kez goruyoruz) -
-            # acilis fiyati olarak bu ilk gozlemi kaydet, bu turda
-            # henuz karsilastirma yapilmaz
-            _window_open_price[symbol] = (current_window_start, price)
-            continue
+        signals = check_signal(
 
-        open_price = prev[1]
-        if open_price == 0:
-            continue
-        change_pct = (price - open_price) / open_price * 100
-        if abs(change_pct) < PRICE_CHANGE_MIN:
-            continue
+            symbol=symbol,
 
-        hits.append({
-            "symbol": symbol,
-            "window_open_time": current_window_start,
-            "change_pct": change_pct,
-            "volume_usdt_24h": daily_volumes.get(symbol, 0.0),
-            "close": price,
-        })
+            price=price,
 
-    if missing_price:
-        log.warning(f"{missing_price} coin icin fiyat verisi bulunamadi (ticker/price listesinde yoktu)")
+            volume=volumes.get(
+                symbol,
+                0
+            ),
 
-    # eski pencerelere ait kayitlari temizle (bellek sismesin diye) -
-    # 2+ pencere (30dk+) once kalmis kayitlar artik kullanilmayacaktir
-    if _window_open_price:
-        very_stale = [s for s, (w, _) in _window_open_price.items() if current_window_start - w >= 2 * WINDOW_MS]
-        for s in very_stale:
-            del _window_open_price[s]
+            window=current_window
+        )
+
+        hits.extend(
+            signals
+        )
 
     return hits
 
 
-def format_alert(hit: dict) -> str:
-    direction = "🟢 YÜKSELİŞ" if hit["change_pct"] > 0 else "🔴 DÜŞÜŞ"
-    return (
-        f"{direction} | {hit['symbol']}  (AÇIK MUM - henüz kapanmadı)\n"
-        f"15dk Değişim: {hit['change_pct']:.2f}%\n"
-        f"Günlük Hacim: ${hit['volume_usdt_24h']:,.0f}\n"
-        f"Fiyat: {hit['close']}\n"
-        f"Zaman: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
-    )
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    _debug_env_check()
-    log.info("Tarayıcı başladı. Kriterler: AÇIK 15dk mum | Günlük Hacim >= $%s | Değişim >= %%%s | Tarama: %ss"
-              % (f"{VOLUME_USDT_MIN:,.0f}", PRICE_CHANGE_MIN, CHECK_INTERVAL_SEC))
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.error("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env variable olarak tanımlı değil! "
-                  "Sunucu panelinden ekle, yoksa Telegram mesajı gitmez.")
-    send_telegram(
-        "✅ Tarayıcı başladı (AÇIK MUM + TEK-İSTEK/bulk fiyat modu).\n"
-        f"Kriterler: Günlük Hacim >= ${VOLUME_USDT_MIN:,.0f} | Değişim >= %{PRICE_CHANGE_MIN}\n"
-        f"Mum kapanmasını beklemeden, eşik geçilir geçilmez sinyal gelir. "
-        f"Artık coin başına ayrı istek atılmıyor - rate-limit riski ortadan kalktı."
+
+    log.info(
+        "=============================================="
     )
-    # symbol -> son sinyal verilen pencerenin open_time'i (ayni pencerede tekrar
-    # alarm atmasin, ama pencere degisince yeni sinyal verebilsin diye)
-    alerted_window = {}
+
+    log.info(
+        "MAJOR SUPPORT / RESISTANCE SCANNER BAŞLADI"
+    )
+
+    log.info(
+        f"24h Minimum Volume: "
+        f"${VOLUME_USDT_MIN:,.0f}"
+    )
+
+    log.info(
+        f"Breakout Threshold: "
+        f"{BREAKOUT_THRESHOLD}%"
+    )
+
+    log.info(
+        f"Major Lookback: "
+        f"{MAJOR_LOOKBACK} x 15m"
+    )
+
+    log.info(
+        f"Major Touches: "
+        f"{MAJOR_TOUCHES}"
+    )
+
+    log.info(
+        f"Major Tolerance: "
+        f"{MAJOR_TOLERANCE * 100:.2f}%"
+    )
+
+    log.info(
+        f"Scanner Interval: "
+        f"{SCAN_INTERVAL_SEC}s"
+    )
+
+    log.info(
+        f"Level Refresh: "
+        f"{KLINE_REFRESH_SEC}s"
+    )
+
+    log.info(
+        "=============================================="
+    )
+
+    if (
+        not TELEGRAM_TOKEN
+        or not TELEGRAM_CHAT_ID
+    ):
+
+        log.warning(
+            "Telegram ENV eksik."
+        )
+
+    else:
+
+        send_telegram(
+            "✅ Major Support / Resistance Scanner başladı.\n\n"
+            f"24h Volume >= ${VOLUME_USDT_MIN:,.0f}\n"
+            f"Breakout/Breakdown >= %{BREAKOUT_THRESHOLD}\n"
+            f"15m Major Levels\n"
+            f"Support + Resistance aynı scanner."
+        )
 
     while True:
-        try:
-            hits = scan_once()
-            for hit in hits:
-                symbol = hit["symbol"]
-                window = hit["window_open_time"]
-                if alerted_window.get(symbol) == window:
-                    continue  # bu pencerede zaten uyarildik
-                alerted_window[symbol] = window
 
-                msg = format_alert(hit)
-                log.info(msg)
-                send_telegram(msg)
+        start = time.time()
+
+        try:
+
+            hits = scan_once()
+
+            for hit in hits:
+
+                message = format_alert(
+                    hit
+                )
+
+                log.info(
+                    "\n" + message
+                )
+
+                send_telegram(
+                    message
+                )
 
         except Exception as e:
-            log.error(f"Tarama döngüsü hatası: {e}")
 
-        time.sleep(CHECK_INTERVAL_SEC)
+            log.exception(
+                f"Tarama hatası: {e}"
+            )
 
+        elapsed = (
+            time.time() - start
+        )
+
+        sleep_time = max(
+            1,
+            SCAN_INTERVAL_SEC - elapsed
+        )
+
+        time.sleep(
+            sleep_time
+        )
+
+
+# ============================================================
+# ENTRY
+# ============================================================
 
 if __name__ == "__main__":
     main()
