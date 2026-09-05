@@ -1,472 +1,427 @@
-import sys
 import os
 import time
 import logging
 import requests
-from datetime import datetime, timezone
+from collections import defaultdict
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+BINANCE_BASE_URL = "https://fapi.binance.com"
+TELEGRAM_URL = "https://api.telegram.org/bot{}/sendMessage"
+
+VOLUME_USDT_MIN = float(os.getenv("VOLUME_USDT_MIN", "1000000"))
+
+BREAKOUT_THRESHOLD = float(os.getenv("BREAKOUT_THRESHOLD", "5"))
+MAX_BREAKOUT_DISTANCE = float(os.getenv("MAX_BREAKOUT_DISTANCE", "10"))
+
+SCAN_INTERVAL_SEC = int(os.getenv("SCAN_INTERVAL_SEC", "10"))
+
+SYMBOL_REFRESH_SEC = int(os.getenv("SYMBOL_REFRESH_SEC", "1800"))
+VOLUME_REFRESH_SEC = int(os.getenv("VOLUME_REFRESH_SEC", "60"))
+LEVEL_REFRESH_SEC = int(os.getenv("LEVEL_REFRESH_SEC", "60"))
+
+MAJOR_LOOKBACK = int(os.getenv("MAJOR_LOOKBACK", "288"))
+MAJOR_TOUCHES = int(os.getenv("MAJOR_TOUCHES", "2"))
+MAJOR_TOLERANCE = float(os.getenv("MAJOR_TOLERANCE", "0.005"))
+
+PIVOT_LEFT = int(os.getenv("PIVOT_LEFT", "2"))
+PIVOT_RIGHT = int(os.getenv("PIVOT_RIGHT", "2"))
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
-# ============================================================
+# =========================================================
 # LOGGING
-# ============================================================
-
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(
-    logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-)
-_handler.flush = sys.stdout.flush
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[_handler],
-    force=True
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-log = logging.getLogger(__name__)
+logger = logging.getLogger("major-level-bot")
 
 
-# ============================================================
-# SETTINGS / ENV
-# ============================================================
-
-BINANCE_FAPI = "https://fapi.binance.com"
-
-# Minimum 24h USDT volume
-VOLUME_USDT_MIN = float(
-    os.getenv("VOLUME_USDT_MIN", "1000000")
-)
-
-# Major levelden minimum uzaklaşma
-BREAKOUT_THRESHOLD = float(
-    os.getenv("BREAKOUT_THRESHOLD", "5")
-)
-
-# Ana tarama sıklığı
-SCAN_INTERVAL_SEC = int(
-    os.getenv("SCAN_INTERVAL_SEC", "10")
-)
-
-# Major seviyeleri kaç saniyede bir yeniden hesaplayalım
-LEVEL_REFRESH_SEC = int(
-    os.getenv("LEVEL_REFRESH_SEC", "60")
-)
-
-# Major level için kaç adet 15m mum
-# 288 = 72 saat = 3 gün
-MAJOR_LOOKBACK = int(
-    os.getenv("MAJOR_LOOKBACK", "288")
-)
-
-# Major level için minimum touch
-MAJOR_TOUCHES = int(
-    os.getenv("MAJOR_TOUCHES", "2")
-)
-
-# Aynı seviyenin kabul edileceği tolerans
-# 0.005 = %0.5
-MAJOR_TOLERANCE = float(
-    os.getenv("MAJOR_TOLERANCE", "0.005")
-)
-
-# Pivot hassasiyeti
-PIVOT_LEFT = int(
-    os.getenv("PIVOT_LEFT", "2")
-)
-
-PIVOT_RIGHT = int(
-    os.getenv("PIVOT_RIGHT", "2")
-)
-
-# Kline yenileme
-KLINE_REFRESH_SEC = int(
-    os.getenv("KLINE_REFRESH_SEC", "60")
-)
-
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_TOKEN",
-    ""
-)
-
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID",
-    ""
-)
-
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 0.5
-
-WINDOW_MS = 15 * 60 * 1000
-
-
-# ============================================================
-# HTTP SESSION
-# ============================================================
+# =========================================================
+# SESSION
+# =========================================================
 
 session = requests.Session()
 
-adapter = requests.adapters.HTTPAdapter(
-    pool_connections=20,
-    pool_maxsize=20
-)
-
-session.mount("https://", adapter)
+session.headers.update({
+    "User-Agent": "MajorLevelScanner/1.0"
+})
 
 
-# ============================================================
-# MEMORY
-# ============================================================
+# =========================================================
+# CACHE
+# =========================================================
 
-# symbol -> {
-#     support,
-#     resistance,
-#     updated
-# }
-major_levels = {}
+symbols_cache = []
+symbols_cache_time = 0
 
-# symbol -> last price
-previous_prices = {}
+volume_cache = {}
+volume_cache_time = 0
 
-# symbol -> last kline refresh
-last_kline_refresh = {}
+price_cache = {}
 
-# Aynı 15m penceresinde aynı sinyali tekrar gönderme
+level_cache = {}
+
+last_scan_time = 0
+
+
+# =========================================================
+# SIGNAL MEMORY
+# =========================================================
+
 alerted_support = {}
 alerted_resistance = {}
 
+# Track whether price was recently close to a level
+support_armed = {}
+resistance_armed = {}
 
-# ============================================================
-# HTTP REQUEST
-# ============================================================
 
-def _get_with_retry(url, params=None, timeout=15):
+# =========================================================
+# HTTP
+# =========================================================
 
-    attempt = 0
+def binance_get(endpoint, params=None, retries=3):
 
-    while True:
+    url = BINANCE_BASE_URL + endpoint
+
+    for attempt in range(retries):
 
         try:
 
-            r = session.get(
+            response = session.get(
                 url,
                 params=params,
-                timeout=timeout
+                timeout=10
             )
 
-        except requests.exceptions.RequestException as e:
+            if response.status_code == 200:
+                return response.json()
 
-            attempt += 1
+            if response.status_code in (418, 429):
 
-            if attempt > MAX_RETRIES:
-                raise
-
-            wait = RETRY_BACKOFF_BASE * (2 ** attempt)
-
-            log.warning(
-                f"Network error: {e} | "
-                f"{wait:.1f}s sonra tekrar"
-            )
-
-            time.sleep(wait)
-
-            continue
-
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
-
-        if r.status_code == 200:
-            return r.json()
-
-        # ----------------------------------------------------
-        # 418
-        # ----------------------------------------------------
-
-        if r.status_code == 418:
-
-            retry_after = r.headers.get(
-                "Retry-After"
-            )
-
-            try:
-                wait = float(retry_after) if retry_after else 60
-            except ValueError:
-                wait = 60
-
-            wait += 2
-
-            log.error(
-                f"HTTP 418 - Binance IP geçici ban. "
-                f"{wait:.0f}s bekleniyor."
-            )
-
-            remaining = wait
-
-            while remaining > 0:
-
-                chunk = min(20, remaining)
-
-                time.sleep(chunk)
-
-                remaining -= chunk
-
-                if remaining > 0:
-
-                    log.info(
-                        f"[418] kalan ~{remaining:.0f}s"
-                    )
-
-            attempt = 0
-            continue
-
-        # ----------------------------------------------------
-        # 429
-        # ----------------------------------------------------
-
-        if r.status_code == 429:
-
-            retry_after = r.headers.get(
-                "Retry-After"
-            )
-
-            wait = RETRY_BACKOFF_BASE * (
-                2 ** attempt
-            )
-
-            if retry_after:
-
-                try:
-                    wait = max(
-                        wait,
-                        float(retry_after)
-                    )
-                except ValueError:
-                    pass
-
-            attempt += 1
-
-            log.warning(
-                f"HTTP 429 | "
-                f"{wait:.1f}s bekle | "
-                f"deneme {attempt}"
-            )
-
-            time.sleep(wait)
-
-            if attempt > MAX_RETRIES:
-
-                raise Exception(
-                    "HTTP 429 - retry limiti"
+                wait_time = min(
+                    30,
+                    2 ** attempt
                 )
 
-            continue
+                logger.warning(
+                    "Binance rate limit %s - waiting %ss",
+                    response.status_code,
+                    wait_time
+                )
 
-        # ----------------------------------------------------
-        # OTHER
-        # ----------------------------------------------------
+                time.sleep(wait_time)
+                continue
 
-        attempt += 1
-
-        wait = RETRY_BACKOFF_BASE * (
-            2 ** attempt
-        )
-
-        log.warning(
-            f"HTTP {r.status_code} | "
-            f"{wait:.1f}s sonra tekrar"
-        )
-
-        time.sleep(wait)
-
-        if attempt > MAX_RETRIES:
-
-            raise Exception(
-                f"HTTP {r.status_code}"
+            logger.warning(
+                "Binance HTTP %s: %s",
+                response.status_code,
+                response.text[:200]
             )
 
+        except requests.RequestException as e:
 
-# ============================================================
+            logger.warning(
+                "Binance request error: %s",
+                e
+            )
+
+            time.sleep(2 ** attempt)
+
+    return None
+
+
+# =========================================================
 # TELEGRAM
-# ============================================================
+# =========================================================
 
 def send_telegram(message):
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
 
-        log.warning(
-            "Telegram ENV eksik."
+        logger.error(
+            "TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID eksik."
         )
 
-        return
+        return False
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
+    url = TELEGRAM_URL.format(TELEGRAM_TOKEN)
+
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message
+    }
 
     try:
 
-        r = session.post(
+        response = requests.post(
             url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message
-            },
+            json=payload,
             timeout=10
         )
 
-        if r.status_code != 200:
+        if response.status_code == 200:
+            return True
 
-            log.error(
-                f"Telegram HTTP {r.status_code}: "
-                f"{r.text[:200]}"
-            )
-
-    except Exception as e:
-
-        log.error(
-            f"Telegram gönderim hatası: {e}"
+        logger.warning(
+            "Telegram error: %s",
+            response.text[:300]
         )
 
+    except requests.RequestException as e:
 
-# ============================================================
+        logger.warning(
+            "Telegram request error: %s",
+            e
+        )
+
+    return False
+
+
+# =========================================================
 # SYMBOLS
-# ============================================================
+# =========================================================
 
 def get_usdt_futures_symbols():
 
-    data = _get_with_retry(
-        f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
-    )
+    global symbols_cache
+    global symbols_cache_time
 
-    symbols = [
+    now = time.time()
 
-        s["symbol"]
+    if (
+        symbols_cache
+        and now - symbols_cache_time < SYMBOL_REFRESH_SEC
+    ):
+        return symbols_cache
 
-        for s in data["symbols"]
+    data = binance_get("/fapi/v1/exchangeInfo")
+
+    if not data:
+        return symbols_cache
+
+    result = []
+
+    for symbol in data.get("symbols", []):
 
         if (
-            s["symbol"].endswith("USDT")
-            and s.get("contractType") == "PERPETUAL"
-            and s.get("status") == "TRADING"
-        )
-    ]
+            symbol.get("status") == "TRADING"
+            and symbol.get("quoteAsset") == "USDT"
+            and symbol.get("contractType") == "PERPETUAL"
+        ):
 
-    return symbols
+            result.append(symbol["symbol"])
+
+    symbols_cache = result
+    symbols_cache_time = now
+
+    logger.info(
+        "USDT perpetual symbols: %s",
+        len(result)
+    )
+
+    return result
 
 
-# ============================================================
+# =========================================================
 # 24H VOLUME
-# ============================================================
+# =========================================================
 
 def get_24h_volumes():
 
-    data = _get_with_retry(
-        f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
-    )
+    global volume_cache
+    global volume_cache_time
 
-    return {
-        item["symbol"]:
-        float(item["quoteVolume"])
-        for item in data
-    }
+    now = time.time()
+
+    if (
+        volume_cache
+        and now - volume_cache_time < VOLUME_REFRESH_SEC
+    ):
+        return volume_cache
+
+    data = binance_get("/fapi/v1/ticker/24hr")
+
+    if not data:
+        return volume_cache
+
+    result = {}
+
+    for item in data:
+
+        symbol = item.get("symbol")
+
+        if not symbol:
+            continue
+
+        try:
+
+            quote_volume = float(
+                item.get("quoteVolume", 0)
+            )
+
+            result[symbol] = quote_volume
+
+        except (TypeError, ValueError):
+
+            continue
+
+    volume_cache = result
+    volume_cache_time = now
+
+    return result
 
 
-# ============================================================
-# BULK PRICE
-# ============================================================
+# =========================================================
+# ALL PRICES
+# =========================================================
 
 def get_all_prices():
 
-    data = _get_with_retry(
-        f"{BINANCE_FAPI}/fapi/v1/ticker/price"
-    )
+    data = binance_get("/fapi/v1/ticker/price")
 
-    return {
-        item["symbol"]:
-        float(item["price"])
-        for item in data
-    }
+    if not data:
+        return {}
+
+    result = {}
+
+    for item in data:
+
+        symbol = item.get("symbol")
+
+        try:
+
+            price = float(item.get("price", 0))
+
+            if price > 0:
+                result[symbol] = price
+
+        except (TypeError, ValueError):
+
+            continue
+
+    return result
 
 
-# ============================================================
-# 15M KLINE
-# ============================================================
+# =========================================================
+# 15M KLINES
+# =========================================================
 
 def get_15m_klines(symbol):
 
-    return _get_with_retry(
-        f"{BINANCE_FAPI}/fapi/v1/klines",
+    data = binance_get(
+        "/fapi/v1/klines",
         params={
             "symbol": symbol,
             "interval": "15m",
-            "limit": MAJOR_LOOKBACK + 5
+            "limit": MAJOR_LOOKBACK + 10
         }
     )
 
+    if not data:
+        return []
 
-# ============================================================
-# PIVOT LOW
-# ============================================================
+    candles = []
 
-def is_pivot_low(candles, index):
+    for candle in data:
 
-    if index - PIVOT_LEFT < 0:
-        return False
+        try:
 
-    if index + PIVOT_RIGHT >= len(candles):
-        return False
+            candles.append({
+                "open_time": int(candle[0]),
+                "open": float(candle[1]),
+                "high": float(candle[2]),
+                "low": float(candle[3]),
+                "close": float(candle[4])
+            })
 
-    low = float(
-        candles[index][3]
-    )
+        except (TypeError, ValueError, IndexError):
 
-    for i in range(
-        index - PIVOT_LEFT,
-        index + PIVOT_RIGHT + 1
-    ):
-
-        if i == index:
             continue
 
-        if float(candles[i][3]) <= low:
-            return False
-
-    return True
+    return candles
 
 
-# ============================================================
-# PIVOT HIGH
-# ============================================================
+# =========================================================
+# PIVOTS
+# =========================================================
 
-def is_pivot_high(candles, index):
+def find_pivot_highs(candles):
 
-    if index - PIVOT_LEFT < 0:
-        return False
+    pivots = []
 
-    if index + PIVOT_RIGHT >= len(candles):
-        return False
+    start = PIVOT_LEFT
+    end = len(candles) - PIVOT_RIGHT
 
-    high = float(
-        candles[index][2]
-    )
+    for i in range(start, end):
 
-    for i in range(
-        index - PIVOT_LEFT,
-        index + PIVOT_RIGHT + 1
-    ):
+        current_high = candles[i]["high"]
 
-        if i == index:
-            continue
+        is_pivot = True
 
-        if float(candles[i][2]) >= high:
-            return False
+        for j in range(
+            i - PIVOT_LEFT,
+            i + PIVOT_RIGHT + 1
+        ):
 
-    return True
+            if j == i:
+                continue
+
+            if candles[j]["high"] >= current_high:
+
+                is_pivot = False
+                break
+
+        if is_pivot:
+            pivots.append(current_high)
+
+    return pivots
 
 
-# ============================================================
-# CLUSTER LEVELS
-# ============================================================
+def find_pivot_lows(candles):
+
+    pivots = []
+
+    start = PIVOT_LEFT
+    end = len(candles) - PIVOT_RIGHT
+
+    for i in range(start, end):
+
+        current_low = candles[i]["low"]
+
+        is_pivot = True
+
+        for j in range(
+            i - PIVOT_LEFT,
+            i + PIVOT_RIGHT + 1
+        ):
+
+            if j == i:
+                continue
+
+            if candles[j]["low"] <= current_low:
+
+                is_pivot = False
+                break
+
+        if is_pivot:
+            pivots.append(current_low)
+
+    return pivots
+
+
+# =========================================================
+# LEVEL CLUSTERING
+# =========================================================
 
 def cluster_levels(levels):
 
@@ -477,695 +432,587 @@ def cluster_levels(levels):
 
     clusters = []
 
-    current = [
-        levels[0]
-    ]
+    current_cluster = [levels[0]]
 
-    for price in levels[1:]:
+    for level in levels[1:]:
 
-        average = (
-            sum(current)
-            / len(current)
-        )
+        average = sum(current_cluster) / len(current_cluster)
 
-        distance = (
-            abs(price - average)
-            / average
-        )
+        distance = abs(level - average) / average
 
         if distance <= MAJOR_TOLERANCE:
 
-            current.append(price)
+            current_cluster.append(level)
 
         else:
 
-            clusters.append(
-                current
-            )
+            clusters.append(current_cluster)
 
-            current = [
-                price
-            ]
+            current_cluster = [level]
 
-    clusters.append(current)
+    clusters.append(current_cluster)
 
-    return clusters
+    result = []
+
+    for cluster in clusters:
+
+        if len(cluster) >= MAJOR_TOUCHES:
+
+            average = sum(cluster) / len(cluster)
+
+            result.append({
+                "level": average,
+                "touches": len(cluster)
+            })
+
+    return result
 
 
-# ============================================================
-# MAJOR LEVEL CALCULATION
-# ============================================================
+# =========================================================
+# FIND MAJOR LEVELS
+# =========================================================
 
-def calculate_major_levels(candles):
+def calculate_major_levels(candles, current_price):
 
-    # Açık 15m mum kullanılmaz.
-    closed = candles[:-1]
-
-    if len(closed) < 30:
+    if len(candles) < 30:
         return None, None
 
-    support_pivots = []
-    resistance_pivots = []
+    # Exclude current/open candle
+    closed_candles = candles[:-1]
 
-    end = (
-        len(closed)
-        - PIVOT_RIGHT
+    pivot_highs = find_pivot_highs(
+        closed_candles
     )
 
-    for i in range(
-        PIVOT_LEFT,
-        end
-    ):
-
-        if is_pivot_low(
-            closed,
-            i
-        ):
-
-            support_pivots.append(
-                float(
-                    closed[i][3]
-                )
-            )
-
-        if is_pivot_high(
-            closed,
-            i
-        ):
-
-            resistance_pivots.append(
-                float(
-                    closed[i][2]
-                )
-            )
-
-    support_clusters = cluster_levels(
-        support_pivots
+    pivot_lows = find_pivot_lows(
+        closed_candles
     )
 
     resistance_clusters = cluster_levels(
-        resistance_pivots
+        pivot_highs
     )
 
-    # --------------------------------------------------------
-    # MAJOR SUPPORT
-    # --------------------------------------------------------
+    support_clusters = cluster_levels(
+        pivot_lows
+    )
+
+    # -----------------------------------------------------
+    # IMPORTANT:
+    # Support MUST be below current price
+    # Resistance MUST be above current price
+    # -----------------------------------------------------
 
     valid_supports = [
-
-        sum(cluster)
-        / len(cluster)
-
-        for cluster
-        in support_clusters
-
-        if len(cluster)
-        >= MAJOR_TOUCHES
+        x for x in support_clusters
+        if x["level"] < current_price
     ]
-
-    # --------------------------------------------------------
-    # MAJOR RESISTANCE
-    # --------------------------------------------------------
 
     valid_resistances = [
-
-        sum(cluster)
-        / len(cluster)
-
-        for cluster
-        in resistance_clusters
-
-        if len(cluster)
-        >= MAJOR_TOUCHES
+        x for x in resistance_clusters
+        if x["level"] > current_price
     ]
+
+    # Nearest valid support below price
+    support = None
 
     if valid_supports:
 
-        # En güncel / yüksek destek
-        support = max(
-            valid_supports
+        nearest_support = max(
+            valid_supports,
+            key=lambda x: x["level"]
         )
 
-    else:
+        support = nearest_support["level"]
 
-        support = None
+    # Nearest valid resistance above price
+    resistance = None
 
     if valid_resistances:
 
-        # En güncel / düşük direnç
-        resistance = min(
-            valid_resistances
+        nearest_resistance = min(
+            valid_resistances,
+            key=lambda x: x["level"]
         )
 
-    else:
-
-        resistance = None
+        resistance = nearest_resistance["level"]
 
     return support, resistance
 
 
-# ============================================================
-# REFRESH LEVELS
-# ============================================================
+# =========================================================
+# LEVEL CACHE
+# =========================================================
 
 def refresh_major_levels(
-    candidates
+    symbol,
+    current_price
 ):
 
     now = time.time()
 
-    updated = 0
-    failed = 0
+    cached = level_cache.get(symbol)
 
-    for symbol in candidates:
+    if cached:
 
-        last = last_kline_refresh.get(
-            symbol,
-            0
+        if now - cached["time"] < LEVEL_REFRESH_SEC:
+
+            return (
+                cached["support"],
+                cached["resistance"]
+            )
+
+    candles = get_15m_klines(symbol)
+
+    if not candles:
+
+        return (
+            cached["support"] if cached else None,
+            cached["resistance"] if cached else None
         )
 
-        if (
-            now - last
-            < KLINE_REFRESH_SEC
-        ):
+    support, resistance = calculate_major_levels(
+        candles,
+        current_price
+    )
 
-            continue
+    level_cache[symbol] = {
+        "time": now,
+        "support": support,
+        "resistance": resistance
+    }
 
-        try:
+    return support, resistance
 
-            candles = get_15m_klines(
-                symbol
-            )
 
-            support, resistance = (
-                calculate_major_levels(
-                    candles
-                )
-            )
+# =========================================================
+# 15M WINDOW
+# =========================================================
 
-            major_levels[symbol] = {
+def get_current_15m_window():
 
-                "support": support,
+    now_ms = int(time.time() * 1000)
 
-                "resistance": resistance,
+    fifteen_minutes_ms = 15 * 60 * 1000
 
-                "updated": now
-            }
-
-            last_kline_refresh[symbol] = now
-
-            updated += 1
-
-        except Exception as e:
-
-            failed += 1
-
-            log.warning(
-                f"{symbol} level error: {e}"
-            )
-
-    log.info(
-        f"Major levels | "
-        f"updated={updated} "
-        f"failed={failed}"
+    return (
+        now_ms // fifteen_minutes_ms
     )
 
 
-# ============================================================
-# SIGNAL CHECK
-# ============================================================
+# =========================================================
+# FORMAT PRICE
+# =========================================================
 
-def check_signal(
+def format_price(price):
+
+    if price >= 1000:
+        return f"{price:.2f}"
+
+    if price >= 1:
+        return f"{price:.4f}"
+
+    if price >= 0.1:
+        return f"{price:.5f}"
+
+    if price >= 0.01:
+        return f"{price:.6f}"
+
+    if price >= 0.001:
+        return f"{price:.7f}"
+
+    return f"{price:.10f}"
+
+
+# =========================================================
+# ALERT FORMAT
+# =========================================================
+
+def format_alert(
+    symbol,
+    direction,
+    level,
+    price,
+    distance,
+    volume
+):
+
+    if direction == "support":
+
+        title = "🔴 MAJOR SUPPORT BREAKDOWN"
+
+        distance_text = f"-{distance:.2f}%"
+
+    else:
+
+        title = "🟢 MAJOR RESISTANCE BREAKOUT"
+
+        distance_text = f"+{distance:.2f}%"
+
+    utc_time = time.strftime(
+        "%H:%M:%S UTC",
+        time.gmtime()
+    )
+
+    return f"""
+{title}
+
+━━━━━━━━━━━━━━━━━━
+
+Coin: {symbol}
+
+Major Level: {format_price(level)}
+
+Fiyat: {format_price(price)}
+
+Level'dan uzaklık: {distance_text}
+
+24h Hacim: ${volume:,.0f}
+
+Timeframe: 15m
+
+━━━━━━━━━━━━━━━━━━
+
+{utc_time}
+""".strip()
+
+
+# =========================================================
+# CHECK SUPPORT
+# =========================================================
+
+def check_support_signal(
     symbol,
     price,
+    support,
     volume,
     window
 ):
 
-    signals = []
+    if support is None:
+        return
 
-    levels = major_levels.get(
-        symbol
+    # Price must actually be below support
+    if price >= support:
+
+        # Reset when price returns above level
+        support_armed[symbol] = False
+
+        return
+
+    distance = (
+        (support - price)
+        / support
+        * 100
     )
 
-    if not levels:
-        return signals
+    # -----------------------------------------------------
+    # Price has entered the "break zone".
+    #
+    # We arm the setup between 0% and 5%.
+    # Then alert when it reaches 5%-10%.
+    # -----------------------------------------------------
 
-    support = levels.get(
-        "support"
-    )
+    if 0 <= distance < BREAKOUT_THRESHOLD:
 
-    resistance = levels.get(
-        "resistance"
-    )
+        support_armed[symbol] = True
 
-    # ========================================================
-    # SUPPORT BREAKDOWN
-    # ========================================================
+        return
 
-    if support and support > 0:
+    # Too far = stale move
+    if distance > MAX_BREAKOUT_DISTANCE:
 
-        # Fiyat support'un ne kadar altında?
-        breakdown_pct = (
-            (
-                support - price
+        support_armed[symbol] = False
+
+        return
+
+    # -----------------------------------------------------
+    # Only trigger if:
+    #
+    # 1. price previously entered the break zone
+    # 2. now reached >= 5%
+    # -----------------------------------------------------
+
+    if distance >= BREAKOUT_THRESHOLD:
+
+        if not support_armed.get(symbol, False):
+
+            return
+
+        if alerted_support.get(symbol) == window:
+
+            return
+
+        message = format_alert(
+            symbol,
+            "support",
+            support,
+            price,
+            distance,
+            volume
+        )
+
+        if send_telegram(message):
+
+            alerted_support[symbol] = window
+
+            logger.info(
+                "SUPPORT BREAKDOWN | %s | %.2f%%",
+                symbol,
+                distance
             )
-            / support
-        ) * 100
 
-        # ÖNEMLİ:
-        # Artık previous_price >= support
-        # şartı YOK.
-        #
-        # Böylece bot ilk crossing'i kaçırsa bile
-        # fiyat %5 seviyesine ulaştığında alarm verir.
 
-        if (
-            price < support
-            and breakdown_pct
-            >= BREAKOUT_THRESHOLD
-        ):
+# =========================================================
+# CHECK RESISTANCE
+# =========================================================
 
-            if (
-                alerted_support.get(symbol)
-                != window
-            ):
+def check_resistance_signal(
+    symbol,
+    price,
+    resistance,
+    volume,
+    window
+):
 
-                signals.append({
+    if resistance is None:
+        return
 
-                    "type":
-                    "SUPPORT_BREAKDOWN",
+    # Price must actually be above resistance
+    if price <= resistance:
 
-                    "symbol":
-                    symbol,
+        # Reset when price returns below level
+        resistance_armed[symbol] = False
 
-                    "level":
-                    support,
+        return
 
-                    "price":
-                    price,
+    distance = (
+        (price - resistance)
+        / resistance
+        * 100
+    )
 
-                    "change_pct":
-                    -breakdown_pct,
+    # Entered break zone
+    if 0 <= distance < BREAKOUT_THRESHOLD:
 
-                    "volume":
-                    volume,
+        resistance_armed[symbol] = True
 
-                    "window":
-                    window
-                })
+        return
 
-                alerted_support[
-                    symbol
-                ] = window
+    # Too far = stale move
+    if distance > MAX_BREAKOUT_DISTANCE:
 
-    # ========================================================
-    # RESISTANCE BREAKOUT
-    # ========================================================
+        resistance_armed[symbol] = False
 
-    if resistance and resistance > 0:
+        return
 
-        # Fiyat resistance'ın ne kadar üstünde?
-        breakout_pct = (
-            (
-                price - resistance
+    # Actual breakout
+    if distance >= BREAKOUT_THRESHOLD:
+
+        if not resistance_armed.get(symbol, False):
+
+            return
+
+        if alerted_resistance.get(symbol) == window:
+
+            return
+
+        message = format_alert(
+            symbol,
+            "resistance",
+            resistance,
+            price,
+            distance,
+            volume
+        )
+
+        if send_telegram(message):
+
+            alerted_resistance[symbol] = window
+
+            logger.info(
+                "RESISTANCE BREAKOUT | %s | %.2f%%",
+                symbol,
+                distance
             )
-            / resistance
-        ) * 100
-
-        if (
-            price > resistance
-            and breakout_pct
-            >= BREAKOUT_THRESHOLD
-        ):
-
-            if (
-                alerted_resistance.get(symbol)
-                != window
-            ):
-
-                signals.append({
-
-                    "type":
-                    "RESISTANCE_BREAKOUT",
-
-                    "symbol":
-                    symbol,
-
-                    "level":
-                    resistance,
-
-                    "price":
-                    price,
-
-                    "change_pct":
-                    breakout_pct,
-
-                    "volume":
-                    volume,
-
-                    "window":
-                    window
-                })
-
-                alerted_resistance[
-                    symbol
-                ] = window
-
-    previous_prices[
-        symbol
-    ] = price
-
-    return signals
 
 
-# ============================================================
-# ALERT FORMAT
-# ============================================================
+# =========================================================
+# CLEANUP
+# =========================================================
 
-def format_alert(hit):
+def cleanup_memory():
 
-    if (
-        hit["type"]
-        == "SUPPORT_BREAKDOWN"
+    current_window = get_current_15m_window()
+
+    old_limit = current_window - 4
+
+    for symbol in list(
+        alerted_support.keys()
     ):
 
-        title = (
-            "🔴 MAJOR SUPPORT BREAKDOWN"
-        )
+        if alerted_support[symbol] < old_limit:
 
-        movement = (
-            f"Support'tan uzaklık: "
-            f"{hit['change_pct']:.2f}%"
-        )
+            del alerted_support[symbol]
 
-    else:
+    for symbol in list(
+        alerted_resistance.keys()
+    ):
 
-        title = (
-            "🟢 MAJOR RESISTANCE BREAKOUT"
-        )
+        if alerted_resistance[symbol] < old_limit:
 
-        movement = (
-            f"Resistance'tan uzaklık: "
-            f"+{hit['change_pct']:.2f}%"
-        )
-
-    return (
-        f"{title}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"Coin: {hit['symbol']}\n"
-        f"Major Level: {hit['level']}\n"
-        f"Fiyat: {hit['price']}\n"
-        f"{movement}\n"
-        f"24h Hacim: "
-        f"${hit['volume']:,.0f}\n"
-        f"Timeframe: 15m\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"{datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}"
-    )
+            del alerted_resistance[symbol]
 
 
-# ============================================================
-# SCAN
-# ============================================================
+# =========================================================
+# MAIN SCAN
+# =========================================================
 
-def scan_once():
-
-    # --------------------------------------------------------
-    # SYMBOLS
-    # --------------------------------------------------------
+def scan():
 
     symbols = get_usdt_futures_symbols()
 
     if not symbols:
-
-        log.error(
-            "Symbol listesi alınamadı."
-        )
-
-        return []
-
-    # --------------------------------------------------------
-    # VOLUME
-    # --------------------------------------------------------
+        return
 
     volumes = get_24h_volumes()
-
-    candidates = [
-
-        symbol
-
-        for symbol in symbols
-
-        if volumes.get(
-            symbol,
-            0
-        ) >= VOLUME_USDT_MIN
-    ]
-
-    log.info(
-        f"Futures: {len(symbols)} | "
-        f"24h >= ${VOLUME_USDT_MIN:,.0f}: "
-        f"{len(candidates)}"
-    )
-
-    if not candidates:
-        return []
-
-    # --------------------------------------------------------
-    # MAJOR LEVELS
-    # --------------------------------------------------------
-
-    refresh_major_levels(
-        candidates
-    )
-
-    # --------------------------------------------------------
-    # CURRENT PRICES
-    # --------------------------------------------------------
 
     prices = get_all_prices()
 
     if not prices:
+        return
 
-        log.error(
-            "Fiyat verisi alınamadı."
-        )
+    window = get_current_15m_window()
 
-        return []
+    eligible = []
 
-    # --------------------------------------------------------
-    # CURRENT 15M WINDOW
-    # --------------------------------------------------------
+    for symbol in symbols:
 
-    now_ms = int(
-        time.time() * 1000
-    )
+        volume = volumes.get(symbol, 0)
 
-    current_window = (
-        now_ms // WINDOW_MS
-    ) * WINDOW_MS
-
-    hits = []
-
-    for symbol in candidates:
-
-        price = prices.get(
-            symbol
-        )
-
-        if price is None:
+        if volume < VOLUME_USDT_MIN:
             continue
 
-        signals = check_signal(
+        price = prices.get(symbol)
 
-            symbol=symbol,
+        if not price or price <= 0:
+            continue
 
-            price=price,
-
-            volume=volumes.get(
-                symbol,
-                0
-            ),
-
-            window=current_window
+        eligible.append(
+            (symbol, price, volume)
         )
 
-        hits.extend(
-            signals
-        )
-
-    return hits
-
-
-# ============================================================
-# CLEAN OLD MEMORY
-# ============================================================
-
-def cleanup_memory():
-
-    now_ms = int(
-        time.time() * 1000
+    logger.info(
+        "Eligible coins: %s",
+        len(eligible)
     )
 
-    current_window = (
-        now_ms // WINDOW_MS
-    ) * WINDOW_MS
+    # -----------------------------------------------------
+    # Analyze eligible symbols
+    # -----------------------------------------------------
 
-    # 1 saatten eski alert kayıtlarını temizle
-    cutoff = (
-        current_window
-        - (4 * WINDOW_MS)
-    )
-
-    for storage in [
-        alerted_support,
-        alerted_resistance
-    ]:
-
-        old_symbols = [
-
-            symbol
-
-            for symbol, window
-            in storage.items()
-
-            if window < cutoff
-        ]
-
-        for symbol in old_symbols:
-
-            del storage[
-                symbol
-            ]
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    log.info(
-        "=========================================="
-    )
-
-    log.info(
-        "MAJOR SUPPORT / RESISTANCE SCANNER"
-    )
-
-    log.info(
-        "=========================================="
-    )
-
-    log.info(
-        f"24h Volume >= "
-        f"${VOLUME_USDT_MIN:,.0f}"
-    )
-
-    log.info(
-        f"Breakout / Breakdown >= "
-        f"{BREAKOUT_THRESHOLD}%"
-    )
-
-    log.info(
-        f"Major Lookback = "
-        f"{MAJOR_LOOKBACK} x 15m"
-    )
-
-    log.info(
-        f"Major Touches = "
-        f"{MAJOR_TOUCHES}"
-    )
-
-    log.info(
-        f"Tolerance = "
-        f"{MAJOR_TOLERANCE * 100:.2f}%"
-    )
-
-    log.info(
-        f"Scan interval = "
-        f"{SCAN_INTERVAL_SEC}s"
-    )
-
-    log.info(
-        "=========================================="
-    )
-
-    if (
-        not TELEGRAM_TOKEN
-        or not TELEGRAM_CHAT_ID
-    ):
-
-        log.warning(
-            "TELEGRAM_TOKEN veya "
-            "TELEGRAM_CHAT_ID eksik."
-        )
-
-    else:
-
-        send_telegram(
-            "✅ Major Support / Resistance "
-            "Scanner başladı.\n\n"
-            f"24h Volume >= "
-            f"${VOLUME_USDT_MIN:,.0f}\n"
-            f"Breakout / Breakdown >= "
-            f"{BREAKOUT_THRESHOLD}%\n"
-            f"Timeframe: 15m\n"
-            f"Support + Resistance aynı scanner."
-        )
-
-    # ========================================================
-    # LOOP
-    # ========================================================
-
-    while True:
-
-        started = time.time()
+    for symbol, price, volume in eligible:
 
         try:
 
-            hits = scan_once()
+            support, resistance = refresh_major_levels(
+                symbol,
+                price
+            )
 
-            for hit in hits:
+            check_support_signal(
+                symbol,
+                price,
+                support,
+                volume,
+                window
+            )
 
-                message = format_alert(
-                    hit
-                )
-
-                log.info(
-                    "\n" + message
-                )
-
-                send_telegram(
-                    message
-                )
-
-            cleanup_memory()
+            check_resistance_signal(
+                symbol,
+                price,
+                resistance,
+                volume,
+                window
+            )
 
         except Exception as e:
 
-            log.exception(
-                f"Tarama döngüsü hatası: {e}"
+            logger.exception(
+                "Error processing %s: %s",
+                symbol,
+                e
             )
 
-        elapsed = (
-            time.time() - started
-        )
+    cleanup_memory()
+
+
+# =========================================================
+# START
+# =========================================================
+
+def main():
+
+    logger.info(
+        "=========================================="
+    )
+
+    logger.info(
+        "MAJOR SUPPORT / RESISTANCE BOT STARTED"
+    )
+
+    logger.info(
+        "Volume minimum: $%s",
+        f"{VOLUME_USDT_MIN:,.0f}"
+    )
+
+    logger.info(
+        "Breakout threshold: %.2f%%",
+        BREAKOUT_THRESHOLD
+    )
+
+    logger.info(
+        "Maximum breakout distance: %.2f%%",
+        MAX_BREAKOUT_DISTANCE
+    )
+
+    logger.info(
+        "Scan interval: %ss",
+        SCAN_INTERVAL_SEC
+    )
+
+    logger.info(
+        "Major lookback: %s candles",
+        MAJOR_LOOKBACK
+    )
+
+    logger.info(
+        "=========================================="
+    )
+
+    while True:
+
+        start = time.time()
+
+        try:
+
+            scan()
+
+        except Exception as e:
+
+            logger.exception(
+                "Main scan error: %s",
+                e
+            )
+
+        elapsed = time.time() - start
 
         sleep_time = max(
             1,
             SCAN_INTERVAL_SEC - elapsed
         )
 
-        time.sleep(
-            sleep_time
-        )
+        time.sleep(sleep_time)
 
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
     main()
