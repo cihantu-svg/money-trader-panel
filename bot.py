@@ -154,13 +154,17 @@ def pivots(candles, window=5):
     return highs, lows
 
 
-def find_wedge(candles, direction):
-    """direction: 'up' (düşen takoz, yukarı kırılım) | 'dn' (yükselen takoz, aşağı kırılım)"""
+def find_wedge(candles, direction, prefer_recent_from=None):
+    """direction: 'up' (düşen takoz, yukarı kırılım) | 'dn' (yükselen takoz, aşağı kırılım)
+    prefer_recent_from: verilirse, break_bar bu bar indeksinden büyük/eşit olan adaylar arasından
+    en çok temaslı olan seçilir (yoksa genel en çok temaslıya düşülür). Bu sayede "5 temaslı ama
+    bayat" bir çizgi, "3 temaslı ama az önce kırılan" güncel çizginin önüne geçmez."""
     highs, lows = pivots(candles, 5)
     n = len(candles)
     piv = [p for p in (highs if direction == "up" else lows) if p[0] >= n - 401][-10:]
 
     best = None
+    best_recent = None
     for i in range(len(piv) - 1):
         for j in range(i + 1, len(piv)):
             b1, p1 = piv[i]
@@ -192,9 +196,14 @@ def find_wedge(candles, direction):
                 if tz and not prev_touch:
                     touches += 1
                 prev_touch = tz
+            cand = {"p1": p1, "b1": b1, "slope": slope, "touches": touches, "break_bar": break_bar}
             if best is None or touches > best["touches"]:
-                best = {"p1": p1, "b1": b1, "slope": slope, "touches": touches, "break_bar": break_bar}
-    return best
+                best = cand
+            if (prefer_recent_from is not None and break_bar is not None
+                    and break_bar >= prefer_recent_from
+                    and (best_recent is None or touches > best_recent["touches"])):
+                best_recent = cand
+    return best_recent if best_recent is not None else best
 
 
 def evaluate_symbol(symbol, tf):
@@ -207,7 +216,7 @@ def evaluate_symbol(symbol, tf):
     n = len(candles)
     results = []
     for direction in ("up", "dn"):
-        w = find_wedge(candles, direction)
+        w = find_wedge(candles, direction, prefer_recent_from=n - BREAK_LOOKBACK)
         if not w or w["break_bar"] is None or w["break_bar"] < n - BREAK_LOOKBACK:
             continue
         stats["any_wedge"] = True
