@@ -46,6 +46,14 @@ HTTP.headers.update({"User-Agent": "wedge-pump-bot/1.0"})
 
 # aynı (sembol, yön) için tekrar tekrar bildirim atmamak için
 already_alerted = set()
+# her kaynağın ilk hatasını bir kere loglamak için (log spam'i önlemek için)
+_warned_sources = set()
+
+
+def _warn_once(key, msg):
+    if key not in _warned_sources:
+        _warned_sources.add(key)
+        log.warning(msg)
 
 
 # ---------------- Veri katmanı ----------------
@@ -87,12 +95,15 @@ def fetch_klines(symbol, tf):
             params={"category": "spot", "symbol": symbol, "interval": BYB_INTERVAL[tf], "limit": KLINE_LIMIT},
             timeout=10,
         )
-        rows = r.json().get("result", {}).get("list", [])
-        if rows:
-            rows = list(reversed(rows))  # bybit yeniden eskiye döner
-            return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
-    except Exception:
-        pass
+        if r.status_code != 200:
+            _warn_once("byb_spot_kline", f"Bybit spot kline istekleri başarısız (örnek HTTP {r.status_code} - {symbol}). IP engeli/rate-limit olabilir.")
+        else:
+            rows = r.json().get("result", {}).get("list", [])
+            if rows:
+                rows = list(reversed(rows))  # bybit yeniden eskiye döner
+                return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+    except Exception as e:
+        _warn_once("byb_spot_kline_exc", f"Bybit spot kline isteğinde istisna (örnek: {symbol}): {e}")
     # 2) Bybit linear (futures) - spotta yoksa
     try:
         r = HTTP.get(
@@ -100,12 +111,15 @@ def fetch_klines(symbol, tf):
             params={"category": "linear", "symbol": symbol, "interval": BYB_INTERVAL[tf], "limit": KLINE_LIMIT},
             timeout=10,
         )
-        rows = r.json().get("result", {}).get("list", [])
-        if rows:
-            rows = list(reversed(rows))
-            return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
-    except Exception:
-        pass
+        if r.status_code != 200:
+            _warn_once("byb_lin_kline", f"Bybit linear kline istekleri başarısız (örnek HTTP {r.status_code} - {symbol}).")
+        else:
+            rows = r.json().get("result", {}).get("list", [])
+            if rows:
+                rows = list(reversed(rows))
+                return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+    except Exception as e:
+        _warn_once("byb_lin_kline_exc", f"Bybit linear kline isteğinde istisna (örnek: {symbol}): {e}")
     # 3) Binance (coğrafi blok bypass'lı public veri ucu)
     try:
         r = HTTP.get(
@@ -113,11 +127,14 @@ def fetch_klines(symbol, tf):
             params={"symbol": symbol, "interval": BIN_INTERVAL[tf], "limit": KLINE_LIMIT},
             timeout=10,
         )
-        rows = r.json()
-        if isinstance(rows, list) and rows:
-            return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
-    except Exception:
-        pass
+        if r.status_code != 200:
+            _warn_once("bin_kline", f"Binance kline istekleri başarısız (örnek HTTP {r.status_code} - {symbol}).")
+        else:
+            rows = r.json()
+            if isinstance(rows, list) and rows:
+                return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+    except Exception as e:
+        _warn_once("bin_kline_exc", f"Binance kline isteğinde istisna (örnek: {symbol}): {e}")
     return None
 
 
@@ -180,17 +197,23 @@ def find_wedge(candles, direction):
 
 
 def evaluate_symbol(symbol, tf):
+    """Döner: (hits, stats) — stats teşhis amaçlı (veri geldi mi, takoz bulundu mu, en iyi temas/gövde%)"""
     candles = fetch_klines(symbol, tf)
+    stats = {"got_data": False, "any_wedge": False, "max_touches": 0, "body_pct": 0.0}
     if not candles or len(candles) < 60:
-        return []
+        return [], stats
+    stats["got_data"] = True
     n = len(candles)
     last = candles[-1]
     body_pct = abs(last["c"] - last["o"]) / last["o"] * 100 if last["o"] else 0
+    stats["body_pct"] = body_pct
     results = []
     for direction in ("up", "dn"):
         w = find_wedge(candles, direction)
         if not w or w["break_bar"] is None or w["break_bar"] != n - 1:
             continue
+        stats["any_wedge"] = True
+        stats["max_touches"] = max(stats["max_touches"], w["touches"])
         if w["touches"] < MIN_TOUCHES:
             continue
         if body_pct < MIN_BODY_PCT:
@@ -199,7 +222,7 @@ def evaluate_symbol(symbol, tf):
             "symbol": symbol, "dir": direction, "tf": tf,
             "touches": w["touches"], "body_pct": body_pct, "price": last["c"],
         })
-    return results
+    return results, stats
 
 
 # ---------------- Telegram ----------------
@@ -249,18 +272,31 @@ def run_scan():
               len(coins), TIMEFRAME, MIN_TOUCHES, MIN_BODY_PCT)
 
     found = 0
+    got_data = 0
+    any_wedge = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(evaluate_symbol, sym, TIMEFRAME): sym for sym in coins}
         for fut in as_completed(futures):
             try:
-                hits = fut.result()
+                hits, stats = fut.result()
             except Exception as e:
                 log.debug("Sembol tarama hatası (%s): %s", futures[fut], e)
                 continue
+            if stats["got_data"]:
+                got_data += 1
+            if stats["any_wedge"]:
+                any_wedge += 1
             for hit in hits:
                 found += 1
                 notify(hit)
-    log.info("Tarama bitti: %d yeni/aktif sinyal.", found)
+    log.info(
+        "Tarama bitti: %d/%d coin'e veri geldi, %d coin'de takoz yapısı görüldü (eşik geçmemiş olabilir), %d sinyal filtreyi geçti.",
+        got_data, len(coins), any_wedge, found,
+    )
+    if got_data == 0:
+        log.error("HİÇBİR coin'e veri gelmedi! Muhtemelen Bybit/Binance bu sunucunun IP'sini engelliyor (403/451). Yukarıdaki uyarı satırlarına bak.")
+    elif any_wedge == 0:
+        log.info("Veri geldi ama hiç takoz yapısı (herhangi bir eşikte) bulunamadı — bu zaman diliminde şu an gerçekten sakin olabilir, normal bir durum.")
 
 
 def main():
