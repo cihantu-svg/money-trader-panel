@@ -36,6 +36,7 @@ MIN_BODY_PCT = float(os.environ.get("MIN_BODY_PCT", "3.0"))
 MAX_COINS = int(os.environ.get("MAX_COINS", "0"))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "180"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
+BREAK_LOOKBACK = int(os.environ.get("BREAK_LOOKBACK", "2"))
 KLINE_LIMIT = 300
 
 BYB_INTERVAL = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "D"}
@@ -204,23 +205,23 @@ def evaluate_symbol(symbol, tf):
         return [], stats
     stats["got_data"] = True
     n = len(candles)
-    last = candles[-1]
-    body_pct = abs(last["c"] - last["o"]) / last["o"] * 100 if last["o"] else 0
-    stats["body_pct"] = body_pct
     results = []
     for direction in ("up", "dn"):
         w = find_wedge(candles, direction)
-        if not w or w["break_bar"] is None or w["break_bar"] != n - 1:
+        if not w or w["break_bar"] is None or w["break_bar"] < n - BREAK_LOOKBACK:
             continue
         stats["any_wedge"] = True
         stats["max_touches"] = max(stats["max_touches"], w["touches"])
+        brk = candles[w["break_bar"]]
+        body_pct = abs(brk["c"] - brk["o"]) / brk["o"] * 100 if brk["o"] else 0
+        stats["body_pct"] = max(stats["body_pct"], body_pct)
         if w["touches"] < MIN_TOUCHES:
             continue
         if body_pct < MIN_BODY_PCT:
             continue
         results.append({
             "symbol": symbol, "dir": direction, "tf": tf,
-            "touches": w["touches"], "body_pct": body_pct, "price": last["c"],
+            "touches": w["touches"], "body_pct": body_pct, "price": candles[-1]["c"],
         })
     return results, stats
 
