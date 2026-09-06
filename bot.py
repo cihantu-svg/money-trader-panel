@@ -275,18 +275,21 @@ def run_scan():
     found = 0
     got_data = 0
     any_wedge = 0
+    wedge_details = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         futures = {ex.submit(evaluate_symbol, sym, TIMEFRAME): sym for sym in coins}
         for fut in as_completed(futures):
+            sym = futures[fut]
             try:
                 hits, stats = fut.result()
             except Exception as e:
-                log.debug("Sembol tarama hatası (%s): %s", futures[fut], e)
+                log.debug("Sembol tarama hatası (%s): %s", sym, e)
                 continue
             if stats["got_data"]:
                 got_data += 1
             if stats["any_wedge"]:
                 any_wedge += 1
+                wedge_details.append(f"{sym} (temas={stats['max_touches']}, gövde=%{stats['body_pct']:.1f})")
             for hit in hits:
                 found += 1
                 notify(hit)
@@ -294,6 +297,8 @@ def run_scan():
         "Tarama bitti: %d/%d coin'e veri geldi, %d coin'de takoz yapısı görüldü (eşik geçmemiş olabilir), %d sinyal filtreyi geçti.",
         got_data, len(coins), any_wedge, found,
     )
+    if wedge_details:
+        log.info("Takoz görülen coinler: %s", ", ".join(wedge_details))
     if got_data == 0:
         log.error("HİÇBİR coin'e veri gelmedi! Muhtemelen Bybit/Binance bu sunucunun IP'sini engelliyor (403/451). Yukarıdaki uyarı satırlarına bak.")
     elif any_wedge == 0:
