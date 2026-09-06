@@ -1,20 +1,26 @@
 """
-Wedge Pump Bot - basit takoz (wedge) kırılım tarayıcısı
---------------------------------------------------------
-Bybit marjine açık USDT paritelerini periyodik olarak tarar, düşen takoz
-(yukarı kırılım) ve yükselen takoz (aşağı kırılım) formasyonlarını arar.
-Formasyon en az MIN_TOUCHES kez test edilmiş ve kırılım mumunun gövdesi
-(open-close farkı) en az MIN_BODY_PCT ise Telegram'a bildirim gönderir.
+4H Trendline Break Bot
+----------------------
+Bybit marjine açık USDT paritelerini 4 saatlik grafikte periyodik olarak
+tarar. LuxAlgo "Trendlines with Breaks" göstergesinin ATR eğim mantığını
+kullanır: son pivot noktasından ATR bazlı bir eğimle projekte edilen
+trendline'ı fiyat kapanışla kırdığında ve kırılım mumunun gövdesi en az
+MIN_BODY_PCT ise Telegram'a bildirim gönderir.
 
-Ortam değişkenleri (Render > Environment sekmesinde ayarlanır):
+Sadece KAPANMIŞ mumlarla çalışır (henüz oluşmakta olan son mum otomatik
+atılır) — bu yüzden orijinal Pine göstergesindeki repaint sorunu burada
+yoktur.
+
+Ortam değişkenleri:
     TELEGRAM_TOKEN     - BotFather'dan alınan bot token (zorunlu)
     TELEGRAM_CHAT_ID   - Mesajın gideceği chat id (zorunlu)
-    TIMEFRAME          - "1m" | "5m" | "15m" (varsayılan "15m")
-    MIN_TOUCHES        - minimum temas sayısı (varsayılan 3)
-    MIN_BODY_PCT       - kırılım mumunun min gövde yüzdesi (varsayılan 3.0)
+    TL_LENGTH          - pivot lookback (varsayılan 14)
+    TL_MULT            - eğim çarpanı (varsayılan 1.0)
+    MIN_BODY_PCT       - kırılım mumunun min gövde yüzdesi (varsayılan 4.0)
+    BREAK_LOOKBACK     - kırılımın son kaç mum içinde sayılacağı (varsayılan 2)
     MAX_COINS          - 0 = tümü, aksi halde ilk N coin (varsayılan 0)
-    SCAN_INTERVAL_SEC  - iki tarama arası bekleme (varsayılan 180)
-    MAX_WORKERS        - eşzamanlı istek sayısı (varsayılan 8, rate-limit için düşük tutulur)
+    SCAN_INTERVAL_SEC  - iki tarama arası bekleme, saniye (varsayılan 180)
+    MAX_WORKERS        - eşzamanlı istek sayısı (varsayılan 8)
 """
 
 import os
@@ -25,29 +31,26 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("wedge-pump-bot")
+log = logging.getLogger("4h-trendline-bot")
 
 # ---------------- Ayarlar ----------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-TIMEFRAME = os.environ.get("TIMEFRAME", "15m")
-MIN_TOUCHES = int(os.environ.get("MIN_TOUCHES", "3"))
-MIN_BODY_PCT = float(os.environ.get("MIN_BODY_PCT", "3.0"))
+TIMEFRAME = "4h"
+TL_LENGTH = int(os.environ.get("TL_LENGTH", "14"))
+TL_MULT = float(os.environ.get("TL_MULT", "1.0"))
+MIN_BODY_PCT = float(os.environ.get("MIN_BODY_PCT", "4.0"))
+BREAK_LOOKBACK = int(os.environ.get("BREAK_LOOKBACK", "2"))
 MAX_COINS = int(os.environ.get("MAX_COINS", "0"))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "180"))
 MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
-BREAK_LOOKBACK = int(os.environ.get("BREAK_LOOKBACK", "2"))
 KLINE_LIMIT = 300
-
-BYB_INTERVAL = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "4h": "240", "1d": "D"}
-BIN_INTERVAL = {"1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1h", "4h": "4h", "1d": "1d"}
+INTERVAL_MS = 14_400_000  # 4 saat
 
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "wedge-pump-bot/1.0"})
+HTTP.headers.update({"User-Agent": "4h-trendline-bot/1.0"})
 
-# aynı (sembol, yön) için tekrar tekrar bildirim atmamak için
 already_alerted = set()
-# her kaynağın ilk hatasını bir kere loglamak için (log spam'i önlemek için)
 _warned_sources = set()
 
 
@@ -76,7 +79,6 @@ def fetch_margin_coins():
     except Exception as e:
         log.warning("Bybit marjin coin listesi alınamadı: %s", e)
 
-    # yedek: Binance'te USDT paritelerinin tamamı (marjin filtresi olmadan)
     try:
         r = HTTP.get("https://data-api.binance.vision/api/v3/exchangeInfo", timeout=15)
         r.raise_for_status()
@@ -87,150 +89,161 @@ def fetch_margin_coins():
         return []
 
 
-def fetch_klines(symbol, tf):
-    """[{o,h,l,c}] formatında kapanmış mumları döndürür (eskiden yeniye sıralı)."""
-    # 1) Bybit spot
+def _drop_unclosed(candles):
+    """Henüz kapanmamış son mumu atar (repaint'i önlemek için)."""
+    if not candles:
+        return candles
+    now_ms = int(time.time() * 1000)
+    if candles[-1]["t"] + INTERVAL_MS > now_ms:
+        return candles[:-1]
+    return candles
+
+
+def fetch_klines(symbol):
+    """[{t,o,h,l,c}] formatında SADECE KAPANMIŞ 4H mumları döndürür (eskiden yeniye)."""
     try:
         r = HTTP.get(
             "https://api.bybit.com/v5/market/kline",
-            params={"category": "spot", "symbol": symbol, "interval": BYB_INTERVAL[tf], "limit": KLINE_LIMIT},
+            params={"category": "spot", "symbol": symbol, "interval": "240", "limit": KLINE_LIMIT},
             timeout=10,
         )
         if r.status_code != 200:
-            _warn_once("byb_spot_kline", f"Bybit spot kline istekleri başarısız (örnek HTTP {r.status_code} - {symbol}). IP engeli/rate-limit olabilir.")
-        else:
-            rows = r.json().get("result", {}).get("list", [])
-            if rows:
-                rows = list(reversed(rows))  # bybit yeniden eskiye döner
-                return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
-    except Exception as e:
-        _warn_once("byb_spot_kline_exc", f"Bybit spot kline isteğinde istisna (örnek: {symbol}): {e}")
-    # 2) Bybit linear (futures) - spotta yoksa
-    try:
-        r = HTTP.get(
-            "https://api.bybit.com/v5/market/kline",
-            params={"category": "linear", "symbol": symbol, "interval": BYB_INTERVAL[tf], "limit": KLINE_LIMIT},
-            timeout=10,
-        )
-        if r.status_code != 200:
-            _warn_once("byb_lin_kline", f"Bybit linear kline istekleri başarısız (örnek HTTP {r.status_code} - {symbol}).")
+            _warn_once("byb_spot", f"Bybit spot kline başarısız (HTTP {r.status_code} - {symbol}).")
         else:
             rows = r.json().get("result", {}).get("list", [])
             if rows:
                 rows = list(reversed(rows))
-                return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+                candles = [{"t": int(x[0]), "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+                return _drop_unclosed(candles)
     except Exception as e:
-        _warn_once("byb_lin_kline_exc", f"Bybit linear kline isteğinde istisna (örnek: {symbol}): {e}")
-    # 3) Binance (coğrafi blok bypass'lı public veri ucu)
+        _warn_once("byb_spot_exc", f"Bybit spot kline isteğinde istisna (örnek: {symbol}): {e}")
+
     try:
         r = HTTP.get(
-            "https://data-api.binance.vision/api/v3/klines",
-            params={"symbol": symbol, "interval": BIN_INTERVAL[tf], "limit": KLINE_LIMIT},
+            "https://api.bybit.com/v5/market/kline",
+            params={"category": "linear", "symbol": symbol, "interval": "240", "limit": KLINE_LIMIT},
             timeout=10,
         )
         if r.status_code != 200:
-            _warn_once("bin_kline", f"Binance kline istekleri başarısız (örnek HTTP {r.status_code} - {symbol}).")
+            _warn_once("byb_lin", f"Bybit linear kline başarısız (HTTP {r.status_code} - {symbol}).")
+        else:
+            rows = r.json().get("result", {}).get("list", [])
+            if rows:
+                rows = list(reversed(rows))
+                candles = [{"t": int(x[0]), "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+                return _drop_unclosed(candles)
+    except Exception as e:
+        _warn_once("byb_lin_exc", f"Bybit linear kline isteğinde istisna (örnek: {symbol}): {e}")
+
+    try:
+        r = HTTP.get(
+            "https://data-api.binance.vision/api/v3/klines",
+            params={"symbol": symbol, "interval": "4h", "limit": KLINE_LIMIT},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            _warn_once("bin", f"Binance kline başarısız (HTTP {r.status_code} - {symbol}).")
         else:
             rows = r.json()
             if isinstance(rows, list) and rows:
-                return [{"o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+                candles = [{"t": int(x[0]), "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4])} for x in rows]
+                return _drop_unclosed(candles)
     except Exception as e:
-        _warn_once("bin_kline_exc", f"Binance kline isteğinde istisna (örnek: {symbol}): {e}")
+        _warn_once("bin_exc", f"Binance kline isteğinde istisna (örnek: {symbol}): {e}")
     return None
 
 
-# ---------------- Takoz (wedge) mantığı ----------------
-def pivots(candles, window=5):
-    """Fraktal pivot high/low listesi döndürür: [(bar_index, price), ...]"""
-    highs, lows = [], []
+# ---------------- Trendline (ATR eğimli) mantığı ----------------
+def wilder_atr(candles, length):
     n = len(candles)
-    for i in range(window, n - window):
-        h = candles[i]["h"]
-        l = candles[i]["l"]
-        if all(h >= candles[j]["h"] for j in range(i - window, i + window + 1)):
-            highs.append((i, h))
-        if all(l <= candles[j]["l"] for j in range(i - window, i + window + 1)):
-            lows.append((i, l))
-    return highs, lows
+    tr = [0.0] * n
+    for i in range(n):
+        h, l = candles[i]["h"], candles[i]["l"]
+        if i == 0:
+            tr[i] = h - l
+        else:
+            pc = candles[i - 1]["c"]
+            tr[i] = max(h - l, abs(h - pc), abs(l - pc))
+    atr = [None] * n
+    if n < length:
+        return atr
+    atr[length - 1] = sum(tr[0:length]) / length
+    for i in range(length, n):
+        atr[i] = (atr[i - 1] * (length - 1) + tr[i]) / length
+    return atr
 
 
-def find_wedge(candles, direction, prefer_recent_from=None):
-    """direction: 'up' (düşen takoz, yukarı kırılım) | 'dn' (yükselen takoz, aşağı kırılım)
-    prefer_recent_from: verilirse, break_bar bu bar indeksinden büyük/eşit olan adaylar arasından
-    en çok temaslı olan seçilir (yoksa genel en çok temaslıya düşülür). Bu sayede "5 temaslı ama
-    bayat" bir çizgi, "3 temaslı ama az önce kırılan" güncel çizginin önüne geçmez."""
-    highs, lows = pivots(candles, 5)
+def _pivot_high_at(candles, i, length):
     n = len(candles)
-    piv = [p for p in (highs if direction == "up" else lows) if p[0] >= n - 401][-10:]
-
-    best = None
-    best_recent = None
-    for i in range(len(piv) - 1):
-        for j in range(i + 1, len(piv)):
-            b1, p1 = piv[i]
-            b2, p2 = piv[j]
-            if direction == "up" and not (p1 > p2):
-                continue
-            if direction == "dn" and not (p1 < p2):
-                continue
-            slope = (p2 - p1) / (b2 - b1)
-            touches = 0
-            prev_touch = False
-            break_bar = None
-            end = min(n - 1, b1 + 400)
-            for b in range(b1, end + 1):
-                yv = p1 + slope * (b - b1)
-                c = candles[b]
-                if direction == "up":
-                    w, bd = c["h"], max(c["o"], c["c"])
-                    if w > yv * 1.004 or bd > yv * 1.001:
-                        break_bar = b
-                        break
-                    tz = w >= yv * 0.996
-                else:
-                    w, bd = c["l"], min(c["o"], c["c"])
-                    if w < yv * 0.996 or bd < yv * 0.999:
-                        break_bar = b
-                        break
-                    tz = w <= yv * 1.004
-                if tz and not prev_touch:
-                    touches += 1
-                prev_touch = tz
-            cand = {"p1": p1, "b1": b1, "slope": slope, "touches": touches, "break_bar": break_bar}
-            if best is None or touches > best["touches"]:
-                best = cand
-            if (prefer_recent_from is not None and break_bar is not None
-                    and break_bar >= prefer_recent_from
-                    and (best_recent is None or touches > best_recent["touches"])):
-                best_recent = cand
-    return best_recent if best_recent is not None else best
+    if i - length < 0 or i + length >= n:
+        return None
+    h = candles[i]["h"]
+    if all(h >= candles[j]["h"] for j in range(i - length, i + length + 1)):
+        return h
+    return None
 
 
-def evaluate_symbol(symbol, tf):
-    """Döner: (hits, stats) — stats teşhis amaçlı (veri geldi mi, takoz bulundu mu, en iyi temas/gövde%)"""
-    candles = fetch_klines(symbol, tf)
-    stats = {"got_data": False, "any_wedge": False, "max_touches": 0, "body_pct": 0.0}
-    if not candles or len(candles) < 60:
+def _pivot_low_at(candles, i, length):
+    n = len(candles)
+    if i - length < 0 or i + length >= n:
+        return None
+    l = candles[i]["l"]
+    if all(l <= candles[j]["l"] for j in range(i - length, i + length + 1)):
+        return l
+    return None
+
+
+def trendline_breaks(candles, length, mult):
+    """Döner: [{'bar','dir','body_pct'}, ...] — o barda gerçekleşen kırılımlar."""
+    n = len(candles)
+    atr = wilder_atr(candles, length)
+    upper = lower = slope_ph = slope_pl = 0.0
+    upos = dnos = 0
+    breaks = []
+    for i in range(n):
+        a = atr[i] if atr[i] is not None else 0.0
+        slope = a / length * mult if length else 0.0
+        ph = _pivot_high_at(candles, i, length)
+        pl = _pivot_low_at(candles, i, length)
+        if ph is not None:
+            slope_ph = slope
+        if pl is not None:
+            slope_pl = slope
+        upper = ph if ph is not None else upper - slope_ph
+        lower = pl if pl is not None else lower + slope_pl
+        c = candles[i]["c"]
+        new_upos = 0 if ph is not None else (1 if c > upper - slope_ph * length else upos)
+        new_dnos = 0 if pl is not None else (1 if c < lower + slope_pl * length else dnos)
+        o = candles[i]["o"]
+        body_pct = abs(c - o) / o * 100 if o else 0.0
+        if new_upos > upos:
+            breaks.append({"bar": i, "dir": "up", "body_pct": body_pct})
+        if new_dnos > dnos:
+            breaks.append({"bar": i, "dir": "dn", "body_pct": body_pct})
+        upos, dnos = new_upos, new_dnos
+    return breaks
+
+
+def evaluate_symbol(symbol):
+    """Döner: (hits, stats)."""
+    candles = fetch_klines(symbol)
+    stats = {"got_data": False, "any_break": False, "body_pct": 0.0}
+    if not candles or len(candles) < TL_LENGTH * 2 + 5:
         return [], stats
     stats["got_data"] = True
     n = len(candles)
+    breaks = trendline_breaks(candles, TL_LENGTH, TL_MULT)
+    recent = [b for b in breaks if b["bar"] >= n - BREAK_LOOKBACK]
+    if recent:
+        stats["any_break"] = True
+        stats["body_pct"] = max(b["body_pct"] for b in recent)
     results = []
-    for direction in ("up", "dn"):
-        w = find_wedge(candles, direction, prefer_recent_from=n - BREAK_LOOKBACK)
-        if not w or w["break_bar"] is None or w["break_bar"] < n - BREAK_LOOKBACK:
-            continue
-        stats["any_wedge"] = True
-        stats["max_touches"] = max(stats["max_touches"], w["touches"])
-        brk = candles[w["break_bar"]]
-        body_pct = abs(brk["c"] - brk["o"]) / brk["o"] * 100 if brk["o"] else 0
-        stats["body_pct"] = max(stats["body_pct"], body_pct)
-        if w["touches"] < MIN_TOUCHES:
-            continue
-        if body_pct < MIN_BODY_PCT:
+    for b in recent:
+        if b["body_pct"] < MIN_BODY_PCT:
             continue
         results.append({
-            "symbol": symbol, "dir": direction, "tf": tf,
-            "touches": w["touches"], "body_pct": body_pct, "price": candles[-1]["c"],
+            "symbol": symbol, "dir": b["dir"],
+            "body_pct": b["body_pct"], "price": candles[-1]["c"],
         })
     return results, stats
 
@@ -254,15 +267,13 @@ def send_telegram(text):
 
 
 def notify(hit):
-    key = (hit["symbol"], hit["dir"], hit["tf"])
+    key = (hit["symbol"], hit["dir"])
     if key in already_alerted:
         return
     already_alerted.add(key)
-    dir_txt = "🚀 TAKOZ YUKARI KIRILDI" if hit["dir"] == "up" else "🔻 TAKOZ AŞAĞI KIRILDI"
-    tf_txt = {"1m": "1dk", "5m": "5dk", "15m": "15dk"}.get(hit["tf"], hit["tf"])
+    dir_txt = "🚀 YUKARI KIRILDI" if hit["dir"] == "up" else "🔻 AŞAĞI KIRILDI"
     msg = (
-        f"<b>{hit['symbol']}</b> — {dir_txt} ({tf_txt})\n"
-        f"Temas: {hit['touches']}\n"
+        f"<b>{hit['symbol']}</b> — {dir_txt} (4S)\n"
         f"Mum Gövdesi: %{hit['body_pct']:.1f}\n"
         f"Fiyat: {hit['price']}"
     )
@@ -278,15 +289,14 @@ def run_scan():
     if not coins:
         log.warning("Taranacak coin bulunamadı.")
         return
-    log.info("Tarama başlıyor: %d coin, TF=%s, min temas=%d, min gövde=%%%.1f",
-              len(coins), TIMEFRAME, MIN_TOUCHES, MIN_BODY_PCT)
+    log.info("Tarama başlıyor: %d coin, TF=4H, min gövde=%%%.1f", len(coins), MIN_BODY_PCT)
 
     found = 0
     got_data = 0
-    any_wedge = 0
-    wedge_details = []
+    any_break = 0
+    break_details = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(evaluate_symbol, sym, TIMEFRAME): sym for sym in coins}
+        futures = {ex.submit(evaluate_symbol, sym): sym for sym in coins}
         for fut in as_completed(futures):
             sym = futures[fut]
             try:
@@ -296,26 +306,25 @@ def run_scan():
                 continue
             if stats["got_data"]:
                 got_data += 1
-            if stats["any_wedge"]:
-                any_wedge += 1
-                wedge_details.append(f"{sym} (temas={stats['max_touches']}, gövde=%{stats['body_pct']:.1f})")
+            if stats["any_break"]:
+                any_break += 1
+                break_details.append(f"{sym} (gövde=%{stats['body_pct']:.1f})")
             for hit in hits:
                 found += 1
                 notify(hit)
+
     log.info(
-        "Tarama bitti: %d/%d coin'e veri geldi, %d coin'de takoz yapısı görüldü (eşik geçmemiş olabilir), %d sinyal filtreyi geçti.",
-        got_data, len(coins), any_wedge, found,
+        "Tarama bitti: %d/%d coin'e veri geldi, %d coin'de kırılım görüldü, %d sinyal filtreyi geçti.",
+        got_data, len(coins), any_break, found,
     )
-    if wedge_details:
-        log.info("Takoz görülen coinler: %s", ", ".join(wedge_details))
+    if break_details:
+        log.info("Kırılım görülen coinler: %s", ", ".join(break_details))
     if got_data == 0:
-        log.error("HİÇBİR coin'e veri gelmedi! Muhtemelen Bybit/Binance bu sunucunun IP'sini engelliyor (403/451). Yukarıdaki uyarı satırlarına bak.")
-    elif any_wedge == 0:
-        log.info("Veri geldi ama hiç takoz yapısı (herhangi bir eşikte) bulunamadı — bu zaman diliminde şu an gerçekten sakin olabilir, normal bir durum.")
+        log.error("HİÇBİR coin'e veri gelmedi! Muhtemelen Bybit/Binance bu sunucunun IP'sini engelliyor.")
 
 
 def main():
-    log.info("wedge-pump-bot başlatıldı. TF=%s SCAN_INTERVAL=%ss", TIMEFRAME, SCAN_INTERVAL_SEC)
+    log.info("4h-trendline-bot başlatıldı. SCAN_INTERVAL=%ss, MIN_BODY_PCT=%%%.1f", SCAN_INTERVAL_SEC, MIN_BODY_PCT)
     while True:
         try:
             run_scan()
