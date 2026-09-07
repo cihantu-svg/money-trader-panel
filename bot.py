@@ -3,29 +3,34 @@
 -----------------------------------------
 Binance'te işlem gören USDT spot paritelerini 15 dakikalık grafikte tarar.
 
-İKİLİ TEPE: Son iki pivot tepe yaklaşık aynı seviyedeyse ve fiyat, tepeler
-arasındaki en düşük noktayı (neckline) aşağı yönlü KAPANMIŞ bir mumla
-kırdıysa sinyal üretir.
+İKİLİ TEPE: Son iki pivot tepe yaklaşık aynı seviyedeyse, formasyon
+yükseliş trendinde (kırılım mumu EMA üstünde) oluşmuşsa ve fiyat neckline'ı
+aşağı yönlü KAPANMIŞ bir mumla kırdıysa sinyal üretir.
 
-İKİLİ DİP: Aynısının ayna görüntüsü — son iki pivot dip yaklaşık aynı
-seviyedeyse ve fiyat neckline'ı (aradaki tepe) yukarı kırdıysa sinyal.
+İKİLİ DİP: Aynısının ayna görüntüsü — formasyon düşüş trendinde (kırılım
+mumu EMA altında) ise ve fiyat neckline'ı yukarı kırdıysa sinyal.
+
+Trend filtresi sayesinde yükselişteki pullback'lar "dip", düşüşteki
+tepki çıkışları "tepe" diye yanlış etiketlenmez.
 
 Sadece KAPANMIŞ mumlarla çalışır (repaint yok).
 Sinyaller hem konsola hem Telegram'a düşer.
 
 Ortam değişkenleri:
-    TELEGRAM_TOKEN     - BotFather'dan alınan bot token (zorunlu)
-    TELEGRAM_CHAT_ID   - Mesajın gideceği chat id (zorunlu)
-    TIMEFRAME          - zaman dilimi (varsayılan 15m)
-    PIVOT_LENGTH       - pivot lookback (varsayılan 5)
-    TOLERANCE_PCT      - iki tepe/dip arası max seviye farkı % (varsayılan 1.5)
-    MIN_DEPTH_PCT      - tepe/dip ile neckline arası min mesafe % (varsayılan 2.0)
-    CONFIRM_LOOKBACK   - neckline kırılımının son kaç mum içinde sayılacağı (varsayılan 3)
-    MAX_BARS_BETWEEN   - iki tepe/dip arası max mum sayısı (varsayılan 60)
-    MAX_COINS          - 0 = tümü, aksi halde ilk N coin (varsayılan 0)
-    SCAN_INTERVAL_SEC  - iki tarama arası bekleme, saniye (varsayılan 180)
-    MAX_WORKERS        - eşzamanlı istek sayısı (varsayılan 8)
-    KLINE_LIMIT        - çekilen mum sayısı (varsayılan 300)
+    TELEGRAM_TOKEN       - BotFather'dan alınan bot token (zorunlu)
+    TELEGRAM_CHAT_ID     - Mesajın gideceği chat id (zorunlu)
+    TIMEFRAME            - zaman dilimi (varsayılan 15m)
+    PIVOT_LENGTH         - pivot lookback (varsayılan 5)
+    TOLERANCE_PCT        - iki tepe/dip arası max seviye farkı % (varsayılan 1.5)
+    MIN_DEPTH_PCT        - tepe/dip ile neckline arası min mesafe % (varsayılan 2.0)
+    NECKLINE_BUFFER_PCT  - kırılımın neckline ötesinde gitmesi gereken min mesafe % (varsayılan 0.15)
+    EMA_LENGTH           - trend filtresi EMA uzunluğu (varsayılan 50)
+    CONFIRM_LOOKBACK     - neckline kırılımının son kaç mum içinde sayılacağı (varsayılan 3)
+    MAX_BARS_BETWEEN     - iki tepe/dip arası max mum sayısı (varsayılan 60)
+    MAX_COINS            - 0 = tümü, aksi halde ilk N coin (varsayılan 0)
+    SCAN_INTERVAL_SEC    - iki tarama arası bekleme, saniye (varsayılan 180)
+    MAX_WORKERS          - eşzamanlı istek sayısı (varsayılan 8)
+    KLINE_LIMIT          - çekilen mum sayısı (varsayılan 300)
 """
 
 import os
@@ -45,6 +50,8 @@ TIMEFRAME = os.environ.get("TIMEFRAME", "15m")
 PIVOT_LENGTH = int(os.environ.get("PIVOT_LENGTH", "5"))
 TOLERANCE_PCT = float(os.environ.get("TOLERANCE_PCT", "1.5"))
 MIN_DEPTH_PCT = float(os.environ.get("MIN_DEPTH_PCT", "2.0"))
+NECKLINE_BUFFER_PCT = float(os.environ.get("NECKLINE_BUFFER_PCT", "0.15"))
+EMA_LENGTH = int(os.environ.get("EMA_LENGTH", "50"))
 CONFIRM_LOOKBACK = int(os.environ.get("CONFIRM_LOOKBACK", "3"))
 MAX_BARS_BETWEEN = int(os.environ.get("MAX_BARS_BETWEEN", "60"))
 MAX_COINS = int(os.environ.get("MAX_COINS", "0"))
@@ -59,7 +66,7 @@ INTERVAL_MS = {
 }.get(TIMEFRAME, 900_000)
 
 HTTP = requests.Session()
-HTTP.headers.update({"User-Agent": "double-top-bottom-bot/1.0"})
+HTTP.headers.update({"User-Agent": "double-top-bottom-bot/1.1"})
 
 already_alerted = set()
 _warned_sources = set()
@@ -128,6 +135,17 @@ def fetch_klines(symbol):
 
 
 # ---------------- İkili tepe / ikili dip mantığı ----------------
+def ema(values, length):
+    """Üssel hareketli ortalama (tüm barlar için liste döndürür)."""
+    k = 2 / (length + 1)
+    out = []
+    e = values[0]
+    for v in values:
+        e = v * k + e * (1 - k)
+        out.append(e)
+    return out
+
+
 def pivot_highs(candles, length):
     """(index, high) listesi — sağında ve solunda 'length' mumdan yüksek olan tepe."""
     n = len(candles)
@@ -154,8 +172,9 @@ def detect_patterns(symbol, candles):
     """Onaylanmış ikili tepe / ikili dip sinyallerini döndürür."""
     n = len(candles)
     results = []
+    ema_vals = ema([c["c"] for c in candles], EMA_LENGTH)
 
-    # ---- İkili tepe ----
+    # ---- İkili tepe (yükseliş trendindeki dönüş) ----
     highs = pivot_highs(candles, PIVOT_LENGTH)
     if len(highs) >= 2:
         (i1, p1), (i2, p2) = highs[-2], highs[-1]
@@ -168,19 +187,23 @@ def detect_patterns(symbol, candles):
                     base = min(p1, p2)
                     depth_pct = (base - neckline) / base * 100
                     if depth_pct >= MIN_DEPTH_PCT:
-                        # Onay: neckline'ın SON CONFIRM_LOOKBACK mum içinde
-                        # aşağı kapanışla kırılmış olması.
+                        buffer = neckline * NECKLINE_BUFFER_PCT / 100
                         start = max(i2 + 1, n - CONFIRM_LOOKBACK)
                         for j in range(start, n):
-                            if candles[j]["c"] < neckline:
+                            if candles[j]["c"] < neckline - buffer:
+                                # Trend filtresi: kırılım mumu EMA üstünde
+                                # olmalı (yükselişte dönüş = gerçek tepe).
+                                if candles[j]["c"] <= ema_vals[j]:
+                                    break
                                 results.append({
                                     "symbol": symbol, "pattern": "İKİLİ TEPE",
                                     "dir": "down", "p1": p1, "p2": p2,
                                     "neckline": neckline, "price": candles[-1]["c"],
+                                    "break_bar": j, "break_t": candles[j]["t"],
                                 })
                                 break
 
-    # ---- İkili dip ----
+    # ---- İkili dip (düşüş trendindeki dönüş) ----
     lows = pivot_lows(candles, PIVOT_LENGTH)
     if len(lows) >= 2:
         (i1, p1), (i2, p2) = lows[-2], lows[-1]
@@ -193,13 +216,19 @@ def detect_patterns(symbol, candles):
                     base = max(p1, p2)
                     depth_pct = (neckline - base) / base * 100
                     if depth_pct >= MIN_DEPTH_PCT:
+                        buffer = neckline * NECKLINE_BUFFER_PCT / 100
                         start = max(i2 + 1, n - CONFIRM_LOOKBACK)
                         for j in range(start, n):
-                            if candles[j]["c"] > neckline:
+                            if candles[j]["c"] > neckline + buffer:
+                                # Trend filtresi: kırılım mumu EMA altında
+                                # olmalı (düşüşte dönüş = gerçek dip).
+                                if candles[j]["c"] >= ema_vals[j]:
+                                    break
                                 results.append({
                                     "symbol": symbol, "pattern": "İKİLİ DİP",
                                     "dir": "up", "p1": p1, "p2": p2,
                                     "neckline": neckline, "price": candles[-1]["c"],
+                                    "break_bar": j, "break_t": candles[j]["t"],
                                 })
                                 break
 
@@ -208,9 +237,14 @@ def detect_patterns(symbol, candles):
 
 def evaluate_symbol(symbol):
     candles = fetch_klines(symbol)
-    if not candles or len(candles) < PIVOT_LENGTH * 2 + MAX_BARS_BETWEEN // 4 + 5:
+    min_bars = max(EMA_LENGTH, PIVOT_LENGTH * 2) + 5
+    if not candles or len(candles) < min_bars:
         return []
-    return detect_patterns(symbol, candles)
+    hits = detect_patterns(symbol, candles)
+    if len(hits) > 1:
+        # Aynı coinde iki formasyon çıktıysa sadece en taze kırılımı gönder.
+        hits = [max(hits, key=lambda h: h["break_bar"])]
+    return hits
 
 
 # ---------------- Telegram ----------------
@@ -237,17 +271,19 @@ def notify(hit):
         return
     already_alerted.add(key)
     emoji = "🔻" if hit["dir"] == "down" else "🚀"
+    break_time = time.strftime("%H:%M", time.gmtime(hit["break_t"] / 1000))
     log.info(
-        "SİNYAL: %s %s %s | seviye1=%.8g seviye2=%.8g neckline=%.8g fiyat=%.8g",
+        "SİNYAL: %s %s %s | seviye1=%.8g seviye2=%.8g neckline=%.8g fiyat=%.8g kırılım=%sUTC",
         hit["symbol"], emoji, hit["pattern"],
-        hit["p1"], hit["p2"], hit["neckline"], hit["price"],
+        hit["p1"], hit["p2"], hit["neckline"], hit["price"], break_time,
     )
     msg = (
         f"<b>{hit['symbol']}</b> — {emoji} {hit['pattern']} ({TIMEFRAME})\n"
         f"Seviye 1: {hit['p1']:.8g}\n"
         f"Seviye 2: {hit['p2']:.8g}\n"
         f"Neckline: {hit['neckline']:.8g}\n"
-        f"Fiyat: {hit['price']:.8g}"
+        f"Fiyat: {hit['price']:.8g}\n"
+        f"Kırılım: {break_time} UTC"
     )
     send_telegram(msg)
 
@@ -261,8 +297,8 @@ def run_scan():
         log.warning("Taranacak coin bulunamadı.")
         return
     log.info(
-        "Tarama başlıyor: %d coin, TF=%s, tol=%%%.2f, min derinlik=%%%.2f",
-        len(coins), TIMEFRAME, TOLERANCE_PCT, MIN_DEPTH_PCT,
+        "Tarama başlıyor: %d coin, TF=%s, tol=%%%.2f, min derinlik=%%%.2f, EMA=%d",
+        len(coins), TIMEFRAME, TOLERANCE_PCT, MIN_DEPTH_PCT, EMA_LENGTH,
     )
 
     found = 0
@@ -291,8 +327,8 @@ def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram ayarlı değil — bildirimler sadece konsola düşecek.")
     log.info(
-        "double-top-bottom-bot başlatıldı. TF=%s, SCAN_INTERVAL=%ss, PIVOT_LENGTH=%d",
-        TIMEFRAME, SCAN_INTERVAL_SEC, PIVOT_LENGTH,
+        "double-top-bottom-bot başlatıldı. TF=%s, SCAN_INTERVAL=%ss, PIVOT_LENGTH=%d, EMA=%d",
+        TIMEFRAME, SCAN_INTERVAL_SEC, PIVOT_LENGTH, EMA_LENGTH,
     )
     while True:
         try:
