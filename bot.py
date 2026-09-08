@@ -12,6 +12,7 @@ Ayarlar en üstteki CONFIG bölümünden değiştirilebilir.
 """
 
 import time
+import logging
 import requests
 from datetime import datetime, timezone
 
@@ -34,21 +35,31 @@ TELEGRAM_CHAT_ID = "BURAYA_CHAT_ID"
 ALERTED_COOLDOWN_SECONDS = 4 * 60 * 60  # aynı coin için 4 saat tekrar gönderme
 _last_alert_time = {}
 
+# ============================== LOGGING ==============================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger("hacim_tepe_bot")
+
 # ============================ TELEGRAM ============================
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or "BURAYA" in TELEGRAM_BOT_TOKEN:
-        print("[UYARI] Telegram token ayarlanmamış, sadece konsola yazılıyor.")
-        print(message)
+        log.warning("Telegram token ayarlanmamış, sadece log'a yazılıyor.")
+        log.info(message)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, data={
+        resp = requests.post(url, data={
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML"
         }, timeout=10)
+        if resp.status_code != 200:
+            log.error(f"Telegram gönderilemedi. HTTP {resp.status_code}: {resp.text}")
     except Exception as e:
-        print(f"[HATA] Telegram gönderilemedi: {e}")
+        log.error(f"Telegram gönderilemedi (exception): {e}")
 
 
 # ============================ BINANCE API ============================
@@ -98,7 +109,6 @@ def check_volume_spike(symbol: str):
     ortalamasının en az %VOLUME_THRESHOLD_PCT üzerinde mi?
     Dönen: (sinyal_var_mi, guncel_hacim, ortalama_hacim)
     """
-    # +2: biri şu an oluşan (kapanmamış) mum, biri de trigger mumu için
     klines = get_klines(symbol, "15m", VOLUME_LOOKBACK + 2)
     if len(klines) < VOLUME_LOOKBACK + 2:
         return False, None, None
@@ -136,20 +146,26 @@ def check_4h_breakout(symbol: str):
     return current_price > swing_high, current_price, swing_high
 
 
-def scan_symbol(symbol: str):
+def scan_symbol(symbol: str, stats: dict):
     try:
         vol_signal, trigger_vol, avg_vol = check_volume_spike(symbol)
         if not vol_signal:
             return
 
+        stats["volume_gecen"] += 1
+        log.debug(f"{symbol}: hacim şartı sağlandı, 4h kontrolüne geçiliyor.")
+
         breakout_signal, price, swing_high = check_4h_breakout(symbol)
         if not breakout_signal:
             return
+
+        stats["kirilim_gecen"] += 1
 
         # cooldown kontrolü
         now = time.time()
         last = _last_alert_time.get(symbol, 0)
         if now - last < ALERTED_COOLDOWN_SECONDS:
+            log.info(f"{symbol}: sinyal şartları sağlandı ama cooldown aktif, atlanıyor.")
             return
 
         volume_increase_pct = (trigger_vol - avg_vol) / avg_vol * 100
@@ -164,41 +180,59 @@ def scan_symbol(symbol: str):
         )
         send_telegram(message)
         _last_alert_time[symbol] = now
-        print(f"[SİNYAL] {symbol} -> {message}")
+        stats["sinyal"] += 1
+        log.info(f"SİNYAL: {symbol} -> hacim +%{volume_increase_pct:.1f}, kırılım +%{breakout_pct:.2f}")
 
     except Exception as e:
-        print(f"[HATA] {symbol} taranırken sorun oluştu: {e}")
+        stats["hata"] += 1
+        log.error(f"{symbol} taranırken hata: {type(e).__name__}: {e}")
 
 
 def run_scan_cycle():
-    print(f"\n[{datetime.now(timezone.utc).isoformat()}] Tarama başlıyor...")
-    symbols = get_usdt_perpetual_symbols()
-    print(f"Toplam {len(symbols)} USDT perpetual sembol bulundu.")
+    log.info("Tarama başlıyor...")
 
-    scanned = 0
+    try:
+        symbols = get_usdt_perpetual_symbols()
+    except Exception as e:
+        log.error(f"Sembol listesi çekilemedi: {type(e).__name__}: {e}")
+        return
+
+    log.info(f"Toplam {len(symbols)} USDT perpetual sembol bulundu.")
+
+    stats = {"taranan": 0, "hacim_filtresi_gecti": 0, "volume_gecen": 0, "kirilim_gecen": 0, "sinyal": 0, "hata": 0}
+
     for symbol in symbols:
         try:
             vol24 = get_24h_quote_volume(symbol)
             if vol24 < MIN_24H_USDT_VOLUME:
                 continue
-        except Exception:
+        except Exception as e:
+            log.error(f"{symbol}: 24h hacim çekilemedi: {type(e).__name__}: {e}")
             continue
 
-        scan_symbol(symbol)
-        scanned += 1
+        stats["hacim_filtresi_gecti"] += 1
+        scan_symbol(symbol, stats)
+        stats["taranan"] += 1
         time.sleep(REQUEST_SLEEP)
 
-    print(f"Tarama tamamlandı. {scanned} sembol filtre sonrası tarandı.")
+    log.info(
+        f"Tarama bitti: {stats['taranan']} coin tarandı "
+        f"(24h hacim filtresini {stats['hacim_filtresi_gecti']} coin geçti), "
+        f"15dk hacim şartını {stats['volume_gecen']} coin sağladı, "
+        f"4h kırılım şartını {stats['kirilim_gecen']} coin sağladı, "
+        f"{stats['sinyal']} sinyal gönderildi, {stats['hata']} hata oluştu."
+    )
 
 
 def main():
-    print("Hacim + 4H Tepe Kırılım Botu başlatıldı.")
+    log.info("Hacim + 4H Tepe Kırılım Botu başlatıldı.")
+    send_telegram("✅ Hacim + 4H Tepe Kırılım Botu başlatıldı, ilk tarama başlıyor.")
     while True:
         start = time.time()
         run_scan_cycle()
         elapsed = time.time() - start
         sleep_time = max(0, CHECK_INTERVAL_SECONDS - elapsed)
-        print(f"Sonraki tarama {sleep_time/60:.1f} dakika sonra.")
+        log.info(f"Sonraki tarama {sleep_time/60:.1f} dakika sonra.")
         time.sleep(sleep_time)
 
 
