@@ -11,6 +11,7 @@ Mantık:
 Ayarlar en üstteki CONFIG bölümünden değiştirilebilir.
 """
 
+import os
 import time
 import logging
 import requests
@@ -25,11 +26,11 @@ VOLUME_THRESHOLD_PCT = 5.0    # ortalamanın üzerine gereken minimum yüzde (%5
 PIVOT_LOOKBACK = 20           # 4h tepe için bar sayısı
 MIN_24H_USDT_VOLUME = 3_000_000  # çok düşük hacimli/illiquid coinleri ele
 
-CHECK_INTERVAL_SECONDS = 15 * 60   # 15 dakikada bir tüm listeyi tara
+CHECK_INTERVAL_SECONDS = 5 * 60    # 5 dakikada bir tüm listeyi tara
 REQUEST_SLEEP = 0.05                # rate-limit için istekler arası bekleme
 
-TELEGRAM_BOT_TOKEN = "BURAYA_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "BURAYA_CHAT_ID"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # Sinyal aynı coin için tekrar tekrar gelmesin diye kısa süreli hafıza
 ALERTED_COOLDOWN_SECONDS = 4 * 60 * 60  # aynı coin için 4 saat tekrar gönderme
@@ -45,8 +46,8 @@ log = logging.getLogger("hacim_tepe_bot")
 
 # ============================ TELEGRAM ============================
 def send_telegram(message: str):
-    if not TELEGRAM_BOT_TOKEN or "BURAYA" in TELEGRAM_BOT_TOKEN:
-        log.warning("Telegram token ayarlanmamış, sadece log'a yazılıyor.")
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env değişkenleri boş, sadece log'a yazılıyor.")
         log.info(message)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -129,19 +130,21 @@ def check_volume_spike(symbol: str):
 
 def check_4h_breakout(symbol: str):
     """
-    4h grafikte son PIVOT_LOOKBACK kapanmış barın en yüksek noktasını (tepe)
-    bulur ve güncel fiyatın bu tepeyi geçip geçmediğini kontrol eder.
+    4h grafikte, kontrol edilen son kapanmış mum HARİÇ önceki
+    PIVOT_LOOKBACK barın en yüksek noktasını (tepe) bulur ve bu son mumun
+    fiyatının bu tepeyi geçip geçmediğini kontrol eder.
     Dönen: (kirildi_mi, guncel_fiyat, tepe_seviyesi)
     """
-    klines = get_klines(symbol, "4h", PIVOT_LOOKBACK + 2)
-    if len(klines) < PIVOT_LOOKBACK + 2:
+    klines = get_klines(symbol, "4h", PIVOT_LOOKBACK + 3)
+    if len(klines) < PIVOT_LOOKBACK + 3:
         return False, None, None
 
-    closed_klines = klines[:-1]
-    pivot_window = closed_klines[-PIVOT_LOOKBACK:]
-    swing_high = max(float(c[2]) for c in pivot_window)  # high sütunu
+    closed_klines = klines[:-1]           # son mum muhtemelen henüz kapanmadı, çıkar
+    trigger_candle = closed_klines[-1]    # kırılımı kontrol ettiğimiz mum
+    pivot_window = closed_klines[-(PIVOT_LOOKBACK + 1):-1]  # ondan ÖNCEKİ 20 mum
 
-    current_price = float(closed_klines[-1][4])  # son kapanmış 4h mumun close'u
+    swing_high = max(float(c[2]) for c in pivot_window)  # high sütunu
+    current_price = float(trigger_candle[4])              # trigger mumun close'u
 
     return current_price > swing_high, current_price, swing_high
 
@@ -226,6 +229,15 @@ def run_scan_cycle():
 
 def main():
     log.info("Hacim + 4H Tepe Kırılım Botu başlatıldı.")
+    if TELEGRAM_BOT_TOKEN:
+        log.info(f"TELEGRAM_TOKEN bulundu (uzunluk: {len(TELEGRAM_BOT_TOKEN)}).")
+    else:
+        log.warning("TELEGRAM_TOKEN env değişkeni bulunamadı!")
+    if TELEGRAM_CHAT_ID:
+        log.info(f"TELEGRAM_CHAT_ID bulundu: {TELEGRAM_CHAT_ID}")
+    else:
+        log.warning("TELEGRAM_CHAT_ID env değişkeni bulunamadı!")
+
     send_telegram("✅ Hacim + 4H Tepe Kırılım Botu başlatıldı, ilk tarama başlıyor.")
     while True:
         start = time.time()
