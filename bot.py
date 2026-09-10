@@ -35,10 +35,12 @@ INTERVAL = "15m"                 # kullanıcı seçimi
 PIVOT_LEN = 2                    # kullanıcı seçimi (len5)
 RSI_LEN = 9
 MIN_VOLUME_USDT = 3_000_000      # önceki botlarla tutarlı hacim filtresi
-KLINES_LIMIT = 200               # RSI/HMA/pivot ısınma payı için yeterli geçmiş
+KLINES_LIMIT = 100               # RSI/HMA/pivot ısınma payı için yeterli (200 gereksizdi, ağırlığı gereksiz artırıyordu)
 SCAN_INTERVAL_SECONDS = 60 * 15  # her 15 dakikada bir tara (mum kapanışına hizalı değil, basit döngü)
 REQUEST_TIMEOUT = 10
-MAX_WORKERS_SLEEP_BETWEEN_SYMBOLS = 0.05  # Binance rate-limit'e nazik davran
+SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.25"))  # Binance rate-limit'e nazik davran
+WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "2000"))  # 1 dakikalık ağırlık limiti ~2400, buna yaklaşınca dur
+MAX_RETRIES = 5
 
 REACTION_PCT = float(os.environ.get("REACTION_PCT", "0.05"))      # zone'dan teyit için gereken hareket (varsayılan %5)
 INVALIDATE_PCT = float(os.environ.get("INVALIDATE_PCT", "0.02"))  # ters yönde geçersizlik eşiği (varsayılan %2)
@@ -78,13 +80,51 @@ def send_telegram(message: str) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  BINANCE FUTURES HELPERS
+#  BINANCE FUTURES HELPERS  (rate-limit korumalı: retry/backoff + weight izleme)
 # ─────────────────────────────────────────────────────────────────────────
+_session = requests.Session()
+
+
+def binance_get(path: str, params: dict | None = None) -> requests.Response:
+    """
+    Tüm Binance Futures GET isteklerinin geçtiği tek nokta.
+    - 429 (Too Many Requests) veya 418 (IP ban) geldiğinde Retry-After'a göre
+      bekleyip tekrar dener (exponential backoff ile).
+    - Yanıttaki X-MBX-USED-WEIGHT-1M header'ını izler; limite yaklaşılırsa
+      bir sonraki dakikaya kadar bekler.
+    """
+    url = f"{BINANCE_FAPI}{path}"
+    for attempt in range(1, MAX_RETRIES + 1):
+        r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
+        if r.status_code == 200:
+            used_weight = r.headers.get("X-MBX-USED-WEIGHT-1M")
+            if used_weight is not None and int(used_weight) >= WEIGHT_SOFT_LIMIT:
+                log.warning(
+                    "Kullanılan ağırlık %s/%s soft limite yaklaştı, 60sn bekleniyor.",
+                    used_weight, WEIGHT_SOFT_LIMIT,
+                )
+                time.sleep(60)
+            return r
+
+        if r.status_code in (429, 418):
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else min(60, 2 ** attempt)
+            log.warning(
+                "%s: %s alındı (deneme %d/%d), %.0f sn bekleniyor.",
+                path, r.status_code, attempt, MAX_RETRIES, wait,
+            )
+            time.sleep(wait)
+            continue
+
+        r.raise_for_status()
+
+    raise RuntimeError(f"{path} için {MAX_RETRIES} denemeden sonra rate-limit aşılamadı.")
+
+
 def get_usdt_perpetual_symbols() -> list[str]:
     """USDT-M perpetual, TRADING durumundaki tüm semboller."""
-    url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
-    r = requests.get(url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
+    r = binance_get("/fapi/v1/exchangeInfo")
     data = r.json()
     symbols = []
     for s in data.get("symbols", []):
@@ -99,18 +139,13 @@ def get_usdt_perpetual_symbols() -> list[str]:
 
 def get_24h_volume_map() -> dict[str, float]:
     """symbol -> 24s quoteVolume (USDT)"""
-    url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
-    r = requests.get(url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
+    r = binance_get("/fapi/v1/ticker/24hr")
     data = r.json()
     return {d["symbol"]: float(d["quoteVolume"]) for d in data}
 
 
 def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
-    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
+    r = binance_get("/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
     raw = r.json()
     cols = [
         "open_time", "open", "high", "low", "close", "volume",
@@ -351,7 +386,7 @@ def run_scan_cycle() -> None:
 
     for sym in filtered:
         scan_symbol(sym)
-        time.sleep(MAX_WORKERS_SLEEP_BETWEEN_SYMBOLS)
+        time.sleep(SLEEP_BETWEEN_SYMBOLS)
 
     log.info("Tarama döngüsü tamamlandı.")
 
