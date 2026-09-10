@@ -45,7 +45,7 @@ MAX_RETRIES = 5
 REACTION_PCT = float(os.environ.get("REACTION_PCT", "0.05"))      # zone'dan teyit için gereken hareket (varsayılan %5)
 INVALIDATE_PCT = float(os.environ.get("INVALIDATE_PCT", "0.02"))  # ters yönde geçersizlik eşiği (varsayılan %2)
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 logging.basicConfig(
@@ -66,10 +66,10 @@ LAST_STATE: dict[str, dict] = {}
 #  TELEGRAM
 # ─────────────────────────────────────────────────────────────────────────
 def send_telegram(message: str) -> None:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram env değişkenleri eksik, mesaj sadece loglanıyor:\n%s", message)
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
