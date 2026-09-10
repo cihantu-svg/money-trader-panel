@@ -335,6 +335,12 @@ def scan_symbol(symbol: str) -> None:
                     log.info(msg.replace("\n", " | "))
                     send_telegram(msg)
                     sup_zone["status"] = "invalidated"
+                else:
+                    move_pct = (last_close / level - 1) * 100
+                    log.info(
+                        "%s | DESTEK pending | zone=%.6g kapanış=%.6g hareket=%+.2f%% (hedef +%%%.0f)",
+                        symbol, level, last_close, move_pct, REACTION_PCT * 100,
+                    )
 
             # --- Bekleyen direnç zone'unun tepkisini kontrol et ---
             if res_zone is not None and res_zone["status"] == "pending":
@@ -360,6 +366,12 @@ def scan_symbol(symbol: str) -> None:
                     log.info(msg.replace("\n", " | "))
                     send_telegram(msg)
                     res_zone["status"] = "invalidated"
+                else:
+                    move_pct = (1 - last_close / level) * 100
+                    log.info(
+                        "%s | DİRENÇ pending | zone=%.6g kapanış=%.6g hareket=%+.2f%% (hedef -%%%.0f)",
+                        symbol, level, last_close, move_pct, REACTION_PCT * 100,
+                    )
 
         LAST_STATE[symbol] = {
             "tf1": new_tf1,
