@@ -282,34 +282,21 @@ def scan_symbol(symbol: str) -> None:
 
         # ── İlk çalıştırmada state'i sadece kaydet, spam alarm atma ──
         if not first_run:
-            # --- Yeni destek/direnç çizgisi oluştu -> zone'u "pending" olarak aç ---
+            # --- Yeni destek/direnç çizgisi oluştu -> zone'u "pending" aç, SADECE LOG (Telegram'a atma) ---
             if tf1_changed and new_tf1 > 0:
-                msg = (
-                    f"🟢 <b>DESTEK sinyali (Bar Stallone S/R)</b>\n"
-                    f"Sembol: <b>{symbol}</b>\n"
-                    f"TF: {INTERVAL}\n"
-                    f"Seviye: {new_tf1:.6g}\n"
-                    f"RSI(9): {last['rsi']:.1f} | CMO: {last['cmo']:.1f}\n"
-                    f"Teyit için gereken hareket: +%{REACTION_PCT*100:.0f}\n"
-                    f"Mum kapanış: {last['close_time']}"
+                log.info(
+                    "%s | DESTEK sinyali oluştu (henüz teyit yok) | seviye=%.6g RSI=%.1f CMO=%.1f",
+                    symbol, new_tf1, last["rsi"], last["cmo"],
                 )
-                log.info(msg.replace("\n", " | "))
-                send_telegram(msg)
                 sup_zone = {"level": new_tf1, "status": "pending"}
 
             if tf2_changed and new_tf2 > 0:
-                msg = (
-                    f"🔴 <b>DİRENÇ sinyali (Bar Stallone S/R)</b>\n"
-                    f"Sembol: <b>{symbol}</b>\n"
-                    f"TF: {INTERVAL}\n"
-                    f"Seviye: {new_tf2:.6g}\n"
-                    f"RSI(9): {last['rsi']:.1f} | CMO: {last['cmo']:.1f}\n"
-                    f"Teyit için gereken hareket: -%{REACTION_PCT*100:.0f}\n"
-                    f"Mum kapanış: {last['close_time']}"
+                log.info(
+                    "%s | DİRENÇ sinyali oluştu (henüz teyit yok) | seviye=%.6g RSI=%.1f CMO=%.1f",
+                    symbol, new_tf2, last["rsi"], last["cmo"],
                 )
-                log.info(msg.replace("\n", " | "))
-                send_telegram(msg)
                 res_zone = {"level": new_tf2, "status": "pending"}
+
 
             # --- Bekleyen destek zone'unun tepkisini kontrol et ---
             if sup_zone is not None and sup_zone["status"] == "pending":
