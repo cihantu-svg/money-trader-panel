@@ -43,8 +43,8 @@ MIN_VOLUME_USDT = 3_000_000      # önceki botlarla tutarlı hacim filtresi
 KLINES_LIMIT = 100               # RSI/HMA/pivot ısınma payı için yeterli (200 gereksizdi, ağırlığı gereksiz artırıyordu)
 SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", 60 * 5))  # her 5 dakikada bir tara (diğer botlarla aynı desen), mum periyodu ayrı (INTERVAL=15m)
 REQUEST_TIMEOUT = 10
-SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.25"))  # Binance rate-limit'e nazik davran
-WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "2000"))  # 1 dakikalık ağırlık limiti ~2400, buna yaklaşınca dur
+SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.45"))  # Binance rate-limit'e nazik davran (291 sembol ~ 3.5dk sürer, 60sn'lik zorunlu duraklamalara gerek kalmaz)
+WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "1800"))  # 1 dakikalık ağırlık limiti ~2400; buraya SEYREK değinilmeli, düzenli değinme SLEEP_BETWEEN_SYMBOLS'in düşük olduğu anlamına gelir
 MAX_RETRIES = 5
 
 REACTION_PCT = float(os.environ.get("REACTION_PCT", "0.05"))      # zone'dan teyit için gereken hareket (varsayılan %5)
@@ -345,7 +345,7 @@ def scan_symbol(symbol: str) -> None:
                     move_pct = (1 - last_close / level) * 100
                     log.info(
                         "%s | DİRENÇ pending | zone=%.6g kapanış=%.6g hareket=%+.2f%% (hedef -%%%.0f)",
-                        symbol, level, last_close, move_pct, REACTION_PCT * 100,
+                        symbol, level, last_close, -move_pct, REACTION_PCT * 100,
                     )
 
             # --- SONRA yeni destek/direnç çizgisi oluştu mu bak -> zone'u "pending" aç, SADECE LOG ---
