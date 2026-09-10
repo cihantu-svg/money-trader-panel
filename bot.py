@@ -36,7 +36,7 @@ PIVOT_LEN = 2                    # kullanıcı seçimi (len5)
 RSI_LEN = 9
 MIN_VOLUME_USDT = 3_000_000      # önceki botlarla tutarlı hacim filtresi
 KLINES_LIMIT = 100               # RSI/HMA/pivot ısınma payı için yeterli (200 gereksizdi, ağırlığı gereksiz artırıyordu)
-SCAN_INTERVAL_SECONDS = 60 * 15  # her 15 dakikada bir tara (mum kapanışına hizalı değil, basit döngü)
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", 60 * 5))  # her 5 dakikada bir tara (diğer botlarla aynı desen), mum periyodu ayrı (INTERVAL=15m)
 REQUEST_TIMEOUT = 10
 SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.25"))  # Binance rate-limit'e nazik davran
 WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "2000"))  # 1 dakikalık ağırlık limiti ~2400, buna yaklaşınca dur
