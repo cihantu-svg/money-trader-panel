@@ -11,10 +11,15 @@ KULLANILMADAN, tek zaman diliminde ve sadece kapanmış mumlar üzerinden hesapl
 
   xup / xdown  : sup/res tetiklendiğinde güncellenen "yapışkan" (sticky) seviyeler
                  (Pine'daki yeşil/turuncu çizgilerin karşılığı)
-  Alert        : xup ya da xdown DEĞİŞTİĞİNDE (yeni çizgi çizildiğinde) gönderilir.
+
+  Zone oluşumu (xup/xdown değişimi): SADECE LOG'a yazılır, Telegram'a gitmez.
+  Telegram alarmı SADECE şu iki durumda gider:
+    - Zone'dan +REACTION_PCT (destek) / -REACTION_PCT (direnç) hareket -> ✅ TEYİT ALDI
+    - Zone'un tersi yönünde INVALIDATE_PCT kırılırsa                    -> ❌ GEÇERSİZ
 
 Kapsam: Binance Futures USDT-M perpetual, 24s hacim >= MIN_VOLUME_USDT
-Zaman dilimi: 15 dakika (kullanıcı seçimi)
+Zaman dilimi (mum): 15 dakika (kullanıcı seçimi)
+Tarama sıklığı (döngü): 5 dakika (SCAN_INTERVAL_SECONDS, diğer botlarla aynı desen)
 Pivot uzunluğu (len5): 2 (kullanıcı seçimi - orijinal, sık sinyal)
 """
 
@@ -282,23 +287,7 @@ def scan_symbol(symbol: str) -> None:
 
         # ── İlk çalıştırmada state'i sadece kaydet, spam alarm atma ──
         if not first_run:
-            # --- Yeni destek/direnç çizgisi oluştu -> zone'u "pending" aç, SADECE LOG (Telegram'a atma) ---
-            if tf1_changed and new_tf1 > 0:
-                log.info(
-                    "%s | DESTEK sinyali oluştu (henüz teyit yok) | seviye=%.6g RSI=%.1f CMO=%.1f",
-                    symbol, new_tf1, last["rsi"], last["cmo"],
-                )
-                sup_zone = {"level": new_tf1, "status": "pending"}
-
-            if tf2_changed and new_tf2 > 0:
-                log.info(
-                    "%s | DİRENÇ sinyali oluştu (henüz teyit yok) | seviye=%.6g RSI=%.1f CMO=%.1f",
-                    symbol, new_tf2, last["rsi"], last["cmo"],
-                )
-                res_zone = {"level": new_tf2, "status": "pending"}
-
-
-            # --- Bekleyen destek zone'unun tepkisini kontrol et ---
+            # --- Önce MEVCUT pending zone'ları kontrol et (yeni sinyal onları ezmeden önce) ---
             if sup_zone is not None and sup_zone["status"] == "pending":
                 level = sup_zone["level"]
                 if last_close >= level * (1 + REACTION_PCT):
@@ -329,7 +318,6 @@ def scan_symbol(symbol: str) -> None:
                         symbol, level, last_close, move_pct, REACTION_PCT * 100,
                     )
 
-            # --- Bekleyen direnç zone'unun tepkisini kontrol et ---
             if res_zone is not None and res_zone["status"] == "pending":
                 level = res_zone["level"]
                 if last_close <= level * (1 - REACTION_PCT):
@@ -359,6 +347,31 @@ def scan_symbol(symbol: str) -> None:
                         "%s | DİRENÇ pending | zone=%.6g kapanış=%.6g hareket=%+.2f%% (hedef -%%%.0f)",
                         symbol, level, last_close, move_pct, REACTION_PCT * 100,
                     )
+
+            # --- SONRA yeni destek/direnç çizgisi oluştu mu bak -> zone'u "pending" aç, SADECE LOG ---
+            if tf1_changed and new_tf1 > 0:
+                if sup_zone is not None and sup_zone["status"] == "pending":
+                    log.info(
+                        "%s | DESTEK zone yeni sinyalle değişti, önceki (%.6g) sonuçlanmadan kapandı.",
+                        symbol, sup_zone["level"],
+                    )
+                log.info(
+                    "%s | DESTEK sinyali oluştu (henüz teyit yok) | seviye=%.6g RSI=%.1f CMO=%.1f",
+                    symbol, new_tf1, last["rsi"], last["cmo"],
+                )
+                sup_zone = {"level": new_tf1, "status": "pending"}
+
+            if tf2_changed and new_tf2 > 0:
+                if res_zone is not None and res_zone["status"] == "pending":
+                    log.info(
+                        "%s | DİRENÇ zone yeni sinyalle değişti, önceki (%.6g) sonuçlanmadan kapandı.",
+                        symbol, res_zone["level"],
+                    )
+                log.info(
+                    "%s | DİRENÇ sinyali oluştu (henüz teyit yok) | seviye=%.6g RSI=%.1f CMO=%.1f",
+                    symbol, new_tf2, last["rsi"], last["cmo"],
+                )
+                res_zone = {"level": new_tf2, "status": "pending"}
 
         LAST_STATE[symbol] = {
             "tf1": new_tf1,
