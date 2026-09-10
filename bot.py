@@ -1,251 +1,370 @@
 """
-Hacim + 4H Tepe Kırılım Tarama Botu
-------------------------------------
-Mantık:
-1) Binance Futures'ta her USDT perpetual coin için 15 dakikalık mumlarda
-   hacim, son 20 periyodun ortalama hacminin en az %5 üzerine çıkmış mı bak.
-2) Eğer hacim şartı sağlanıyorsa, aynı coin için 4 saatlik grafikte son 20
-   barın en yüksek noktasını (swing high / "tepe") bul.
-3) Güncel fiyat bu tepeyi geçmişse (kırmışsa), Telegram'a sinyal gönder.
+Bar Stallone Support/Resistance Scanner
+-----------------------------------------------
+Pine kaynağı: "Support/Resistance" (BarStallone / @christofferka güncellemesi)
 
-Ayarlar en üstteki CONFIG bölümünden değiştirilebilir.
+Mantık (indikatörle birebir, ama repaint riski taşıyan request.security(lookahead_on)
+KULLANILMADAN, tek zaman diliminde ve sadece kapanmış mumlar üzerinden hesaplanır):
+
+  RSI(9) < 25  AND  CMO_custom > 50   AND  yakın pivot-low mevcut  -> DESTEK sinyali (sup)
+  RSI(9) > 75  AND  CMO_custom < -50  AND  yakın pivot-high mevcut -> DİRENÇ sinyali (res)
+
+  xup / xdown  : sup/res tetiklendiğinde güncellenen "yapışkan" (sticky) seviyeler
+                 (Pine'daki yeşil/turuncu çizgilerin karşılığı)
+  Alert        : xup ya da xdown DEĞİŞTİĞİNDE (yeni çizgi çizildiğinde) gönderilir.
+
+Kapsam: Binance Futures USDT-M perpetual, 24s hacim >= MIN_VOLUME_USDT
+Zaman dilimi: 15 dakika (kullanıcı seçimi)
+Pivot uzunluğu (len5): 2 (kullanıcı seçimi - orijinal, sık sinyal)
 """
 
 import os
 import time
 import logging
-import requests
 from datetime import datetime, timezone
 
-# ============================== CONFIG ==============================
+import numpy as np
+import pandas as pd
+import requests
+
+# ─────────────────────────────────────────────────────────────────────────
+#  CONFIG
+# ─────────────────────────────────────────────────────────────────────────
 BINANCE_FAPI = "https://fapi.binance.com"
+INTERVAL = "15m"                 # kullanıcı seçimi
+PIVOT_LEN = 2                    # kullanıcı seçimi (len5)
+RSI_LEN = 9
+MIN_VOLUME_USDT = 3_000_000      # önceki botlarla tutarlı hacim filtresi
+KLINES_LIMIT = 200               # RSI/HMA/pivot ısınma payı için yeterli geçmiş
+SCAN_INTERVAL_SECONDS = 60 * 15  # her 15 dakikada bir tara (mum kapanışına hizalı değil, basit döngü)
+REQUEST_TIMEOUT = 10
+MAX_WORKERS_SLEEP_BETWEEN_SYMBOLS = 0.05  # Binance rate-limit'e nazik davran
 
-VOLUME_LOOKBACK = 20          # 15dk hacim ortalaması için bar sayısı
-VOLUME_THRESHOLD_PCT = 5.0    # ortalamanın üzerine gereken minimum yüzde (%5)
+REACTION_PCT = 0.05      # zone'dan teyit için gereken hareket (%5, senin diğer botlarındaki standart eşik)
+INVALIDATE_PCT = 0.02    # teyitten önce ters yönde bu kadar kırılırsa zone geçersiz sayılır (%2)
 
-PIVOT_LOOKBACK = 20           # 4h tepe için bar sayısı
-MIN_24H_USDT_VOLUME = 3_000_000  # çok düşük hacimli/illiquid coinleri ele
-
-CHECK_INTERVAL_SECONDS = 5 * 60    # 5 dakikada bir tüm listeyi tara
-REQUEST_SLEEP = 0.05                # rate-limit için istekler arası bekleme
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-# Sinyal aynı coin için tekrar tekrar gelmesin diye kısa süreli hafıza
-ALERTED_COOLDOWN_SECONDS = 4 * 60 * 60  # aynı coin için 4 saat tekrar gönderme
-_last_alert_time = {}
-
-# ============================== LOGGING ==============================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("hacim_tepe_bot")
+log = logging.getLogger("bar_stallone_scanner")
 
-# ============================ TELEGRAM ============================
-def send_telegram(message: str):
+# symbol -> {
+#   "tf1": float or None, "tf2": float or None,             (son bilinen sticky seviyeler)
+#   "sup_zone": {"level": float, "status": "pending"/"confirmed"/"invalidated"} or None,
+#   "res_zone": {...} or None,
+# }
+LAST_STATE: dict[str, dict] = {}
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  TELEGRAM
+# ─────────────────────────────────────────────────────────────────────────
+def send_telegram(message: str) -> None:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID env değişkenleri boş, sadece log'a yazılıyor.")
-        log.info(message)
+        log.warning("Telegram env değişkenleri eksik, mesaj sadece loglanıyor:\n%s", message)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        resp = requests.post(url, data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        }, timeout=10)
-        if resp.status_code != 200:
-            log.error(f"Telegram gönderilemedi. HTTP {resp.status_code}: {resp.text}")
-    except Exception as e:
-        log.error(f"Telegram gönderilemedi (exception): {e}")
+        r = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        if r.status_code != 200:
+            log.error("Telegram gönderim hatası: %s - %s", r.status_code, r.text)
+    except requests.RequestException as e:
+        log.error("Telegram isteği başarısız: %s", e)
 
 
-# ============================ BINANCE API ============================
-def get_usdt_perpetual_symbols():
-    """Tüm USDT perpetual futures sembollerini çeker."""
+# ─────────────────────────────────────────────────────────────────────────
+#  BINANCE FUTURES HELPERS
+# ─────────────────────────────────────────────────────────────────────────
+def get_usdt_perpetual_symbols() -> list[str]:
+    """USDT-M perpetual, TRADING durumundaki tüm semboller."""
     url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    data = resp.json()
-
+    r = requests.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
     symbols = []
-    for s in data["symbols"]:
-        if (s["contractType"] == "PERPETUAL"
-                and s["quoteAsset"] == "USDT"
-                and s["status"] == "TRADING"):
+    for s in data.get("symbols", []):
+        if (
+            s.get("contractType") == "PERPETUAL"
+            and s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+        ):
             symbols.append(s["symbol"])
     return symbols
 
 
-def get_24h_quote_volume(symbol: str):
+def get_24h_volume_map() -> dict[str, float]:
+    """symbol -> 24s quoteVolume (USDT)"""
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
-    resp = requests.get(url, params={"symbol": symbol}, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    return float(data["quoteVolume"])
+    r = requests.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    data = r.json()
+    return {d["symbol"]: float(d["quoteVolume"]) for d in data}
 
 
-def get_klines(symbol: str, interval: str, limit: int):
-    """
-    Binance kline formatı:
-    [ openTime, open, high, low, close, volume, closeTime, ... ]
-    """
+def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    resp = requests.get(url, params={
-        "symbol": symbol,
-        "interval": interval,
-        "limit": limit
-    }, timeout=10)
-    resp.raise_for_status()
-    return resp.json()
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    raw = r.json()
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore",
+    ]
+    df = pd.DataFrame(raw, columns=cols)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    # Binance'in son satırı henüz KAPANMAMIŞ (oluşmakta olan) mum olabilir -> at.
+    now_ms = int(time.time() * 1000)
+    if raw and raw[-1][6] > now_ms:  # close_time > şimdi -> mum hâlâ açık
+        df = df.iloc[:-1].reset_index(drop=True)
+    return df
 
 
-# ============================ SİNYAL MANTIĞI ============================
-def check_volume_spike(symbol: str):
-    """
-    15dk mumlarında: son KAPANMIŞ mumun hacmi, önceki 20 mumun
-    ortalamasının en az %VOLUME_THRESHOLD_PCT üzerinde mi?
-    Dönen: (sinyal_var_mi, guncel_hacim, ortalama_hacim)
-    """
-    klines = get_klines(symbol, "15m", VOLUME_LOOKBACK + 2)
-    if len(klines) < VOLUME_LOOKBACK + 2:
-        return False, None, None
-
-    closed_klines = klines[:-1]  # son mum muhtemelen henüz kapanmadı, çıkar
-    trigger_candle = closed_klines[-1]
-    avg_window = closed_klines[-(VOLUME_LOOKBACK + 1):-1]
-
-    trigger_volume = float(trigger_candle[5])
-    avg_volume = sum(float(c[5]) for c in avg_window) / len(avg_window)
-
-    if avg_volume == 0:
-        return False, trigger_volume, avg_volume
-
-    increase_pct = (trigger_volume - avg_volume) / avg_volume * 100
-    return increase_pct >= VOLUME_THRESHOLD_PCT, trigger_volume, avg_volume
+# ─────────────────────────────────────────────────────────────────────────
+#  İNDİKATÖR HESAPLARI (Pine koduna birebir sadık)
+# ─────────────────────────────────────────────────────────────────────────
+def wma(series: pd.Series, length: int) -> pd.Series:
+    weights = np.arange(1, length + 1)
+    return series.rolling(length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
 
 
-def check_4h_breakout(symbol: str):
-    """
-    4h grafikte, kontrol edilen son kapanmış mum HARİÇ önceki
-    PIVOT_LOOKBACK barın en yüksek noktasını (tepe) bulur ve bu son mumun
-    fiyatının bu tepeyi geçip geçmediğini kontrol eder.
-    Dönen: (kirildi_mi, guncel_fiyat, tepe_seviyesi)
-    """
-    klines = get_klines(symbol, "4h", PIVOT_LOOKBACK + 3)
-    if len(klines) < PIVOT_LOOKBACK + 3:
-        return False, None, None
-
-    closed_klines = klines[:-1]           # son mum muhtemelen henüz kapanmadı, çıkar
-    trigger_candle = closed_klines[-1]    # kırılımı kontrol ettiğimiz mum
-    pivot_window = closed_klines[-(PIVOT_LOOKBACK + 1):-1]  # ondan ÖNCEKİ 20 mum
-
-    swing_high = max(float(c[2]) for c in pivot_window)  # high sütunu
-    current_price = float(trigger_candle[4])              # trigger mumun close'u
-
-    return current_price > swing_high, current_price, swing_high
+def hma(series: pd.Series, length: int) -> pd.Series:
+    half = max(1, int(length / 2))
+    sqrt_len = max(1, int(round(np.sqrt(length))))
+    diff = 2 * wma(series, half) - wma(series, length)
+    return wma(diff, sqrt_len)
 
 
-def scan_symbol(symbol: str, stats: dict):
+def rma(series: pd.Series, length: int) -> pd.Series:
+    alpha = 1.0 / length
+    return series.ewm(alpha=alpha, adjust=False).mean()
+
+
+def wilder_rsi(close: pd.Series, length: int = 9) -> pd.Series:
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    roll_up = rma(up, length)
+    roll_down = rma(down, length)
+    rs = roll_up / roll_down
+    rsi = np.where(roll_down == 0, 100.0, np.where(roll_up == 0, 0.0, 100 - 100 / (1 + rs)))
+    return pd.Series(rsi, index=close.index)
+
+
+def rolling_dev(series: pd.Series, length: int) -> pd.Series:
+    """Pine ta.dev: ortalama mutlak sapma (mean absolute deviation)."""
+    return series.rolling(length).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+
+
+def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # --- RSI(9) ---
+    out["rsi"] = wilder_rsi(out["close"], RSI_LEN)
+
+    # --- Özel HMA tabanlı CMO ---
+    src1 = hma(out["open"], 5).shift(1)   # Pine: ta.hma(open,5)[1]  (built-in lag düzeltmesi)
+    src2 = hma(out["close"], 12)
+    momm1 = src1.diff()
+    momm2 = src2.diff()
+    m1 = np.where(momm1 >= momm2, momm1, 0.0)
+    m2 = np.where(momm1 >= momm2, 0.0, -momm1)
+    # length1 = 1 -> sum(x,1) = x, ek işlem gerekmiyor
+    sm1 = pd.Series(m1, index=out.index)
+    sm2 = pd.Series(m2, index=out.index)
+    out["cmo"] = 100 * (sm1 - sm2) / (sm1 + sm2)
+
+    # --- Pivot (Pine'daki backward-only highest/lowest + dev tekniği) ---
+    h = out["high"].rolling(PIVOT_LEN).max()
+    h_dev = rolling_dev(h, PIVOT_LEN)
+    h1 = np.where(h_dev != 0, np.nan, h)
+    out["hpivot"] = pd.Series(h1, index=out.index).ffill()
+
+    l = out["low"].rolling(PIVOT_LEN).min()
+    l_dev = rolling_dev(l, PIVOT_LEN)
+    l1 = np.where(l_dev != 0, np.nan, l)
+    out["lpivot"] = pd.Series(l1, index=out.index).ffill()
+
+    # --- sup / res ---
+    out["sup"] = (out["rsi"] < 25) & (out["cmo"] > 50) & out["lpivot"].notna()
+    out["res"] = (out["rsi"] > 75) & (out["cmo"] < -50) & out["hpivot"].notna()
+
+    # --- xup / xdown (sticky çizgi seviyeleri) ---
+    xup = np.zeros(len(out))
+    xdown = np.zeros(len(out))
+    prev_up = 0.0
+    prev_down = 0.0
+    sup_vals = out["sup"].to_numpy()
+    res_vals = out["res"].to_numpy()
+    low_vals = out["low"].to_numpy()
+    high_vals = out["high"].to_numpy()
+    for i in range(len(out)):
+        if sup_vals[i]:
+            prev_up = low_vals[i]
+        xup[i] = prev_up
+        if res_vals[i]:
+            prev_down = high_vals[i]
+        xdown[i] = prev_down
+    out["tf1"] = xup   # destek (yeşil) seviyesi
+    out["tf2"] = xdown  # direnç (turuncu) seviyesi
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#  SEMBOL TARAMA
+# ─────────────────────────────────────────────────────────────────────────
+def scan_symbol(symbol: str) -> None:
     try:
-        vol_signal, trigger_vol, avg_vol = check_volume_spike(symbol)
-        if not vol_signal:
+        df = get_klines(symbol, INTERVAL, KLINES_LIMIT)
+        if len(df) < 60:
             return
+        df = compute_signals(df)
 
-        stats["volume_gecen"] += 1
-        log.debug(f"{symbol}: hacim şartı sağlandı, 4h kontrolüne geçiliyor.")
-
-        breakout_signal, price, swing_high = check_4h_breakout(symbol)
-        if not breakout_signal:
-            return
-
-        stats["kirilim_gecen"] += 1
-
-        # cooldown kontrolü
-        now = time.time()
-        last = _last_alert_time.get(symbol, 0)
-        if now - last < ALERTED_COOLDOWN_SECONDS:
-            log.info(f"{symbol}: sinyal şartları sağlandı ama cooldown aktif, atlanıyor.")
-            return
-
-        volume_increase_pct = (trigger_vol - avg_vol) / avg_vol * 100
-        breakout_pct = (price - swing_high) / swing_high * 100
-
-        message = (
-            f"🚀 <b>{symbol}</b> — Hacim + 4H Tepe Kırılımı\n"
-            f"15dk Hacim: ortalamanın <b>%{volume_increase_pct:.1f}</b> üzerinde\n"
-            f"4H Tepe: {swing_high:.6f}\n"
-            f"Güncel Fiyat: {price:.6f} (tepeyi <b>%{breakout_pct:.2f}</b> geçti)\n"
-            f"Zaman: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+        last = df.iloc[-1]
+        last_close = float(last["close"])
+        prev_state = LAST_STATE.get(
+            symbol, {"tf1": None, "tf2": None, "sup_zone": None, "res_zone": None}
         )
-        send_telegram(message)
-        _last_alert_time[symbol] = now
-        stats["sinyal"] += 1
-        log.info(f"SİNYAL: {symbol} -> hacim +%{volume_increase_pct:.1f}, kırılım +%{breakout_pct:.2f}")
+
+        new_tf1 = last["tf1"]
+        new_tf2 = last["tf2"]
+
+        tf1_changed = prev_state["tf1"] is not None and new_tf1 != prev_state["tf1"]
+        tf2_changed = prev_state["tf2"] is not None and new_tf2 != prev_state["tf2"]
+        first_run = prev_state["tf1"] is None and prev_state["tf2"] is None
+
+        sup_zone = prev_state["sup_zone"]
+        res_zone = prev_state["res_zone"]
+
+        # ── İlk çalıştırmada state'i sadece kaydet, spam alarm atma ──
+        if not first_run:
+            # --- Yeni destek/direnç çizgisi oluştu -> zone'u "pending" olarak aç ---
+            if tf1_changed and new_tf1 > 0:
+                msg = (
+                    f"🟢 <b>DESTEK sinyali (Bar Stallone S/R)</b>\n"
+                    f"Sembol: <b>{symbol}</b>\n"
+                    f"TF: {INTERVAL}\n"
+                    f"Seviye: {new_tf1:.6g}\n"
+                    f"RSI(9): {last['rsi']:.1f} | CMO: {last['cmo']:.1f}\n"
+                    f"Teyit için gereken hareket: +%{REACTION_PCT*100:.0f}\n"
+                    f"Mum kapanış: {last['close_time']}"
+                )
+                log.info(msg.replace("\n", " | "))
+                send_telegram(msg)
+                sup_zone = {"level": new_tf1, "status": "pending"}
+
+            if tf2_changed and new_tf2 > 0:
+                msg = (
+                    f"🔴 <b>DİRENÇ sinyali (Bar Stallone S/R)</b>\n"
+                    f"Sembol: <b>{symbol}</b>\n"
+                    f"TF: {INTERVAL}\n"
+                    f"Seviye: {new_tf2:.6g}\n"
+                    f"RSI(9): {last['rsi']:.1f} | CMO: {last['cmo']:.1f}\n"
+                    f"Teyit için gereken hareket: -%{REACTION_PCT*100:.0f}\n"
+                    f"Mum kapanış: {last['close_time']}"
+                )
+                log.info(msg.replace("\n", " | "))
+                send_telegram(msg)
+                res_zone = {"level": new_tf2, "status": "pending"}
+
+            # --- Bekleyen destek zone'unun tepkisini kontrol et ---
+            if sup_zone is not None and sup_zone["status"] == "pending":
+                level = sup_zone["level"]
+                if last_close >= level * (1 + REACTION_PCT):
+                    move_pct = (last_close / level - 1) * 100
+                    msg = (
+                        f"✅ <b>DESTEK TEYİT ALDI</b>\n"
+                        f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
+                        f"Zone: {level:.6g} -> Kapanış: {last_close:.6g} (+%{move_pct:.1f})\n"
+                        f"Mum kapanış: {last['close_time']}"
+                    )
+                    log.info(msg.replace("\n", " | "))
+                    send_telegram(msg)
+                    sup_zone["status"] = "confirmed"
+                elif last_close <= level * (1 - INVALIDATE_PCT):
+                    msg = (
+                        f"❌ <b>DESTEK GEÇERSİZ (kırıldı)</b>\n"
+                        f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
+                        f"Zone: {level:.6g} -> Kapanış: {last_close:.6g}\n"
+                        f"Mum kapanış: {last['close_time']}"
+                    )
+                    log.info(msg.replace("\n", " | "))
+                    send_telegram(msg)
+                    sup_zone["status"] = "invalidated"
+
+            # --- Bekleyen direnç zone'unun tepkisini kontrol et ---
+            if res_zone is not None and res_zone["status"] == "pending":
+                level = res_zone["level"]
+                if last_close <= level * (1 - REACTION_PCT):
+                    move_pct = (1 - last_close / level) * 100
+                    msg = (
+                        f"✅ <b>DİRENÇ TEYİT ALDI</b>\n"
+                        f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
+                        f"Zone: {level:.6g} -> Kapanış: {last_close:.6g} (-%{move_pct:.1f})\n"
+                        f"Mum kapanış: {last['close_time']}"
+                    )
+                    log.info(msg.replace("\n", " | "))
+                    send_telegram(msg)
+                    res_zone["status"] = "confirmed"
+                elif last_close >= level * (1 + INVALIDATE_PCT):
+                    msg = (
+                        f"❌ <b>DİRENÇ GEÇERSİZ (kırıldı)</b>\n"
+                        f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
+                        f"Zone: {level:.6g} -> Kapanış: {last_close:.6g}\n"
+                        f"Mum kapanış: {last['close_time']}"
+                    )
+                    log.info(msg.replace("\n", " | "))
+                    send_telegram(msg)
+                    res_zone["status"] = "invalidated"
+
+        LAST_STATE[symbol] = {
+            "tf1": new_tf1,
+            "tf2": new_tf2,
+            "sup_zone": sup_zone,
+            "res_zone": res_zone,
+        }
 
     except Exception as e:
-        stats["hata"] += 1
-        log.error(f"{symbol} taranırken hata: {type(e).__name__}: {e}")
+        log.error("Sembol taramasında hata (%s): %s", symbol, e)
 
 
-def run_scan_cycle():
-    log.info("Tarama başlıyor...")
-
+def run_scan_cycle() -> None:
+    log.info("Tarama döngüsü başlıyor...")
     try:
         symbols = get_usdt_perpetual_symbols()
+        volumes = get_24h_volume_map()
     except Exception as e:
-        log.error(f"Sembol listesi çekilemedi: {type(e).__name__}: {e}")
+        log.error("Sembol/hacim listesi alınamadı: %s", e)
         return
 
-    log.info(f"Toplam {len(symbols)} USDT perpetual sembol bulundu.")
+    filtered = [s for s in symbols if volumes.get(s, 0) >= MIN_VOLUME_USDT]
+    log.info("Taranacak sembol sayısı: %d (hacim filtresi >= %s USDT)", len(filtered), f"{MIN_VOLUME_USDT:,}")
 
-    stats = {"taranan": 0, "hacim_filtresi_gecti": 0, "volume_gecen": 0, "kirilim_gecen": 0, "sinyal": 0, "hata": 0}
+    for sym in filtered:
+        scan_symbol(sym)
+        time.sleep(MAX_WORKERS_SLEEP_BETWEEN_SYMBOLS)
 
-    for symbol in symbols:
-        try:
-            vol24 = get_24h_quote_volume(symbol)
-            if vol24 < MIN_24H_USDT_VOLUME:
-                continue
-        except Exception as e:
-            log.error(f"{symbol}: 24h hacim çekilemedi: {type(e).__name__}: {e}")
-            continue
-
-        stats["hacim_filtresi_gecti"] += 1
-        scan_symbol(symbol, stats)
-        stats["taranan"] += 1
-        time.sleep(REQUEST_SLEEP)
-
-    log.info(
-        f"Tarama bitti: {stats['taranan']} coin tarandı "
-        f"(24h hacim filtresini {stats['hacim_filtresi_gecti']} coin geçti), "
-        f"15dk hacim şartını {stats['volume_gecen']} coin sağladı, "
-        f"4h kırılım şartını {stats['kirilim_gecen']} coin sağladı, "
-        f"{stats['sinyal']} sinyal gönderildi, {stats['hata']} hata oluştu."
-    )
+    log.info("Tarama döngüsü tamamlandı.")
 
 
-def main():
-    log.info("Hacim + 4H Tepe Kırılım Botu başlatıldı.")
-    if TELEGRAM_BOT_TOKEN:
-        log.info(f"TELEGRAM_TOKEN bulundu (uzunluk: {len(TELEGRAM_BOT_TOKEN)}).")
-    else:
-        log.warning("TELEGRAM_TOKEN env değişkeni bulunamadı!")
-    if TELEGRAM_CHAT_ID:
-        log.info(f"TELEGRAM_CHAT_ID bulundu: {TELEGRAM_CHAT_ID}")
-    else:
-        log.warning("TELEGRAM_CHAT_ID env değişkeni bulunamadı!")
-
-    send_telegram("✅ Hacim + 4H Tepe Kırılım Botu başlatıldı, ilk tarama başlıyor.")
+def main() -> None:
+    log.info("Bar Stallone S/R Scanner başlatıldı. TF=%s, PIVOT_LEN=%d", INTERVAL, PIVOT_LEN)
     while True:
         start = time.time()
         run_scan_cycle()
         elapsed = time.time() - start
-        sleep_time = max(0, CHECK_INTERVAL_SECONDS - elapsed)
-        log.info(f"Sonraki tarama {sleep_time/60:.1f} dakika sonra.")
-        time.sleep(sleep_time)
+        sleep_for = max(5.0, SCAN_INTERVAL_SECONDS - elapsed)
+        log.info("Sonraki tarama %.0f saniye sonra.", sleep_for)
+        time.sleep(sleep_for)
 
 
 if __name__ == "__main__":
