@@ -40,8 +40,8 @@ SCAN_INTERVAL_SECONDS = 60 * 15  # her 15 dakikada bir tara (mum kapanışına h
 REQUEST_TIMEOUT = 10
 MAX_WORKERS_SLEEP_BETWEEN_SYMBOLS = 0.05  # Binance rate-limit'e nazik davran
 
-REACTION_PCT = 0.05      # zone'dan teyit için gereken hareket (%5, senin diğer botlarındaki standart eşik)
-INVALIDATE_PCT = 0.02    # teyitten önce ters yönde bu kadar kırılırsa zone geçersiz sayılır (%2)
+REACTION_PCT = float(os.environ.get("REACTION_PCT", "0.05"))      # zone'dan teyit için gereken hareket (varsayılan %5)
+INVALIDATE_PCT = float(os.environ.get("INVALIDATE_PCT", "0.02"))  # ters yönde geçersizlik eşiği (varsayılan %2)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
