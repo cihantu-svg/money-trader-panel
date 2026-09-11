@@ -48,7 +48,7 @@ SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.45"))
 WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "1800"))
 MAX_RETRIES = 5
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+CONVICTION_MIN = int(os.environ.get("CONVICTION_MIN", "60"))  # bunun altındaki sinyaller sadece log'a yazılır, Telegram'a gitmez
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -199,14 +199,19 @@ def compute_signals(df: pd.DataFrame, piv_len: int = PIV_LEN) -> pd.DataFrame:
     choch_dn_arr = np.zeros(n, dtype=bool)
     buy_arr = np.zeros(n, dtype=bool)
     sell_arr = np.zeros(n, dtype=bool)
+    conv_arr = np.zeros(n, dtype=float)
 
     high = out["high"].to_numpy()
     low = out["low"].to_numpy()
     close = out["close"].to_numpy()
     open_ = out["open"].to_numpy()
     atr_v = out["atr"].to_numpy()
-    ph_v = ph.to_numpy()
-    pl_v = pl.to_numpy()
+    # Pine'da ta.pivothigh/pivotlow bir pivotu piv_len bar SONRA (sağ taraf teyit
+    # olunca) "biliniyor" sayar ve lastPH/lastPL ancak o barda güncellenir.
+    # find_pivots() değeri pivot barının KENDİSİNE yazıyor, bu yüzden burada
+    # piv_len bar ileri kaydırıp Pine'ın gerçek "biliniyor" anına hizalıyoruz.
+    ph_v = ph.shift(piv_len).to_numpy()
+    pl_v = pl.shift(piv_len).to_numpy()
 
     for i in range(n):
         # --- yeni pivot teyidi -> sticky lastPH/lastPL güncelle, sweep flag sıfırla ---
@@ -262,6 +267,21 @@ def compute_signals(df: pd.DataFrame, piv_len: int = PIV_LEN) -> pd.DataFrame:
         if sig:
             last_sig_bar = i
 
+        # --- CONVICTION (Pine dashboard'daki 0-100 skorun aynısı; FVG bileşeni
+        # bizde olmadığı için nötr/muhafazakar (0.4) sabit kabul edilir) ---
+        conv = 0.0
+        if sig:
+            struct_comp = 1.0 if ((buy and choch_up) or (sell and choch_dn)) else 0.6
+            eps = 1e-9
+            if buy and not np.isnan(arm_low_ref):
+                sweep_depth = min(1.0, max(0.0, (last_pl - arm_low_ref) / (atr_v[i] + eps)))
+            elif sell and not np.isnan(arm_high_ref):
+                sweep_depth = min(1.0, max(0.0, (arm_high_ref - last_ph) / (atr_v[i] + eps)))
+            else:
+                sweep_depth = 0.0
+            fvg_comp = 0.4  # FVG confluence portu yok, nötr/muhafazakar sabit
+            conv = round(100 * (0.4 * struct_comp + 0.35 * sweep_depth + 0.25 * fvg_comp))
+
         if buy:
             armed_long = False
         if sell:
@@ -281,6 +301,7 @@ def compute_signals(df: pd.DataFrame, piv_len: int = PIV_LEN) -> pd.DataFrame:
         choch_dn_arr[i] = choch_dn
         buy_arr[i] = buy
         sell_arr[i] = sell
+        conv_arr[i] = conv
 
     out["sweep_low"] = sweep_low_arr
     out["sweep_high"] = sweep_high_arr
@@ -290,6 +311,7 @@ def compute_signals(df: pd.DataFrame, piv_len: int = PIV_LEN) -> pd.DataFrame:
     out["choch_dn"] = choch_dn_arr
     out["buy"] = buy_arr
     out["sell"] = sell_arr
+    out["conv"] = conv_arr
     return out
 
 
@@ -310,28 +332,38 @@ def scan_symbol(symbol: str) -> None:
 
         if last["buy"]:
             tag = "CHoCH" if last["choch_up"] else "BOS"
+            conv = last["conv"]
             msg = (
                 f"🟢 <b>BUY — ICT Liquidity Sweep</b>\n"
                 f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
                 f"Yapı: {tag} (sweep + onay)\n"
+                f"Conviction: {conv:.0f}/100\n"
                 f"Kapanış: {last['close']:.6g}\n"
                 f"Mum kapanış: {last['close_time']}"
             )
-            log.info(msg.replace("\n", " | "))
-            send_telegram(msg)
+            if conv >= CONVICTION_MIN:
+                log.info(msg.replace("\n", " | "))
+                send_telegram(msg)
+            else:
+                log.info("%s | BUY sinyali ama conviction düşük (%.0f < %d), Telegram'a atlanmadı.", symbol, conv, CONVICTION_MIN)
             LAST_ALERTED_BAR[symbol] = bar_key
 
         elif last["sell"]:
             tag = "CHoCH" if last["choch_dn"] else "BOS"
+            conv = last["conv"]
             msg = (
                 f"🔴 <b>SELL — ICT Liquidity Sweep</b>\n"
                 f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
                 f"Yapı: {tag} (sweep + onay)\n"
+                f"Conviction: {conv:.0f}/100\n"
                 f"Kapanış: {last['close']:.6g}\n"
                 f"Mum kapanış: {last['close_time']}"
             )
-            log.info(msg.replace("\n", " | "))
-            send_telegram(msg)
+            if conv >= CONVICTION_MIN:
+                log.info(msg.replace("\n", " | "))
+                send_telegram(msg)
+            else:
+                log.info("%s | SELL sinyali ama conviction düşük (%.0f < %d), Telegram'a atlanmadı.", symbol, conv, CONVICTION_MIN)
             LAST_ALERTED_BAR[symbol] = bar_key
 
         elif last["sweep_low"] or last["sweep_high"]:
