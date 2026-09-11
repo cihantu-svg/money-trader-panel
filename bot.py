@@ -1,32 +1,29 @@
 """
-Bar Stallone Support/Resistance Scanner
+ICT Liquidity Sweep & Structure Scanner
 -----------------------------------------------
-Pine kaynağı: "Support/Resistance" (BarStallone / @christofferka güncellemesi)
+Pine kaynağı: "ICT Liquidity Sweep & Structure" (@version=6, overlay indikatör)
 
-Mantık (indikatörle birebir, ama repaint riski taşıyan request.security(lookahead_on)
-KULLANILMADAN, tek zaman diliminde ve sadece kapanmış mumlar üzerinden hesaplanır):
+Mantık (indikatörle birebir port edildi, tek zaman diliminde, security() kullanılmadığı
+için repaint riski yok):
 
-  RSI(9) < 25  AND  CMO_custom > 50   AND  yakın pivot-low mevcut  -> DESTEK sinyali (sup)
-  RSI(9) > 75  AND  CMO_custom < -50  AND  yakın pivot-high mevcut -> DİRENÇ sinyali (res)
-
-  xup / xdown  : sup/res tetiklendiğinde güncellenen "yapışkan" (sticky) seviyeler
-                 (Pine'daki yeşil/turuncu çizgilerin karşılığı)
-
-  Zone oluşumu (xup/xdown değişimi): SADECE LOG'a yazılır, Telegram'a gitmez.
-  Telegram alarmı SADECE şu iki durumda gider:
-    - Zone'dan +REACTION_PCT (destek) / -REACTION_PCT (direnç) hareket -> ✅ TEYİT ALDI
-    - Zone'un tersi yönünde INVALIDATE_PCT kırılırsa                    -> ❌ GEÇERSİZ
+  1) SWING PIVOT: pivLen bar sağında/solunda teyitli swing high/low (lastPH / lastPL).
+  2) LIQUIDITY SWEEP: fiyat bir swing'i FİTİLLE aşıp KAPANIŞLA geri içeri dönerse
+     "sweep" (likidite avı) sayılır -> armedLong / armedShort.
+  3) MARKET STRUCTURE: kapanış son swing'i geçerse BOS (trend yönünde) ya da
+     CHoCH (ilk ters kırılım).
+  4) SİNYAL: sweep + (BOS ya da güçlü yönlü kapanış) ikisi birden gerçekleşirse
+     BUY / SELL üretilir. Bar bazlı debounce (minGap) ile sık sinyal engellenir.
+     -> Bu tasarım zaten "sweep + yapısal teyit" istediği için Bar Stallone'daki
+        gibi ayrı bir %5 reaction katmanına ihtiyaç yok; sinyal zaten teyitli üretiliyor.
 
 Kapsam: Binance Futures USDT-M perpetual, 24s hacim >= MIN_VOLUME_USDT
-Zaman dilimi (mum): 15 dakika (kullanıcı seçimi)
-Tarama sıklığı (döngü): 5 dakika (SCAN_INTERVAL_SECONDS, diğer botlarla aynı desen)
-Pivot uzunluğu (len5): 2 (kullanıcı seçimi - orijinal, sık sinyal)
+Zaman dilimi: 15 dakika (kullanıcı seçimi)
+Pivot gücü (pivLen): 5 (kullanıcı seçimi - "biraz daha sık")
 """
 
 import os
 import time
 import logging
-from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -36,35 +33,29 @@ import requests
 #  CONFIG
 # ─────────────────────────────────────────────────────────────────────────
 BINANCE_FAPI = "https://fapi.binance.com"
-INTERVAL = "15m"                 # kullanıcı seçimi
-PIVOT_LEN = int(os.environ.get("PIVOT_LEN", "8"))  # len5 - 8: major seviyeler, daha az/güçlü sinyal (önceki: 2, çok gürültülüydü)
-RSI_LEN = 9
-MIN_VOLUME_USDT = 3_000_000      # önceki botlarla tutarlı hacim filtresi
-KLINES_LIMIT = 100               # RSI/HMA/pivot ısınma payı için yeterli (200 gereksizdi, ağırlığı gereksiz artırıyordu)
-SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", 60 * 5))  # her 5 dakikada bir tara (diğer botlarla aynı desen), mum periyodu ayrı (INTERVAL=15m)
-REQUEST_TIMEOUT = 10
-SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.45"))  # Binance rate-limit'e nazik davran (291 sembol ~ 3.5dk sürer, 60sn'lik zorunlu duraklamalara gerek kalmaz)
-WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "1800"))  # 1 dakikalık ağırlık limiti ~2400; buraya SEYREK değinilmeli, düzenli değinme SLEEP_BETWEEN_SYMBOLS'in düşük olduğu anlamına gelir
-MAX_RETRIES = 5
+INTERVAL = "15m"                          # kullanıcı seçimi
+PIV_LEN = int(os.environ.get("PIV_LEN", "5"))      # kullanıcı seçimi (pivLen)
+SWEEP_WICK_ATR = float(os.environ.get("SWEEP_WICK_ATR", "0.0"))  # Pine varsayılanı: 0.0 (herhangi bir piercing yeterli)
+ARM_EXPIRE_BARS = int(os.environ.get("ARM_EXPIRE_BARS", "6"))    # sweep sonrası onay beklenen max bar sayısı
+MIN_SIGNAL_GAP_BARS = int(os.environ.get("MIN_SIGNAL_GAP_BARS", "8"))  # aynı sembolde ardışık sinyal debounce
+ATR_LEN = 14
 
-REACTION_PCT = float(os.environ.get("REACTION_PCT", "0.05"))      # zone'dan teyit için gereken hareket (varsayılan %5)
-INVALIDATE_PCT = float(os.environ.get("INVALIDATE_PCT", "0.02"))  # ters yönde geçersizlik eşiği (varsayılan %2)
+MIN_VOLUME_USDT = 3_000_000
+KLINES_LIMIT = 150
+SCAN_INTERVAL_SECONDS = int(os.environ.get("SCAN_INTERVAL_SECONDS", 60 * 5))  # 5 dakikada bir tara
+REQUEST_TIMEOUT = 10
+SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.45"))
+WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "1800"))
+MAX_RETRIES = 5
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("bar_stallone_scanner")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("ict_liquidity_scanner")
 
-# symbol -> {
-#   "tf1": float or None, "tf2": float or None,             (son bilinen sticky seviyeler)
-#   "sup_zone": {"level": float, "status": "pending"/"confirmed"/"invalidated"} or None,
-#   "res_zone": {...} or None,
-# }
-LAST_STATE: dict[str, dict] = {}
+# symbol -> son alarm verilen bar'ın close_time'ı (aynı bar için tekrar mesaj atmamak için)
+LAST_ALERTED_BAR: dict[str, str] = {}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -91,13 +82,6 @@ _session = requests.Session()
 
 
 def binance_get(path: str, params: dict | None = None) -> requests.Response:
-    """
-    Tüm Binance Futures GET isteklerinin geçtiği tek nokta.
-    - 429 (Too Many Requests) veya 418 (IP ban) geldiğinde Retry-After'a göre
-      bekleyip tekrar dener (exponential backoff ile).
-    - Yanıttaki X-MBX-USED-WEIGHT-1M header'ını izler; limite yaklaşılırsa
-      bir sonraki dakikaya kadar bekler.
-    """
     url = f"{BINANCE_FAPI}{path}"
     for attempt in range(1, MAX_RETRIES + 1):
         r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
@@ -105,20 +89,14 @@ def binance_get(path: str, params: dict | None = None) -> requests.Response:
         if r.status_code == 200:
             used_weight = r.headers.get("X-MBX-USED-WEIGHT-1M")
             if used_weight is not None and int(used_weight) >= WEIGHT_SOFT_LIMIT:
-                log.warning(
-                    "Kullanılan ağırlık %s/%s soft limite yaklaştı, 60sn bekleniyor.",
-                    used_weight, WEIGHT_SOFT_LIMIT,
-                )
+                log.warning("Kullanılan ağırlık %s/%s soft limite yaklaştı, 60sn bekleniyor.", used_weight, WEIGHT_SOFT_LIMIT)
                 time.sleep(60)
             return r
 
         if r.status_code in (429, 418):
             retry_after = r.headers.get("Retry-After")
             wait = float(retry_after) if retry_after else min(60, 2 ** attempt)
-            log.warning(
-                "%s: %s alındı (deneme %d/%d), %.0f sn bekleniyor.",
-                path, r.status_code, attempt, MAX_RETRIES, wait,
-            )
+            log.warning("%s: %s alındı (deneme %d/%d), %.0f sn bekleniyor.", path, r.status_code, attempt, MAX_RETRIES, wait)
             time.sleep(wait)
             continue
 
@@ -128,22 +106,15 @@ def binance_get(path: str, params: dict | None = None) -> requests.Response:
 
 
 def get_usdt_perpetual_symbols() -> list[str]:
-    """USDT-M perpetual, TRADING durumundaki tüm semboller."""
     r = binance_get("/fapi/v1/exchangeInfo")
     data = r.json()
-    symbols = []
-    for s in data.get("symbols", []):
-        if (
-            s.get("contractType") == "PERPETUAL"
-            and s.get("quoteAsset") == "USDT"
-            and s.get("status") == "TRADING"
-        ):
-            symbols.append(s["symbol"])
-    return symbols
+    return [
+        s["symbol"] for s in data.get("symbols", [])
+        if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+    ]
 
 
 def get_24h_volume_map() -> dict[str, float]:
-    """symbol -> 24s quoteVolume (USDT)"""
     r = binance_get("/fapi/v1/ticker/24hr")
     data = r.json()
     return {d["symbol"]: float(d["quoteVolume"]) for d in data}
@@ -161,101 +132,164 @@ def get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     for c in ["open", "high", "low", "close", "volume"]:
         df[c] = df[c].astype(float)
     df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    # Binance'in son satırı henüz KAPANMAMIŞ (oluşmakta olan) mum olabilir -> at.
     now_ms = int(time.time() * 1000)
-    if raw and raw[-1][6] > now_ms:  # close_time > şimdi -> mum hâlâ açık
+    if raw and raw[-1][6] > now_ms:  # son mum hâlâ açık -> at
         df = df.iloc[:-1].reset_index(drop=True)
     return df
 
 
 # ─────────────────────────────────────────────────────────────────────────
-#  İNDİKATÖR HESAPLARI (Pine koduna birebir sadık)
+#  İNDİKATÖR HESAPLARI (Pine koduna sadık port)
 # ─────────────────────────────────────────────────────────────────────────
-def wma(series: pd.Series, length: int) -> pd.Series:
-    weights = np.arange(1, length + 1)
-    return series.rolling(length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+def atr(df: pd.DataFrame, length: int = ATR_LEN) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / length, adjust=False).mean()
 
 
-def hma(series: pd.Series, length: int) -> pd.Series:
-    half = max(1, int(length / 2))
-    sqrt_len = max(1, int(round(np.sqrt(length))))
-    diff = 2 * wma(series, half) - wma(series, length)
-    return wma(diff, sqrt_len)
+def find_pivots(df: pd.DataFrame, piv_len: int) -> tuple[pd.Series, pd.Series]:
+    """Standart pivot high/low: piv_len bar solunda ve sağında en yüksek/düşük.
+    Sadece i+piv_len <= son index olan barlarda teyitlidir (non-repainting)."""
+    high, low = df["high"], df["low"]
+    n = len(df)
+    ph = pd.Series(np.nan, index=df.index)
+    pl = pd.Series(np.nan, index=df.index)
+    for i in range(piv_len, n - piv_len):
+        window_h = high.iloc[i - piv_len:i + piv_len + 1]
+        if high.iloc[i] == window_h.max():
+            ph.iloc[i] = high.iloc[i]
+        window_l = low.iloc[i - piv_len:i + piv_len + 1]
+        if low.iloc[i] == window_l.min():
+            pl.iloc[i] = low.iloc[i]
+    return ph, pl
 
 
-def rma(series: pd.Series, length: int) -> pd.Series:
-    alpha = 1.0 / length
-    return series.ewm(alpha=alpha, adjust=False).mean()
+def compute_signals(df: pd.DataFrame, piv_len: int = PIV_LEN) -> pd.DataFrame:
+    out = df.copy().reset_index(drop=True)
+    out["atr"] = atr(out, ATR_LEN)
+    ph, pl = find_pivots(out, piv_len)
 
+    n = len(out)
+    last_ph = np.nan
+    last_pl = np.nan
+    ph_swept = False
+    pl_swept = False
+    bias = 0
+    bos_hi = np.nan
+    bos_lo = np.nan
 
-def wilder_rsi(close: pd.Series, length: int = 9) -> pd.Series:
-    delta = close.diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    roll_up = rma(up, length)
-    roll_down = rma(down, length)
-    rs = roll_up / roll_down
-    rsi = np.where(roll_down == 0, 100.0, np.where(roll_up == 0, 0.0, 100 - 100 / (1 + rs)))
-    return pd.Series(rsi, index=close.index)
+    armed_long = False
+    armed_short = False
+    arm_low_ref = np.nan
+    arm_high_ref = np.nan
+    arm_long_bar = None
+    arm_short_bar = None
+    last_sig_bar = None
 
+    sweep_low_arr = np.zeros(n, dtype=bool)
+    sweep_high_arr = np.zeros(n, dtype=bool)
+    bos_up_arr = np.zeros(n, dtype=bool)
+    bos_dn_arr = np.zeros(n, dtype=bool)
+    choch_up_arr = np.zeros(n, dtype=bool)
+    choch_dn_arr = np.zeros(n, dtype=bool)
+    buy_arr = np.zeros(n, dtype=bool)
+    sell_arr = np.zeros(n, dtype=bool)
 
-def rolling_dev(series: pd.Series, length: int) -> pd.Series:
-    """Pine ta.dev: ortalama mutlak sapma (mean absolute deviation)."""
-    return series.rolling(length).apply(lambda x: np.mean(np.abs(x - np.mean(x))), raw=True)
+    high = out["high"].to_numpy()
+    low = out["low"].to_numpy()
+    close = out["close"].to_numpy()
+    open_ = out["open"].to_numpy()
+    atr_v = out["atr"].to_numpy()
+    ph_v = ph.to_numpy()
+    pl_v = pl.to_numpy()
 
+    for i in range(n):
+        # --- yeni pivot teyidi -> sticky lastPH/lastPL güncelle, sweep flag sıfırla ---
+        if not np.isnan(ph_v[i]):
+            last_ph = ph_v[i]
+            ph_swept = False
+        if not np.isnan(pl_v[i]):
+            last_pl = pl_v[i]
+            pl_swept = False
 
-def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+        if not np.isnan(last_ph):
+            bos_hi = last_ph
+        if not np.isnan(last_pl):
+            bos_lo = last_pl
 
-    # --- RSI(9) ---
-    out["rsi"] = wilder_rsi(out["close"], RSI_LEN)
+        # --- market structure: BOS / CHoCH ---
+        bos_up = (not np.isnan(bos_hi)) and i > 0 and close[i - 1] <= bos_hi < close[i]
+        bos_dn = (not np.isnan(bos_lo)) and i > 0 and close[i - 1] >= bos_lo > close[i]
+        choch_up = bos_up and bias <= 0
+        choch_dn = bos_dn and bias >= 0
+        if bos_up:
+            bias = 1
+        if bos_dn:
+            bias = -1
 
-    # --- Özel HMA tabanlı CMO ---
-    src1 = hma(out["open"], 5).shift(1)   # Pine: ta.hma(open,5)[1]  (built-in lag düzeltmesi)
-    src2 = hma(out["close"], 12)
-    momm1 = src1.diff()
-    momm2 = src2.diff()
-    m1 = np.where(momm1 >= momm2, momm1, 0.0)
-    m2 = np.where(momm1 >= momm2, 0.0, -momm1)
-    # length1 = 1 -> sum(x,1) = x, ek işlem gerekmiyor
-    sm1 = pd.Series(m1, index=out.index)
-    sm2 = pd.Series(m2, index=out.index)
-    out["cmo"] = 100 * (sm1 - sm2) / (sm1 + sm2)
+        # --- liquidity sweep ---
+        pad = SWEEP_WICK_ATR * (atr_v[i] if not np.isnan(atr_v[i]) else 0.0)
+        sweep_low = (not np.isnan(last_pl)) and (not pl_swept) and low[i] < (last_pl - pad) and close[i] > last_pl
+        sweep_high = (not np.isnan(last_ph)) and (not ph_swept) and high[i] > (last_ph + pad) and close[i] < last_ph
 
-    # --- Pivot (Pine'daki backward-only highest/lowest + dev tekniği) ---
-    h = out["high"].rolling(PIVOT_LEN).max()
-    h_dev = rolling_dev(h, PIVOT_LEN)
-    h1 = np.where(h_dev != 0, np.nan, h)
-    out["hpivot"] = pd.Series(h1, index=out.index).ffill()
+        if sweep_low:
+            pl_swept = True
+            armed_long = True
+            arm_low_ref = low[i]
+            arm_long_bar = i
+        if sweep_high:
+            ph_swept = True
+            armed_short = True
+            arm_high_ref = high[i]
+            arm_short_bar = i
 
-    l = out["low"].rolling(PIVOT_LEN).min()
-    l_dev = rolling_dev(l, PIVOT_LEN)
-    l1 = np.where(l_dev != 0, np.nan, l)
-    out["lpivot"] = pd.Series(l1, index=out.index).ffill()
+        # --- confirm ---
+        bull_confirm = armed_long and (bos_up or (close[i] > open_[i] and i > 0 and close[i] > high[i - 1]))
+        bear_confirm = armed_short and (bos_dn or (close[i] < open_[i] and i > 0 and close[i] < low[i - 1]))
 
-    # --- sup / res ---
-    out["sup"] = (out["rsi"] < 25) & (out["cmo"] > 50) & out["lpivot"].notna()
-    out["res"] = (out["rsi"] > 75) & (out["cmo"] < -50) & out["hpivot"].notna()
+        sell = bear_confirm
+        buy = bull_confirm and not sell
 
-    # --- xup / xdown (sticky çizgi seviyeleri) ---
-    xup = np.zeros(len(out))
-    xdown = np.zeros(len(out))
-    prev_up = 0.0
-    prev_down = 0.0
-    sup_vals = out["sup"].to_numpy()
-    res_vals = out["res"].to_numpy()
-    low_vals = out["low"].to_numpy()
-    high_vals = out["high"].to_numpy()
-    for i in range(len(out)):
-        if sup_vals[i]:
-            prev_up = low_vals[i]
-        xup[i] = prev_up
-        if res_vals[i]:
-            prev_down = high_vals[i]
-        xdown[i] = prev_down
-    out["tf1"] = xup   # destek (yeşil) seviyesi
-    out["tf2"] = xdown  # direnç (turuncu) seviyesi
+        ok_gap = (last_sig_bar is None) or (i - last_sig_bar >= MIN_SIGNAL_GAP_BARS)
+        buy = buy and ok_gap
+        sell = sell and ok_gap
+        sig = buy or sell
+        if sig:
+            last_sig_bar = i
 
+        if buy:
+            armed_long = False
+        if sell:
+            armed_short = False
+
+        # --- staleness: onaysız kalan sweep'i belirli bar sonra düşür ---
+        if arm_long_bar is not None and (i - arm_long_bar) > ARM_EXPIRE_BARS:
+            armed_long = False
+        if arm_short_bar is not None and (i - arm_short_bar) > ARM_EXPIRE_BARS:
+            armed_short = False
+
+        sweep_low_arr[i] = sweep_low
+        sweep_high_arr[i] = sweep_high
+        bos_up_arr[i] = bos_up
+        bos_dn_arr[i] = bos_dn
+        choch_up_arr[i] = choch_up
+        choch_dn_arr[i] = choch_dn
+        buy_arr[i] = buy
+        sell_arr[i] = sell
+
+    out["sweep_low"] = sweep_low_arr
+    out["sweep_high"] = sweep_high_arr
+    out["bos_up"] = bos_up_arr
+    out["bos_dn"] = bos_dn_arr
+    out["choch_up"] = choch_up_arr
+    out["choch_dn"] = choch_dn_arr
+    out["buy"] = buy_arr
+    out["sell"] = sell_arr
     return out
 
 
@@ -265,120 +299,45 @@ def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
 def scan_symbol(symbol: str) -> None:
     try:
         df = get_klines(symbol, INTERVAL, KLINES_LIMIT)
-        if len(df) < 60:
+        if len(df) < (2 * PIV_LEN + 30):
             return
-        df = compute_signals(df)
+        out = compute_signals(df, PIV_LEN)
+        last = out.iloc[-1]
+        bar_key = str(last["close_time"])
 
-        last = df.iloc[-1]
-        last_close = float(last["close"])
-        prev_state = LAST_STATE.get(
-            symbol, {"tf1": None, "tf2": None, "sup_zone": None, "res_zone": None}
-        )
+        if LAST_ALERTED_BAR.get(symbol) == bar_key:
+            return  # bu bar için zaten mesaj atıldı
 
-        new_tf1 = last["tf1"]
-        new_tf2 = last["tf2"]
+        if last["buy"]:
+            tag = "CHoCH" if last["choch_up"] else "BOS"
+            msg = (
+                f"🟢 <b>BUY — ICT Liquidity Sweep</b>\n"
+                f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
+                f"Yapı: {tag} (sweep + onay)\n"
+                f"Kapanış: {last['close']:.6g}\n"
+                f"Mum kapanış: {last['close_time']}"
+            )
+            log.info(msg.replace("\n", " | "))
+            send_telegram(msg)
+            LAST_ALERTED_BAR[symbol] = bar_key
 
-        tf1_changed = prev_state["tf1"] is not None and new_tf1 != prev_state["tf1"]
-        tf2_changed = prev_state["tf2"] is not None and new_tf2 != prev_state["tf2"]
-        first_run = prev_state["tf1"] is None and prev_state["tf2"] is None
+        elif last["sell"]:
+            tag = "CHoCH" if last["choch_dn"] else "BOS"
+            msg = (
+                f"🔴 <b>SELL — ICT Liquidity Sweep</b>\n"
+                f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
+                f"Yapı: {tag} (sweep + onay)\n"
+                f"Kapanış: {last['close']:.6g}\n"
+                f"Mum kapanış: {last['close_time']}"
+            )
+            log.info(msg.replace("\n", " | "))
+            send_telegram(msg)
+            LAST_ALERTED_BAR[symbol] = bar_key
 
-        sup_zone = prev_state["sup_zone"]
-        res_zone = prev_state["res_zone"]
-
-        # ── İlk çalıştırmada state'i sadece kaydet, spam alarm atma ──
-        if not first_run:
-            # --- Önce MEVCUT pending zone'ları kontrol et (yeni sinyal onları ezmeden önce) ---
-            if sup_zone is not None and sup_zone["status"] == "pending":
-                level = sup_zone["level"]
-                if last_close >= level * (1 + REACTION_PCT):
-                    move_pct = (last_close / level - 1) * 100
-                    msg = (
-                        f"✅ <b>DESTEK TEYİT ALDI</b>\n"
-                        f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
-                        f"Zone: {level:.6g} -> Kapanış: {last_close:.6g} (+%{move_pct:.1f})\n"
-                        f"Mum kapanış: {last['close_time']}"
-                    )
-                    log.info(msg.replace("\n", " | "))
-                    send_telegram(msg)
-                    sup_zone["status"] = "confirmed"
-                elif last_close <= level * (1 - INVALIDATE_PCT):
-                    msg = (
-                        f"❌ <b>DESTEK GEÇERSİZ (kırıldı)</b>\n"
-                        f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
-                        f"Zone: {level:.6g} -> Kapanış: {last_close:.6g}\n"
-                        f"Mum kapanış: {last['close_time']}"
-                    )
-                    log.info(msg.replace("\n", " | "))
-                    send_telegram(msg)
-                    sup_zone["status"] = "invalidated"
-                else:
-                    move_pct = (last_close / level - 1) * 100
-                    log.info(
-                        "%s | DESTEK pending | zone=%.6g kapanış=%.6g hareket=%+.2f%% (hedef +%%%.0f)",
-                        symbol, level, last_close, move_pct, REACTION_PCT * 100,
-                    )
-
-            if res_zone is not None and res_zone["status"] == "pending":
-                level = res_zone["level"]
-                if last_close <= level * (1 - REACTION_PCT):
-                    move_pct = (1 - last_close / level) * 100
-                    msg = (
-                        f"✅ <b>DİRENÇ TEYİT ALDI</b>\n"
-                        f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
-                        f"Zone: {level:.6g} -> Kapanış: {last_close:.6g} (-%{move_pct:.1f})\n"
-                        f"Mum kapanış: {last['close_time']}"
-                    )
-                    log.info(msg.replace("\n", " | "))
-                    send_telegram(msg)
-                    res_zone["status"] = "confirmed"
-                elif last_close >= level * (1 + INVALIDATE_PCT):
-                    msg = (
-                        f"❌ <b>DİRENÇ GEÇERSİZ (kırıldı)</b>\n"
-                        f"Sembol: <b>{symbol}</b> | TF: {INTERVAL}\n"
-                        f"Zone: {level:.6g} -> Kapanış: {last_close:.6g}\n"
-                        f"Mum kapanış: {last['close_time']}"
-                    )
-                    log.info(msg.replace("\n", " | "))
-                    send_telegram(msg)
-                    res_zone["status"] = "invalidated"
-                else:
-                    move_pct = (1 - last_close / level) * 100
-                    log.info(
-                        "%s | DİRENÇ pending | zone=%.6g kapanış=%.6g hareket=%+.2f%% (hedef -%%%.0f)",
-                        symbol, level, last_close, -move_pct, REACTION_PCT * 100,
-                    )
-
-            # --- SONRA yeni destek/direnç çizgisi oluştu mu bak -> zone'u "pending" aç, SADECE LOG ---
-            if tf1_changed and new_tf1 > 0:
-                if sup_zone is not None and sup_zone["status"] == "pending":
-                    log.info(
-                        "%s | DESTEK zone yeni sinyalle değişti, önceki (%.6g) sonuçlanmadan kapandı.",
-                        symbol, sup_zone["level"],
-                    )
-                log.info(
-                    "%s | DESTEK sinyali oluştu (henüz teyit yok) | seviye=%.6g RSI=%.1f CMO=%.1f",
-                    symbol, new_tf1, last["rsi"], last["cmo"],
-                )
-                sup_zone = {"level": new_tf1, "status": "pending"}
-
-            if tf2_changed and new_tf2 > 0:
-                if res_zone is not None and res_zone["status"] == "pending":
-                    log.info(
-                        "%s | DİRENÇ zone yeni sinyalle değişti, önceki (%.6g) sonuçlanmadan kapandı.",
-                        symbol, res_zone["level"],
-                    )
-                log.info(
-                    "%s | DİRENÇ sinyali oluştu (henüz teyit yok) | seviye=%.6g RSI=%.1f CMO=%.1f",
-                    symbol, new_tf2, last["rsi"], last["cmo"],
-                )
-                res_zone = {"level": new_tf2, "status": "pending"}
-
-        LAST_STATE[symbol] = {
-            "tf1": new_tf1,
-            "tf2": new_tf2,
-            "sup_zone": sup_zone,
-            "res_zone": res_zone,
-        }
+        elif last["sweep_low"] or last["sweep_high"]:
+            # sadece log — henüz onay yok, henüz sinyal değil
+            direction = "SSL (destek) sweep" if last["sweep_low"] else "BSL (direnç) sweep"
+            log.info("%s | %s tespit edildi, onay bekleniyor.", symbol, direction)
 
     except Exception as e:
         log.error("Sembol taramasında hata (%s): %s", symbol, e)
@@ -404,7 +363,7 @@ def run_scan_cycle() -> None:
 
 
 def main() -> None:
-    log.info("Bar Stallone S/R Scanner başlatıldı. TF=%s, PIVOT_LEN=%d", INTERVAL, PIVOT_LEN)
+    log.info("ICT Liquidity Sweep Scanner başlatıldı. TF=%s, PIV_LEN=%d", INTERVAL, PIV_LEN)
     while True:
         start = time.time()
         run_scan_cycle()
