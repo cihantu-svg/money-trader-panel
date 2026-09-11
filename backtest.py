@@ -26,7 +26,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from scanner import (
+from bot import (
     binance_get,
     get_usdt_perpetual_symbols,
     get_24h_volume_map,
