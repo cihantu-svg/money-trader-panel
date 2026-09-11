@@ -37,7 +37,7 @@ import requests
 # ─────────────────────────────────────────────────────────────────────────
 BINANCE_FAPI = "https://fapi.binance.com"
 INTERVAL = "15m"                 # kullanıcı seçimi
-PIVOT_LEN = 2                    # kullanıcı seçimi (len5)
+PIVOT_LEN = int(os.environ.get("PIVOT_LEN", "8"))  # len5 - 8: major seviyeler, daha az/güçlü sinyal (önceki: 2, çok gürültülüydü)
 RSI_LEN = 9
 MIN_VOLUME_USDT = 3_000_000      # önceki botlarla tutarlı hacim filtresi
 KLINES_LIMIT = 100               # RSI/HMA/pivot ısınma payı için yeterli (200 gereksizdi, ağırlığı gereksiz artırıyordu)
