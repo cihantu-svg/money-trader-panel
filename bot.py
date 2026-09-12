@@ -49,6 +49,7 @@ WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "1800"))
 MAX_RETRIES = 5
 
 CONVICTION_MIN = int(os.environ.get("CONVICTION_MIN", "60"))  # bunun altındaki sinyaller sadece log'a yazılır, Telegram'a gitmez
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
