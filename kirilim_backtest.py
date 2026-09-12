@@ -4,7 +4,7 @@ KIRILIM + RETEST BACKTEST  (tek dosya, bağımsız çalışır)
 Çalıştırma:  python3 kirilim_backtest.py
 Gerekli env: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
 
-Mantık:
+Mantık1:
   1) "MONEY TRADER - FIBO TRADE" indikatörünün kırılım bölümüyle BİREBİR AYNI
      şekilde KIRILIM AL / KIRILIM SAT sinyallerini üret (breakout + hacim + RSI/MACD).
   2) Sinyal barındaki kırılan seviyeyi (resistance_level / support_level) not al.
