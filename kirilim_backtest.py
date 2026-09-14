@@ -6,7 +6,7 @@ Strateji:
   - Kırılım mumunun gövdesi (body) en az %5 olacak  -> |close-open|/open >= %5
   - Sadece 24 saatlik hacmi >= 1,000,000 USDT olan Binance Futures USDT-M coinleri taranır
   - Giriş fiyatı: kırılım mumunun kapanışı (close)
-  - Stop-Loss: kırılım mumunun EN DÜŞÜĞÜNDEN (low) %3 aşağısı
+  - Stop-Loss: GİRİŞ FİYATINDAN %3 aşağısı (mum dibinden değil)
   - Take-Profit: giriş fiyatının %8 üzeri
   - Sinyalden sonra SL/TP hangisi önce vurursa pozisyon orada kapanır
   - MAX_HOLD_BARS bar içinde ne SL ne TP vurmazsa, son kapanış fiyatından "SURESI_DOLDU" ile kapanır
@@ -159,13 +159,12 @@ def find_breakout_signals(df):
 def simulate_trade(df, entry_idx):
     """
     Kırılım mumundan sonraki barlarda SL/TP takibi yapar.
-    SL: kırılım mumunun LOW'undan %STOP_LOSS_PCT aşağısı
+    SL: GİRİŞ FİYATINDAN %STOP_LOSS_PCT aşağısı (mum dibinden değil)
     TP: giriş fiyatından %TAKE_PROFIT_PCT yukarısı
     Aynı mumda hem SL hem TP seviyesine değinilirse, muhafazakar davranıp SL kabul edilir.
     """
     entry_price = df.loc[entry_idx, "close"]
-    candle_low = df.loc[entry_idx, "low"]
-    sl_price = candle_low * (1 - STOP_LOSS_PCT / 100)
+    sl_price = entry_price * (1 - STOP_LOSS_PCT / 100)
     tp_price = entry_price * (1 + TAKE_PROFIT_PCT / 100)
 
     end_idx = min(entry_idx + MAX_HOLD_BARS, len(df) - 1)
