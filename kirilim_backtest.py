@@ -1,21 +1,3 @@
-"""
-FIBO ALANI KIRILIM BACKTEST - 15 Dakikalık Binance Futures
-=============================================================
-Strateji (MONEY TRADER - FIBO TRADE indikatöründeki Fibo bölgesine göre):
-  - Fibo alanı: son 200 barın en yükseği (gridYuksek) ve en düşüğü (gridDusuk)
-  - LONG sinyal: kapanış, gridYuksek'in ÜZERİNE kırılırsa (alan yukarı kırılır)
-  - SHORT sinyal: kapanış, gridDusuk'un ALTINA kırılırsa (alan aşağı kırılır)
-  - Kırılım mumunun gövdesi (body) en az %3 olmalı
-  - Risk/Ödül: 1:2 sabit oran
-      LONG  -> SL = kırılım mumunun LOW'u,  Risk = entry - SL,  TP = entry + 2*Risk
-      SHORT -> SL = kırılım mumunun HIGH'ı, Risk = SL - entry,  TP = entry - 2*Risk
-  - Likidite filtresi: 24s hacim >= 1,000,000 USDT
-  - MAX_HOLD_BARS içinde SL/TP vurmazsa, son kapanıştan "SURESI_DOLDU" ile çıkılır
-
-NOT: Bu script Binance Futures API'sine (fapi.binance.com) erişim gerektirir,
-kendi Render.com Shell / sunucu ortamında çalıştırman gerekiyor.
-"""
-
 import os
 import time
 import csv
@@ -26,21 +8,21 @@ from datetime import datetime, timedelta, timezone
 # ============================== AYARLAR ==============================
 BASE_URL = "https://fapi.binance.com"
 INTERVAL = "15m"
-LOOKBACK_DAYS = 30                 # geriye dönük kaç günlük veri taranacak
-FIBO_LOOKBACK = 200                # fibo alanı için bar sayısı (indikatördeki "lookback")
-MIN_CANDLE_BODY_PCT = 3.0          # kırılım mumunun gövdesi en az %3
-RR_RATIO = 2.0                     # ödül/risk oranı (1:2 -> TP = 2 x Risk)
-MIN_24H_VOLUME_USDT = 1_000_000    # likidite filtresi
-MAX_HOLD_BARS = 300                # ~75 saat sonra hala SL/TP vurmadıysa süre dolar
-REQUEST_SLEEP = 0.25               # rate-limit için istekler arası bekleme (sn)
+LOOKBACK_DAYS = 30                 # Geriye dönük taranacak gün sayısı
+FIBO_LOOKBACK = 200                # Fibo alanı için bar sayısı
+MIN_CANDLE_BODY_PCT = 3.0          # Kırılım mumunun gövdesi en az %3
+STOP_PCT_FROM_LOW = 3.0            # Kırılım mumunun dibinden %3 aşağısı Stop Loss
+TP_PCT_FROM_ENTRY = 7.0            # Giriş fiyatından %7 yukarısı Take Profit
+MIN_24H_VOLUME_USDT = 1_000_000    # Likidite filtresi (USDT)
+MAX_HOLD_BARS = 300                # Zaman aşımı (~75 saat)
+REQUEST_SLEEP = 0.25               # API rate-limit beklemesi (saniye)
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 OUTPUT_CSV = "fibo_kirilim_backtest_sonuclari.csv"
 
-
-# ============================== YARDIMCI FONKSİYONLAR ==============================
+# ============================== API & YARDIMCI FONKSİYONLAR ==============================
 
 def get_usdt_perpetual_symbols():
     url = f"{BASE_URL}/fapi/v1/exchangeInfo"
@@ -66,7 +48,7 @@ def filter_by_liquidity(symbols):
     vol_map = {d["symbol"]: float(d.get("quoteVolume", 0)) for d in data}
 
     liquid = [s for s in symbols if vol_map.get(s, 0) >= MIN_24H_VOLUME_USDT]
-    print(f"[i] Toplam {len(symbols)} sembolden, likidite filtresini geçen: {len(liquid)}")
+    print(f"[i] Toplam {len(symbols)} sembolden likidite filtresini geçen: {len(liquid)}")
     return liquid
 
 
@@ -115,20 +97,19 @@ def get_klines(symbol, interval, start_ms, end_ms):
     return df.reset_index(drop=True)
 
 
+# ============================== STRATEJİ MANTIĞI ==============================
+
 def find_fibo_breakout_signals(df):
     """
-    Fibo alanı (200 bar high/low) kırılım sinyallerini bulur.
-    Döndürür: [(index, yon), ...]  yon = "LONG" veya "SHORT"
+    Son 200 mumun en yükseğini kırıp gövdesi >= %3 olan sinyalleri bulur.
     """
     df["grid_high"] = df["high"].rolling(FIBO_LOOKBACK).max().shift(1)
-    df["grid_low"] = df["low"].rolling(FIBO_LOOKBACK).min().shift(1)
     df["body_pct"] = (df["close"] - df["open"]).abs() / df["open"] * 100
 
     signals = []
     for i in range(FIBO_LOOKBACK + 1, len(df)):
         grid_high = df.loc[i, "grid_high"]
-        grid_low = df.loc[i, "grid_low"]
-        if pd.isna(grid_high) or pd.isna(grid_low):
+        if pd.isna(grid_high):
             continue
 
         close_i = df.loc[i, "close"]
@@ -139,38 +120,24 @@ def find_fibo_breakout_signals(df):
             continue
 
         breakout_up = close_i > grid_high and prev_close <= grid_high
-        breakout_down = close_i < grid_low and prev_close >= grid_low
 
         if breakout_up:
             signals.append((i, "LONG"))
-        elif breakout_down:
-            signals.append((i, "SHORT"))
 
     return signals
 
 
 def simulate_trade(df, entry_idx, direction):
     """
-    1:2 sabit risk/ödül ile SL/TP takibi.
-    LONG:  SL = kırılım mumunun low'u,  Risk = entry-SL,  TP = entry + RR_RATIO*Risk
-    SHORT: SL = kırılım mumunun high'ı, Risk = SL-entry,  TP = entry - RR_RATIO*Risk
+    SL = Kırılım mumunun low'unun %3 altı
+    TP = Giriş fiyatının %7 üstü
     """
     entry_price = df.loc[entry_idx, "close"]
     candle_low = df.loc[entry_idx, "low"]
-    candle_high = df.loc[entry_idx, "high"]
 
-    if direction == "LONG":
-        sl_price = candle_low
-        risk = entry_price - sl_price
-        if risk <= 0:
-            return None
-        tp_price = entry_price + RR_RATIO * risk
-    else:  # SHORT
-        sl_price = candle_high
-        risk = sl_price - entry_price
-        if risk <= 0:
-            return None
-        tp_price = entry_price - RR_RATIO * risk
+    # Stop Loss ve Take Profit Seviyeleri
+    sl_price = candle_low * (1 - (STOP_PCT_FROM_LOW / 100.0))
+    tp_price = entry_price * (1 + (TP_PCT_FROM_ENTRY / 100.0))
 
     end_idx = min(entry_idx + MAX_HOLD_BARS, len(df) - 1)
 
@@ -178,44 +145,37 @@ def simulate_trade(df, entry_idx, direction):
         low_j = df.loc[j, "low"]
         high_j = df.loc[j, "high"]
 
-        if direction == "LONG":
-            hit_sl = low_j <= sl_price
-            hit_tp = high_j >= tp_price
-        else:
-            hit_sl = high_j >= sl_price
-            hit_tp = low_j <= tp_price
+        hit_sl = low_j <= sl_price
+        hit_tp = high_j >= tp_price
 
         if hit_sl:
-            # ikisi de aynı mumda tetiklenirse muhafazakar: SL kabul et
-            pnl_pct = (
-                (sl_price - entry_price) / entry_price * 100
-                if direction == "LONG"
-                else (entry_price - sl_price) / entry_price * 100
-            )
+            pnl_pct = ((sl_price - entry_price) / entry_price) * 100
             return {
-                "exit_time": df.loc[j, "open_time"], "exit_price": sl_price,
-                "exit_reason": "SL", "pnl_pct": pnl_pct, "bars_held": j - entry_idx,
+                "exit_time": df.loc[j, "open_time"],
+                "exit_price": sl_price,
+                "exit_reason": "SL",
+                "pnl_pct": pnl_pct,
+                "bars_held": j - entry_idx,
             }
         if hit_tp:
-            pnl_pct = (
-                (tp_price - entry_price) / entry_price * 100
-                if direction == "LONG"
-                else (entry_price - tp_price) / entry_price * 100
-            )
+            pnl_pct = ((tp_price - entry_price) / entry_price) * 100
             return {
-                "exit_time": df.loc[j, "open_time"], "exit_price": tp_price,
-                "exit_reason": "TP", "pnl_pct": pnl_pct, "bars_held": j - entry_idx,
+                "exit_time": df.loc[j, "open_time"],
+                "exit_price": tp_price,
+                "exit_reason": "TP",
+                "pnl_pct": pnl_pct,
+                "bars_held": j - entry_idx,
             }
 
+    # Zaman Aşımı
     last_close = df.loc[end_idx, "close"]
-    pnl_pct = (
-        (last_close - entry_price) / entry_price * 100
-        if direction == "LONG"
-        else (entry_price - last_close) / entry_price * 100
-    )
+    pnl_pct = ((last_close - entry_price) / entry_price) * 100
     return {
-        "exit_time": df.loc[end_idx, "open_time"], "exit_price": last_close,
-        "exit_reason": "SURESI_DOLDU", "pnl_pct": pnl_pct, "bars_held": end_idx - entry_idx,
+        "exit_time": df.loc[end_idx, "open_time"],
+        "exit_price": last_close,
+        "exit_reason": "SURESI_DOLDU",
+        "pnl_pct": pnl_pct,
+        "bars_held": end_idx - entry_idx,
     }
 
 
@@ -235,13 +195,13 @@ def send_to_telegram(csv_path, summary_text):
         print(f"[HATA] Telegram gönderimi başarısız: {e}")
 
 
-# ============================== ANA BACKTEST ==============================
+# ============================== ANA BACKTEST MANTIĞI ==============================
 
 def run_backtest():
     print("=" * 60)
-    print("FIBO ALANI KIRILIM BACKTEST BAŞLIYOR")
+    print("FIBO ALANI KIRILIM BACKTEST (LONG - %3 SL / %7 TP)")
     print(f"Zaman dilimi: {INTERVAL} | Geriye dönük: {LOOKBACK_DAYS} gün | Fibo lookback: {FIBO_LOOKBACK} bar")
-    print(f"Body filtresi: >= %{MIN_CANDLE_BODY_PCT} | Risk/Ödül: 1:{RR_RATIO:.0f}")
+    print(f"Body filtresi: >= %{MIN_CANDLE_BODY_PCT} | Stop Loss: Mum Low -%{STOP_PCT_FROM_LOW} | TP: Entry +%{TP_PCT_FROM_ENTRY}")
     print(f"Likidite filtresi: >= {MIN_24H_VOLUME_USDT:,.0f} USDT (24s hacim)")
     print("=" * 60)
 
@@ -297,8 +257,6 @@ def run_backtest():
     wins = [t for t in all_trades if t["exit_reason"] == "TP"]
     losses = [t for t in all_trades if t["exit_reason"] == "SL"]
     timeouts = [t for t in all_trades if t["exit_reason"] == "SURESI_DOLDU"]
-    longs = [t for t in all_trades if t["direction"] == "LONG"]
-    shorts = [t for t in all_trades if t["direction"] == "SHORT"]
 
     win_rate = len(wins) / total * 100 if total else 0
     avg_pnl = sum(t["pnl_pct"] for t in all_trades) / total if total else 0
@@ -306,8 +264,8 @@ def run_backtest():
 
     summary_lines = [
         "FIBO ALANI KIRILIM BACKTEST SONUÇLARI",
-        f"Toplam işlem: {total}  (LONG: {len(longs)} | SHORT: {len(shorts)})",
-        f"TP (kar): {len(wins)} | SL (zarar): {len(losses)} | Süresi dolan: {len(timeouts)}",
+        f"Toplam işlem: {total} (LONG)",
+        f"TP (%7 Kar): {len(wins)} | SL (%3 Zarar): {len(losses)} | Süresi dolan: {len(timeouts)}",
         f"Kazanma oranı: %{win_rate:.1f}",
         f"Ortalama PnL/işlem: %{avg_pnl:.2f}",
         f"Toplam PnL: %{total_pnl:.2f}",
