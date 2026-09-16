@@ -1,4 +1,3 @@
-cat << 'EOF' > kirilim_backtest.py
 import os
 import time
 import requests
@@ -159,7 +158,7 @@ def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull
                 elif row['low'] <= current_trade['tp']:
                     current_trade['exit_time'] = row.name
                     current_trade['exit_price'] = current_trade['tp']
-                    current_trade['pnl_pct'] = ((current_trade['entry'] - current_trade['tp']) / current_trade['entry']) * 100
+                    current_trade['pnl_pct'] = ((current_trade['entry'] - current_trade['sl']) / current_trade['entry']) * 100
                     current_trade['result'] = 'TP'
                     trades.append(current_trade)
                     in_position = False
@@ -275,7 +274,7 @@ if __name__ == "__main__":
         final_trades.to_csv(output_filename, index=False)
         print(f"\n[BAŞARILI] Toplam {len(final_trades)} adet işlem bulundu ve {output_filename} dosyasına kaydedildi.")
 
-        send_telegram_csv(output_filename, caption=f"📊 Binance Futures Tüm Borsa Kırılım Backtest Sonuçları (15m & 1H)\nToplam İşlem: {len(final_trades)}")
+        msg = f"📊 Binance Futures Tüm Borsa Kırılım Backtest Sonuçları (15m & 1H)\nToplam İşlem: {len(final_trades)}"
+        send_telegram_csv(output_filename, caption=msg)
     else:
         print("\n[BİLGİ] Kriterlere uyan hiçbir işlem bulunamadı.")
-EOF
