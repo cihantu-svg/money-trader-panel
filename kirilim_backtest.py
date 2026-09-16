@@ -1,14 +1,84 @@
+import os
+import time
+import requests
 import pandas as pd
 import numpy as np
-import requests
-import os
 
 # ==========================================
-# CONFIGURATION & TELEGRAM SETTINGS
-# Environment değişkenlerinden otomatik çekilir
+# CONFIGURATION & BINANCE FAPI SETTINGS
 # ==========================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BINANCE_FAPI = "https://fapi.binance.com"
+MIN_VOLUME_USDT = 3_000_000
+REQUEST_TIMEOUT = 10
+SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.45"))
+WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "1800"))
+MAX_RETRIES = 5
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ==========================================
+# BINANCE FUTURES API HELPERS (RATE-LIMIT PROTECTED)
+# ==========================================
+_session = requests.Session()
+
+def binance_get(path: str, params: dict | None = None) -> requests.Response:
+    url = f"{BINANCE_FAPI}{path}"
+    for attempt in range(1, MAX_RETRIES + 1):
+        r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+
+        if r.status_code == 200:
+            used_weight = r.headers.get("X-MBX-USED-WEIGHT-1M")
+            if used_weight is not None and int(used_weight) >= WEIGHT_SOFT_LIMIT:
+                print(f"[UYARI] Kullanılan ağırlık {used_weight}/{WEIGHT_SOFT_LIMIT} soft limite yaklaştı, 60sn bekleniyor...")
+                time.sleep(60)
+            return r
+
+        if r.status_code in (429, 418):
+            retry_after = r.headers.get("Retry-After")
+            wait = float(retry_after) if retry_after else min(60, 2 ** attempt)
+            print(f"[UYARI] {path}: {r.status_code} alındı (deneme {attempt}/{MAX_RETRIES}), {wait:.0f} sn bekleniyor...")
+            time.sleep(wait)
+            continue
+
+        r.raise_for_status()
+
+    raise RuntimeError(f"{path} için {MAX_RETRIES} denemeden sonra rate-limit aşılamadı.")
+
+def get_usdt_perpetual_symbols() -> list[str]:
+    r = binance_get("/fapi/v1/exchangeInfo")
+    data = r.json()
+    return [
+        s["symbol"] for s in data.get("symbols", [])
+        if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+    ]
+
+def get_24h_volume_map() -> dict[str, float]:
+    r = binance_get("/fapi/v1/ticker/24hr")
+    data = r.json()
+    return {d["symbol"]: float(d["quoteVolume"]) for d in data}
+
+def get_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
+    r = binance_get("/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
+    raw = r.json()
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore",
+    ]
+    df = pd.DataFrame(raw, columns=cols)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+    
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    
+    # Kapanmamış mumu ele
+    now_ms = int(time.time() * 1000)
+    if raw and raw[-1][6] > now_ms:
+        df = df.iloc[:-1].reset_index(drop=True)
+        
+    df.set_index("open_time", inplace=True)
+    return df
 
 # ==========================================
 # INDICATOR CALCULATIONS
@@ -29,6 +99,8 @@ def calculate_macd(series, fast=12, slow=26, signal=9):
     return macd_line, signal_line, hist
 
 def prepare_data(df, bo_len=20, rsi_len=14, sma_len=100, vol_len=20):
+    if df.empty:
+        return df
     df = df.copy()
     
     # Technical Indicators
@@ -37,8 +109,7 @@ def prepare_data(df, bo_len=20, rsi_len=14, sma_len=100, vol_len=20):
     df['rsi'] = calculate_rsi(df['close'], period=rsi_len)
     df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(df['close'])
     
-    # 24h/20-period Rolling Volume USD Liquidity Estimation
-    # Filters out low liquidity pairs (min $1M turnover check)
+    # 24h Rolling Volume USD Liquidity Estimation
     df['volume_usd'] = df['close'] * df['volume']
     df['volume_24h_usd'] = df['volume_usd'].rolling(window=24).sum()
     
@@ -51,7 +122,7 @@ def prepare_data(df, bo_len=20, rsi_len=14, sma_len=100, vol_len=20):
 # ==========================================
 # BACKTEST ENGINE
 # ==========================================
-def run_backtest(df, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull=60, rsi_bear=40, rr_ratio=2.0, min_liquidity_usd=1000000):
+def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull=60, rsi_bear=40, rr_ratio=2.0, min_liquidity_usd=MIN_VOLUME_USDT):
     trades = []
     in_position = False
     current_trade = {}
@@ -61,7 +132,7 @@ def run_backtest(df, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull=60, rsi
         row = df.iloc[i]
         prev_row = df.iloc[i-1]
         
-        # Check liquidity filter ($1M minimum turnover requirement)
+        # Check liquidity filter ($3M minimum turnover requirement)
         if pd.isna(row['volume_24h_usd']) or row['volume_24h_usd'] < min_liquidity_usd:
             continue
 
@@ -125,6 +196,7 @@ def run_backtest(df, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull=60, rsi
                     tp_price = entry_price + (risk * rr_ratio) # 1:2 R/R Ratio
                     in_position = True
                     current_trade = {
+                        'symbol': symbol,
                         'timeframe': tf_label,
                         'type': 'LONG',
                         'entry_time': row.name,
@@ -143,6 +215,7 @@ def run_backtest(df, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull=60, rsi
                     tp_price = entry_price - (risk * rr_ratio) # 1:2 R/R Ratio
                     in_position = True
                     current_trade = {
+                        'symbol': symbol,
                         'timeframe': tf_label,
                         'type': 'SHORT',
                         'entry_time': row.name,
@@ -176,53 +249,55 @@ def send_telegram_csv(file_path, caption="Backtest Sonuçları CSV"):
         print(f"Hata oluştu: {e}")
 
 # ==========================================
-# MAIN EXECUTION
+# MAIN EXECUTION (SCAN ALL BINANCE FUTURES)
 # ==========================================
 if __name__ == "__main__":
-    print("Backtest başlatılıyor...")
+    print("Binance Futures Borsa Taraması & Backtest Başlatılıyor...")
     
-    # Synthetic Data Generation for Testing
-    dates_15m = pd.date_range(start="2024-01-01", periods=1000, freq="15min")
-    dates_1h = pd.date_range(start="2024-01-01", periods=1000, freq="1h")
-    
-    np.random.seed(42)
-    price_15m = 50000 + np.cumsum(np.random.randn(1000) * 100)
-    vol_15m = np.random.randint(50, 500, size=1000) * 1000
-    
-    df_15m = pd.DataFrame({
-        'open': price_15m,
-        'high': price_15m + np.abs(np.random.randn(1000) * 50),
-        'low': price_15m - np.abs(np.random.randn(1000) * 50),
-        'close': price_15m + np.random.randn(1000) * 20,
-        'volume': vol_15m
-    }, index=dates_15m)
-    
-    price_1h = 50000 + np.cumsum(np.random.randn(1000) * 250)
-    vol_1h = np.random.randint(200, 2000, size=1000) * 1000
-    
-    df_1h = pd.DataFrame({
-        'open': price_1h,
-        'high': price_1h + np.abs(np.random.randn(1000) * 100),
-        'low': price_1h - np.abs(np.random.randn(1000) * 100),
-        'close': price_1h + np.random.randn(1000) * 40,
-        'volume': vol_1h
-    }, index=dates_1h)
+    try:
+        symbols = get_usdt_perpetual_symbols()
+        volumes = get_24h_volume_map()
+    except Exception as e:
+        print(f"Sembol/hacim listesi alınamadı: {e}")
+        exit(1)
 
-    # Prepare data & calculate indicators
-    df_15m_prep = prepare_data(df_15m)
-    df_1h_prep = prepare_data(df_1h)
+    filtered_symbols = [s for s in symbols if volumes.get(s, 0) >= MIN_VOLUME_USDT]
+    print(f"Taranacak Filtrelenmiş Sembol Sayısı: {len(filtered_symbols)} (24s Hacim >= ${MIN_VOLUME_USDT:,} USDT)")
 
-    # Run backtests
-    trades_15m = run_backtest(df_15m_prep, tf_label="15m")
-    trades_1h = run_backtest(df_1h_prep, tf_label="1H")
+    all_trades_list = []
 
-    # Combine results
-    all_trades = pd.concat([trades_15m, trades_1h], ignore_index=True)
-    
-    # Export to CSV
-    output_filename = "kirilim_backtest_sonuclari.csv"
-    all_trades.to_csv(output_filename, index=False)
-    print(f"İşlem sonuçları {output_filename} dosyasına kaydedildi.")
+    for idx, sym in enumerate(filtered_symbols, 1):
+        print(f"[{idx}/{len(filtered_symbols)}] {sym} çekiliyor ve test ediliyor...")
+        
+        # 15m Verisi Çek ve Test Et
+        df_15m = get_klines(sym, interval="15m", limit=1000)
+        if not df_15m.empty:
+            df_15m_prep = prepare_data(df_15m)
+            trades_15m = run_backtest(df_15m_prep, symbol=sym, tf_label="15m")
+            if not trades_15m.empty:
+                all_trades_list.append(trades_15m)
 
-    # Telegram'a Gönder
-    send_telegram_csv(output_filename, caption="📊 Kırılım Backtest Sonuçları (15m & 1H)")
+        # 1H Verisi Çek ve Test Et
+        df_1h = get_klines(sym, interval="1h", limit=1000)
+        if not df_1h.empty:
+            df_1h_prep = prepare_data(df_1h)
+            trades_1h = run_backtest(df_1h_prep, symbol=sym, tf_label="1H")
+            if not trades_1h.empty:
+                all_trades_list.append(trades_1h)
+
+        time.sleep(SLEEP_BETWEEN_SYMBOLS)
+
+    # Sonuçları Birleştir
+    if all_trades_list:
+        final_trades = pd.concat(all_trades_list, ignore_index=True)
+        output_filename = "kirilim_backtest_sonuclari.csv"
+        final_trades.to_csv(output_filename, index=False)
+        print(f"
+[BAŞARILI] Toplam {len(final_trades)} adet işlem bulundu ve {output_filename} dosyasına kaydedildi.")
+
+        # Telegram'a Gönder
+        send_telegram_csv(output_filename, caption=f"📊 Binance Futures Tüm Borsa Kırılım Backtest Sonuçları (15m & 1H)
+Toplam İşlem: {len(final_trades)}")
+    else:
+        print("
+[BİLGİ] Kriterlere uyan hiçbir işlem bulunamadı.")
