@@ -33,7 +33,7 @@ import requests
 #  CONFIG
 # ─────────────────────────────────────────────────────────────────────────
 BINANCE_FAPI = "https://fapi.binance.com"
-INTERVAL = "15m"                          # kullanıcı seçimi
+INTERVAL = "1H"                          # kullanıcı seçimi
 PIV_LEN = int(os.environ.get("PIV_LEN", "5"))      # kullanıcı seçimi (pivLen)
 SWEEP_WICK_ATR = float(os.environ.get("SWEEP_WICK_ATR", "0.0"))  # Pine varsayılanı: 0.0 (herhangi bir piercing yeterli)
 ARM_EXPIRE_BARS = int(os.environ.get("ARM_EXPIRE_BARS", "6"))    # sweep sonrası onay beklenen max bar sayısı
