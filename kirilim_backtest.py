@@ -1,3 +1,4 @@
+cat << 'EOF' > kirilim_backtest.py
 import os
 import time
 import requests
@@ -18,7 +19,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # ==========================================
-# BINANCE FUTURES API HELPERS (RATE-LIMIT PROTECTED)
+# BINANCE FUTURES API HELPERS
 # ==========================================
 _session = requests.Session()
 
@@ -72,7 +73,6 @@ def get_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
     
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
     
-    # Kapanmamış mumu ele
     now_ms = int(time.time() * 1000)
     if raw and raw[-1][6] > now_ms:
         df = df.iloc[:-1].reset_index(drop=True)
@@ -103,17 +103,14 @@ def prepare_data(df, bo_len=20, rsi_len=14, sma_len=100, vol_len=20):
         return df
     df = df.copy()
     
-    # Technical Indicators
     df['sma100'] = df['close'].rolling(window=sma_len).mean()
     df['vol_sma'] = df['volume'].rolling(window=vol_len).mean()
     df['rsi'] = calculate_rsi(df['close'], period=rsi_len)
     df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(df['close'])
     
-    # 24h Rolling Volume USD Liquidity Estimation
     df['volume_usd'] = df['close'] * df['volume']
     df['volume_24h_usd'] = df['volume_usd'].rolling(window=24).sum()
     
-    # Breakout Levels (shifted by 1 to prevent lookahead bias / repaint)
     df['resistance_level'] = df['high'].shift(1).rolling(window=bo_len).max()
     df['support_level'] = df['low'].shift(1).rolling(window=bo_len).min()
     
@@ -127,20 +124,15 @@ def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull
     in_position = False
     current_trade = {}
     
-    # Iterate through dataframe
     for i in range(100, len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i-1]
         
-        # Check liquidity filter ($3M minimum turnover requirement)
         if pd.isna(row['volume_24h_usd']) or row['volume_24h_usd'] < min_liquidity_usd:
             continue
 
-        # Position Exit / Management Check
         if in_position:
-            # LONG Management
             if current_trade['type'] == 'LONG':
-                # Check Stop Loss first
                 if row['low'] <= current_trade['sl']:
                     current_trade['exit_time'] = row.name
                     current_trade['exit_price'] = current_trade['sl']
@@ -148,7 +140,6 @@ def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull
                     current_trade['result'] = 'SL'
                     trades.append(current_trade)
                     in_position = False
-                # Check Take Profit
                 elif row['high'] >= current_trade['tp']:
                     current_trade['exit_time'] = row.name
                     current_trade['exit_price'] = current_trade['tp']
@@ -157,9 +148,7 @@ def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull
                     trades.append(current_trade)
                     in_position = False
             
-            # SHORT Management
             elif current_trade['type'] == 'SHORT':
-                # Check Stop Loss
                 if row['high'] >= current_trade['sl']:
                     current_trade['exit_time'] = row.name
                     current_trade['exit_price'] = current_trade['sl']
@@ -167,18 +156,15 @@ def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull
                     current_trade['result'] = 'SL'
                     trades.append(current_trade)
                     in_position = False
-                # Check Take Profit
                 elif row['low'] <= current_trade['tp']:
                     current_trade['exit_time'] = row.name
                     current_trade['exit_price'] = current_trade['tp']
-                    current_trade['pnl_pct'] = ((current_trade['entry'] - current_trade['sl']) / current_trade['entry']) * 100
+                    current_trade['pnl_pct'] = ((current_trade['entry'] - current_trade['tp']) / current_trade['entry']) * 100
                     current_trade['result'] = 'TP'
                     trades.append(current_trade)
                     in_position = False
 
-        # Entry Signals Check (if not in position)
         if not in_position:
-            # Conditions
             vol_bullish = row['volume'] > (row['vol_sma'] * vol_mult)
             vol_bearish = row['volume'] > (row['vol_sma'] * vol_mult)
             mom_bullish = (row['rsi'] > rsi_bull) and (row['macd_hist'] > 0) and (row['macd'] > row['macd_signal'])
@@ -187,13 +173,12 @@ def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull
             breakout_up = (row['close'] > row['resistance_level'] * (1 + bo_buffer_pct / 100)) and (prev_row['close'] <= row['resistance_level'])
             breakout_down = (row['close'] < row['support_level'] * (1 - bo_buffer_pct / 100)) and (prev_row['close'] >= row['support_level'])
             
-            # LONG Entry Condition: Breakout Up + Volume + Momentum + Price ABOVE SMA 100
             if breakout_up and vol_bullish and mom_bullish and (row['close'] > row['sma100']):
                 entry_price = row['close']
-                sl_price = row['low']  # Breakout candle low as SL
+                sl_price = row['low']
                 risk = entry_price - sl_price
                 if risk > 0:
-                    tp_price = entry_price + (risk * rr_ratio) # 1:2 R/R Ratio
+                    tp_price = entry_price + (risk * rr_ratio)
                     in_position = True
                     current_trade = {
                         'symbol': symbol,
@@ -206,13 +191,12 @@ def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull
                         'risk': risk
                     }
             
-            # SHORT Entry Condition: Breakout Down + Volume + Momentum + Price BELOW SMA 100
             elif breakout_down and vol_bearish and mom_bearish and (row['close'] < row['sma100']):
                 entry_price = row['close']
-                sl_price = row['high']  # Breakout candle high as SL
+                sl_price = row['high']
                 risk = sl_price - entry_price
                 if risk > 0:
-                    tp_price = entry_price - (risk * rr_ratio) # 1:2 R/R Ratio
+                    tp_price = entry_price - (risk * rr_ratio)
                     in_position = True
                     current_trade = {
                         'symbol': symbol,
@@ -249,7 +233,7 @@ def send_telegram_csv(file_path, caption="Backtest Sonuçları CSV"):
         print(f"Hata oluştu: {e}")
 
 # ==========================================
-# MAIN EXECUTION (SCAN ALL BINANCE FUTURES)
+# MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
     print("Binance Futures Borsa Taraması & Backtest Başlatılıyor...")
@@ -269,7 +253,6 @@ if __name__ == "__main__":
     for idx, sym in enumerate(filtered_symbols, 1):
         print(f"[{idx}/{len(filtered_symbols)}] {sym} çekiliyor ve test ediliyor...")
         
-        # 15m Verisi Çek ve Test Et
         df_15m = get_klines(sym, interval="15m", limit=1000)
         if not df_15m.empty:
             df_15m_prep = prepare_data(df_15m)
@@ -277,7 +260,6 @@ if __name__ == "__main__":
             if not trades_15m.empty:
                 all_trades_list.append(trades_15m)
 
-        # 1H Verisi Çek ve Test Et
         df_1h = get_klines(sym, interval="1h", limit=1000)
         if not df_1h.empty:
             df_1h_prep = prepare_data(df_1h)
@@ -287,17 +269,13 @@ if __name__ == "__main__":
 
         time.sleep(SLEEP_BETWEEN_SYMBOLS)
 
-    # Sonuçları Birleştir
     if all_trades_list:
         final_trades = pd.concat(all_trades_list, ignore_index=True)
         output_filename = "kirilim_backtest_sonuclari.csv"
         final_trades.to_csv(output_filename, index=False)
-        print(f"
-[BAŞARILI] Toplam {len(final_trades)} adet işlem bulundu ve {output_filename} dosyasına kaydedildi.")
+        print(f"\n[BAŞARILI] Toplam {len(final_trades)} adet işlem bulundu ve {output_filename} dosyasına kaydedildi.")
 
-        # Telegram'a Gönder
-        send_telegram_csv(output_filename, caption=f"📊 Binance Futures Tüm Borsa Kırılım Backtest Sonuçları (15m & 1H)
-Toplam İşlem: {len(final_trades)}")
+        send_telegram_csv(output_filename, caption=f"📊 Binance Futures Tüm Borsa Kırılım Backtest Sonuçları (15m & 1H)\nToplam İşlem: {len(final_trades)}")
     else:
-        print("
-[BİLGİ] Kriterlere uyan hiçbir işlem bulunamadı.")
+        print("\n[BİLGİ] Kriterlere uyan hiçbir işlem bulunamadı.")
+EOF
