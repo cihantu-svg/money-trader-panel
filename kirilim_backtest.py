@@ -1,280 +1,268 @@
-import os
-import time
+"""
+MONEY TRADER - FIBO TRADE Backtest
+Strateji: 200 barlik Tepe/Dip + Dokunma + Onay Mumu (DIPTEN AL / TEPEDEN SAT)
+Giris: SADECE onay mumu (dipAL / tepeSAT) olustugunda, o mumun close'unda
+SL/TP: Tetik mumunun low/high referans alinarak -%1 / +%4
+Zaman dilimi: 15 dakika
+Coin evreni: Binance Futures USDT-M perpetual, 24s hacim >= 3M USDT
+Donem: Son 30 gun
+Cikti: CSV + Telegram ozet
+"""
+
 import requests
 import pandas as pd
-import numpy as np
+import time
+from datetime import datetime, timedelta, timezone
 
-# ==========================================
-# CONFIGURATION & BINANCE FAPI SETTINGS
-# ==========================================
-BINANCE_FAPI = "https://fapi.binance.com"
+# ─────────────── AYARLAR ───────────────
+LOOKBACK = 200
+MIN_BAR_ARASI = 30
+TOLERANS_PCT = 1.0
+SL_PCT = 0.01     # tetik mumunun low/high'inin %1 asagisi/yukarisi
+TP_PCT = 0.04     # tetik mumunun low/high'inin %4 yukarisi/asagisi
 MIN_VOLUME_USDT = 3_000_000
-REQUEST_TIMEOUT = 10
-SLEEP_BETWEEN_SYMBOLS = float(os.environ.get("SLEEP_BETWEEN_SYMBOLS", "0.45"))
-WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", "1800"))
-MAX_RETRIES = 5
+TIMEFRAME = "15m"
+DAYS_BACK = 30
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+BINANCE_FAPI = "https://fapi.binance.com"
 
-# ==========================================
-# BINANCE FUTURES API HELPERS
-# ==========================================
-_session = requests.Session()
+TELEGRAM_TOKEN = "BURAYA_TOKEN"
+TELEGRAM_CHAT_ID = "BURAYA_CHAT_ID"
 
-def binance_get(path: str, params: dict | None = None) -> requests.Response:
-    url = f"{BINANCE_FAPI}{path}"
-    for attempt in range(1, MAX_RETRIES + 1):
-        r = _session.get(url, params=params, timeout=REQUEST_TIMEOUT)
 
-        if r.status_code == 200:
-            used_weight = r.headers.get("X-MBX-USED-WEIGHT-1M")
-            if used_weight is not None and int(used_weight) >= WEIGHT_SOFT_LIMIT:
-                print(f"[UYARI] Kullanılan ağırlık {used_weight}/{WEIGHT_SOFT_LIMIT} soft limite yaklaştı, 60sn bekleniyor...")
-                time.sleep(60)
-            return r
+def get_usdt_perpetual_symbols():
+    url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
+    r = requests.get(url, timeout=15)
+    data = r.json()
+    symbols = []
+    for s in data["symbols"]:
+        if s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT" and s["status"] == "TRADING":
+            symbols.append(s["symbol"])
+    return symbols
 
-        if r.status_code in (429, 418):
-            retry_after = r.headers.get("Retry-After")
-            wait = float(retry_after) if retry_after else min(60, 2 ** attempt)
-            print(f"[UYARI] {path}: {r.status_code} alındı (deneme {attempt}/{MAX_RETRIES}), {wait:.0f} sn bekleniyor...")
-            time.sleep(wait)
+
+def get_24h_volumes():
+    url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
+    r = requests.get(url, timeout=15)
+    data = r.json()
+    vol_map = {}
+    for d in data:
+        try:
+            vol_map[d["symbol"]] = float(d["quoteVolume"])
+        except (KeyError, ValueError):
             continue
+    return vol_map
 
-        r.raise_for_status()
 
-    raise RuntimeError(f"{path} için {MAX_RETRIES} denemeden sonra rate-limit aşılamadı.")
-
-def get_usdt_perpetual_symbols() -> list[str]:
-    r = binance_get("/fapi/v1/exchangeInfo")
-    data = r.json()
-    return [
-        s["symbol"] for s in data.get("symbols", [])
-        if s.get("contractType") == "PERPETUAL" and s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
-    ]
-
-def get_24h_volume_map() -> dict[str, float]:
-    r = binance_get("/fapi/v1/ticker/24hr")
-    data = r.json()
-    return {d["symbol"]: float(d["quoteVolume"]) for d in data}
-
-def get_klines(symbol: str, interval: str, limit: int = 1000) -> pd.DataFrame:
-    r = binance_get("/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": limit})
-    raw = r.json()
-    cols = [
+def get_klines(symbol, interval, start_ms, end_ms):
+    all_klines = []
+    url = f"{BINANCE_FAPI}/fapi/v1/klines"
+    limit = 1500
+    cur = start_ms
+    while cur < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cur,
+            "endTime": end_ms,
+            "limit": limit,
+        }
+        try:
+            r = requests.get(url, params=params, timeout=15)
+            data = r.json()
+        except Exception:
+            break
+        if not isinstance(data, list) or len(data) == 0:
+            break
+        all_klines.extend(data)
+        cur = data[-1][0] + 1
+        time.sleep(0.05)
+        if len(data) < limit:
+            break
+    if not all_klines:
+        return None
+    df = pd.DataFrame(all_klines, columns=[
         "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades", "taker_buy_base",
-        "taker_buy_quote", "ignore",
-    ]
-    df = pd.DataFrame(raw, columns=cols)
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = df[c].astype(float)
-    
+        "close_time", "quote_volume", "trades", "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    
-    now_ms = int(time.time() * 1000)
-    if raw and raw[-1][6] > now_ms:
-        df = df.iloc[:-1].reset_index(drop=True)
-        
-    df.set_index("open_time", inplace=True)
-    return df
+    return df.reset_index(drop=True)
 
-# ==========================================
-# INDICATOR CALCULATIONS
-# ==========================================
-def calculate_rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
 
-def calculate_macd(series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+def find_signals(df):
+    """Pine script'teki dipAL / tepeSAT mantiginin birebir Python karsiligi."""
+    n = len(df)
+    grid_yuksek = df["high"].rolling(LOOKBACK, min_periods=LOOKBACK).max()
+    grid_dusuk = df["low"].rolling(LOOKBACK, min_periods=LOOKBACK).min()
+    aralik = grid_yuksek - grid_dusuk
+    tolerans = aralik * (TOLERANS_PCT / 100.0)
 
-def prepare_data(df, bo_len=20, rsi_len=14, sma_len=100, vol_len=20):
-    if df.empty:
-        return df
-    df = df.copy()
-    
-    df['sma100'] = df['close'].rolling(window=sma_len).mean()
-    df['vol_sma'] = df['volume'].rolling(window=vol_len).mean()
-    df['rsi'] = calculate_rsi(df['close'], period=rsi_len)
-    df['macd'], df['macd_signal'], df['macd_hist'] = calculate_macd(df['close'])
-    
-    df['volume_usd'] = df['close'] * df['volume']
-    df['volume_24h_usd'] = df['volume_usd'].rolling(window=24).sum()
-    
-    df['resistance_level'] = df['high'].shift(1).rolling(window=bo_len).max()
-    df['support_level'] = df['low'].shift(1).rolling(window=bo_len).min()
-    
-    return df
+    dip_touch = df["low"] <= (grid_dusuk + tolerans)
+    tepe_touch = df["high"] >= (grid_yuksek - tolerans)
 
-# ==========================================
-# BACKTEST ENGINE
-# ==========================================
-def run_backtest(df, symbol, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull=60, rsi_bear=40, rr_ratio=2.0, min_liquidity_usd=MIN_VOLUME_USDT):
-    trades = []
-    in_position = False
-    current_trade = {}
-    
-    for i in range(100, len(df)):
-        row = df.iloc[i]
-        prev_row = df.iloc[i-1]
-        
-        if pd.isna(row['volume_24h_usd']) or row['volume_24h_usd'] < min_liquidity_usd:
+    son_al_bar = -999
+    son_sat_bar = -999
+    al_bekliyor = False
+    sat_bekliyor = False
+
+    signals = []
+
+    for i in range(n):
+        if pd.isna(aralik.iloc[i]) or aralik.iloc[i] <= 0:
             continue
 
-        if in_position:
-            if current_trade['type'] == 'LONG':
-                if row['low'] <= current_trade['sl']:
-                    current_trade['exit_time'] = row.name
-                    current_trade['exit_price'] = current_trade['sl']
-                    current_trade['pnl_pct'] = ((current_trade['sl'] - current_trade['entry']) / current_trade['entry']) * 100
-                    current_trade['result'] = 'SL'
-                    trades.append(current_trade)
-                    in_position = False
-                elif row['high'] >= current_trade['tp']:
-                    current_trade['exit_time'] = row.name
-                    current_trade['exit_price'] = current_trade['tp']
-                    current_trade['pnl_pct'] = ((current_trade['tp'] - current_trade['entry']) / current_trade['entry']) * 100
-                    current_trade['result'] = 'TP'
-                    trades.append(current_trade)
-                    in_position = False
-            
-            elif current_trade['type'] == 'SHORT':
-                if row['high'] >= current_trade['sl']:
-                    current_trade['exit_time'] = row.name
-                    current_trade['exit_price'] = current_trade['sl']
-                    current_trade['pnl_pct'] = ((current_trade['entry'] - current_trade['sl']) / current_trade['entry']) * 100
-                    current_trade['result'] = 'SL'
-                    trades.append(current_trade)
-                    in_position = False
-                elif row['low'] <= current_trade['tp']:
-                    current_trade['exit_time'] = row.name
-                    current_trade['exit_price'] = current_trade['tp']
-                    current_trade['pnl_pct'] = ((current_trade['entry'] - current_trade['sl']) / current_trade['entry']) * 100
-                    current_trade['result'] = 'TP'
-                    trades.append(current_trade)
-                    in_position = False
+        if dip_touch.iloc[i] and (i - son_al_bar > MIN_BAR_ARASI):
+            al_bekliyor = True
+        if tepe_touch.iloc[i] and (i - son_sat_bar > MIN_BAR_ARASI):
+            sat_bekliyor = True
 
-        if not in_position:
-            vol_bullish = row['volume'] > (row['vol_sma'] * vol_mult)
-            vol_bearish = row['volume'] > (row['vol_sma'] * vol_mult)
-            mom_bullish = (row['rsi'] > rsi_bull) and (row['macd_hist'] > 0) and (row['macd'] > row['macd_signal'])
-            mom_bearish = (row['rsi'] < rsi_bear) and (row['macd_hist'] < 0) and (row['macd'] < row['macd_signal'])
-            
-            breakout_up = (row['close'] > row['resistance_level'] * (1 + bo_buffer_pct / 100)) and (prev_row['close'] <= row['resistance_level'])
-            breakout_down = (row['close'] < row['support_level'] * (1 - bo_buffer_pct / 100)) and (prev_row['close'] >= row['support_level'])
-            
-            if breakout_up and vol_bullish and mom_bullish and (row['close'] > row['sma100']):
-                entry_price = row['close']
-                sl_price = row['low']
-                risk = entry_price - sl_price
-                if risk > 0:
-                    tp_price = entry_price + (risk * rr_ratio)
-                    in_position = True
-                    current_trade = {
-                        'symbol': symbol,
-                        'timeframe': tf_label,
-                        'type': 'LONG',
-                        'entry_time': row.name,
-                        'entry': entry_price,
-                        'sl': sl_price,
-                        'tp': tp_price,
-                        'risk': risk
-                    }
-            
-            elif breakout_down and vol_bearish and mom_bearish and (row['close'] < row['sma100']):
-                entry_price = row['close']
-                sl_price = row['high']
-                risk = sl_price - entry_price
-                if risk > 0:
-                    tp_price = entry_price - (risk * rr_ratio)
-                    in_position = True
-                    current_trade = {
-                        'symbol': symbol,
-                        'timeframe': tf_label,
-                        'type': 'SHORT',
-                        'entry_time': row.name,
-                        'entry': entry_price,
-                        'sl': sl_price,
-                        'tp': tp_price,
-                        'risk': risk
-                    }
+        close = df["close"].iloc[i]
+        open_ = df["open"].iloc[i]
 
-    return pd.DataFrame(trades)
+        dip_al = al_bekliyor and (close > open_) and (i - son_al_bar > MIN_BAR_ARASI)
+        tepe_sat = sat_bekliyor and (close < open_) and (i - son_sat_bar > MIN_BAR_ARASI)
 
-# ==========================================
-# TELEGRAM SENDER FUNCTION
-# ==========================================
-def send_telegram_csv(file_path, caption="Backtest Sonuçları CSV"):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("HATA: TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID ortam değişkenlerinde (ENV) bulunamadı!")
-        return
+        if dip_al:
+            al_bekliyor = False
+            son_al_bar = i
+            signals.append({"index": i, "type": "AL"})
+        if tepe_sat:
+            sat_bekliyor = False
+            son_sat_bar = i
+            signals.append({"index": i, "type": "SAT"})
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-    try:
-        with open(file_path, "rb") as file:
-            payload = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption}
-            files = {"document": file}
-            response = requests.post(url, data=payload, files=files)
-            if response.status_code == 200:
-                print("CSV dosyası Telegram'a başarıyla gönderildi!")
-            else:
-                print(f"Telegram gönderme hatası: {response.text}")
-    except Exception as e:
-        print(f"Hata oluştu: {e}")
+    return signals
 
-# ==========================================
-# MAIN EXECUTION
-# ==========================================
-if __name__ == "__main__":
-    print("Binance Futures Borsa Taraması & Backtest Başlatılıyor...")
-    
-    try:
-        symbols = get_usdt_perpetual_symbols()
-        volumes = get_24h_volume_map()
-    except Exception as e:
-        print(f"Sembol/hacim listesi alınamadı: {e}")
-        exit(1)
+
+def simulate_trade(df, sig_index, sig_type):
+    """Sinyal mumunun close'unda giris. SL/TP tetik mumunun low/high'i referans alinarak."""
+    if sig_index + 1 >= len(df):
+        return None
+
+    trigger_low = df["low"].iloc[sig_index]
+    trigger_high = df["high"].iloc[sig_index]
+
+    if sig_type == "AL":
+        sl = trigger_low * (1 - SL_PCT)
+        tp = trigger_low * (1 + TP_PCT)
+        direction = 1
+    else:
+        sl = trigger_high * (1 + SL_PCT)
+        tp = trigger_high * (1 - TP_PCT)
+        direction = -1
+
+    for j in range(sig_index + 1, len(df)):
+        low = df["low"].iloc[j]
+        high = df["high"].iloc[j]
+
+        if direction == 1:
+            hit_sl = low <= sl
+            hit_tp = high >= tp
+        else:
+            hit_sl = high >= sl
+            hit_tp = low <= tp
+
+        # Ayni mumda ikisi de tetiklenirse muhafazakar davranilir: SL kabul edilir
+        if hit_sl:
+            return {"result": "SL", "exit_price": sl, "bars_held": j - sig_index}
+        elif hit_tp:
+            return {"result": "TP", "exit_price": tp, "bars_held": j - sig_index}
+
+    return {"result": "OPEN", "exit_price": df["close"].iloc[-1], "bars_held": len(df) - 1 - sig_index}
+
+
+def main():
+    print("Semboller ve hacimler cekiliyor...")
+    symbols = get_usdt_perpetual_symbols()
+    volumes = get_24h_volumes()
 
     filtered_symbols = [s for s in symbols if volumes.get(s, 0) >= MIN_VOLUME_USDT]
-    print(f"Taranacak Filtrelenmiş Sembol Sayısı: {len(filtered_symbols)} (24s Hacim >= ${MIN_VOLUME_USDT:,} USDT)")
+    print(f"{len(filtered_symbols)} coin hacim filtresini gecti.")
 
-    all_trades_list = []
+    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start_ms = int((datetime.now(timezone.utc) - timedelta(days=DAYS_BACK)).timestamp() * 1000)
 
-    for idx, sym in enumerate(filtered_symbols, 1):
-        print(f"[{idx}/{len(filtered_symbols)}] {sym} çekiliyor ve test ediliyor...")
-        
-        df_15m = get_klines(sym, interval="15m", limit=1000)
-        if not df_15m.empty:
-            df_15m_prep = prepare_data(df_15m)
-            trades_15m = run_backtest(df_15m_prep, symbol=sym, tf_label="15m")
-            if not trades_15m.empty:
-                all_trades_list.append(trades_15m)
+    all_trades = []
 
-        df_1h = get_klines(sym, interval="1h", limit=1000)
-        if not df_1h.empty:
-            df_1h_prep = prepare_data(df_1h)
-            trades_1h = run_backtest(df_1h_prep, symbol=sym, tf_label="1H")
-            if not trades_1h.empty:
-                all_trades_list.append(trades_1h)
+    for idx, symbol in enumerate(filtered_symbols):
+        print(f"[{idx + 1}/{len(filtered_symbols)}] {symbol} isleniyor...")
+        df = get_klines(symbol, TIMEFRAME, start_ms, end_ms)
+        if df is None or len(df) < LOOKBACK + MIN_BAR_ARASI + 5:
+            continue
 
-        time.sleep(SLEEP_BETWEEN_SYMBOLS)
+        signals = find_signals(df)
 
-    if all_trades_list:
-        final_trades = pd.concat(all_trades_list, ignore_index=True)
-        output_filename = "kirilim_backtest_sonuclari.csv"
-        final_trades.to_csv(output_filename, index=False)
-        print(f"\n[BAŞARILI] Toplam {len(final_trades)} adet işlem bulundu ve {output_filename} dosyasına kaydedildi.")
+        for sig in signals:
+            trade = simulate_trade(df, sig["index"], sig["type"])
+            if trade is None:
+                continue
+            all_trades.append({
+                "symbol": symbol,
+                "type": sig["type"],
+                "signal_time": df["open_time"].iloc[sig["index"]],
+                "entry_price": df["close"].iloc[sig["index"]],
+                "result": trade["result"],
+                "exit_price": trade["exit_price"],
+                "bars_held": trade["bars_held"],
+            })
 
-        msg = f"📊 Binance Futures Tüm Borsa Kırılım Backtest Sonuçları (15m & 1H)\nToplam İşlem: {len(final_trades)}"
-        send_telegram_csv(output_filename, caption=msg)
-    else:
-        print("\n[BİLGİ] Kriterlere uyan hiçbir işlem bulunamadı.")
+        time.sleep(0.1)
+
+    if not all_trades:
+        print("Hicbir sinyal bulunamadi.")
+        return
+
+    result_df = pd.DataFrame(all_trades)
+    csv_path = "fibo_backtest_sonuclari.csv"
+    result_df.to_csv(csv_path, index=False)
+
+    total = len(result_df)
+    tp_count = (result_df["result"] == "TP").sum()
+    sl_count = (result_df["result"] == "SL").sum()
+    open_count = (result_df["result"] == "OPEN").sum()
+    closed = tp_count + sl_count
+    win_rate = (tp_count / closed * 100) if closed > 0 else 0
+
+    al_df = result_df[result_df["type"] == "AL"]
+    sat_df = result_df[result_df["type"] == "SAT"]
+
+    def winrate(sub_df):
+        c = sub_df[sub_df["result"].isin(["TP", "SL"])]
+        if len(c) == 0:
+            return 0, 0, 0
+        tp = (c["result"] == "TP").sum()
+        return tp, len(c), (tp / len(c) * 100)
+
+    al_tp, al_closed, al_wr = winrate(al_df)
+    sat_tp, sat_closed, sat_wr = winrate(sat_df)
+
+    summary = (
+        f"FIBO TRADE Backtest Sonucu ({DAYS_BACK} gun, {TIMEFRAME})\n\n"
+        f"Toplam sinyal: {total}\n"
+        f"Kapanan: {closed} | Acik: {open_count}\n"
+        f"TP: {tp_count} | SL: {sl_count}\n"
+        f"Genel basari orani: %{win_rate:.1f}\n\n"
+        f"DIPTEN AL -> {al_tp}/{al_closed} basarili (%{al_wr:.1f})\n"
+        f"TEPEDEN SAT -> {sat_tp}/{sat_closed} basarili (%{sat_wr:.1f})\n\n"
+        f"SL: tetik mumu low/high -%{SL_PCT * 100:.0f}\n"
+        f"TP: tetik mumu low/high +%{TP_PCT * 100:.0f}\n"
+        f"(Risk/odul orani bu ayarla yaklasik 1:{TP_PCT / SL_PCT:.0f})"
+    )
+
+    print(summary)
+
+    if TELEGRAM_TOKEN != "BURAYA_TOKEN":
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": summary},
+                timeout=10,
+            )
+        except Exception as e:
+            print(f"Telegram gonderim hatasi: {e}")
+
+
+if __name__ == "__main__":
+    main()
