@@ -5,9 +5,10 @@ import os
 
 # ==========================================
 # CONFIGURATION & TELEGRAM SETTINGS
+# Environment değişkenlerinden otomatik çekilir
 # ==========================================
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_TOKEN"
-TELEGRAM_CHAT_ID = "YOUR_TELEGRAM_CHAT_ID"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # ==========================================
 # INDICATOR CALCULATIONS
@@ -99,7 +100,7 @@ def run_backtest(df, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull=60, rsi
                 elif row['low'] <= current_trade['tp']:
                     current_trade['exit_time'] = row.name
                     current_trade['exit_price'] = current_trade['tp']
-                    current_trade['pnl_pct'] = ((current_trade['entry'] - current_trade['tp']) / current_trade['entry']) * 100
+                    current_trade['pnl_pct'] = ((current_trade['entry'] - current_trade['sl']) / current_trade['entry']) * 100
                     current_trade['result'] = 'TP'
                     trades.append(current_trade)
                     in_position = False
@@ -157,6 +158,10 @@ def run_backtest(df, tf_label, bo_buffer_pct=0.5, vol_mult=2.0, rsi_bull=60, rsi
 # TELEGRAM SENDER FUNCTION
 # ==========================================
 def send_telegram_csv(file_path, caption="Backtest Sonuçları CSV"):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("HATA: TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID ortam değişkenlerinde (ENV) bulunamadı!")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
     try:
         with open(file_path, "rb") as file:
@@ -171,12 +176,12 @@ def send_telegram_csv(file_path, caption="Backtest Sonuçları CSV"):
         print(f"Hata oluştu: {e}")
 
 # ==========================================
-# MAIN EXECUTION & EXAMPLE GENERATION
+# MAIN EXECUTION
 # ==========================================
 if __name__ == "__main__":
     print("Backtest başlatılıyor...")
     
-    # Synthetic Data Generation for Testing (Replace with your actual CSV/Binance API data)
+    # Synthetic Data Generation for Testing
     dates_15m = pd.date_range(start="2024-01-01", periods=1000, freq="15min")
     dates_1h = pd.date_range(start="2024-01-01", periods=1000, freq="1h")
     
@@ -220,7 +225,4 @@ if __name__ == "__main__":
     print(f"İşlem sonuçları {output_filename} dosyasına kaydedildi.")
 
     # Telegram'a Gönder
-    if TELEGRAM_TOKEN != "YOUR_TELEGRAM_TOKEN" and TELEGRAM_CHAT_ID != "YOUR_TELEGRAM_CHAT_ID":
-        send_telegram_csv(output_filename, caption="📊 Kırılım Backtest Sonuçları (15m & 1H)")
-    else:
-        print("Lütfen TELEGRAM_TOKEN ve TELEGRAM_CHAT_ID değişkenlerini kendi bilgilerinizle güncelleyin.")
+    send_telegram_csv(output_filename, caption="📊 Kırılım Backtest Sonuçları (15m & 1H)")
