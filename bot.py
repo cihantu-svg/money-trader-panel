@@ -1,17 +1,10 @@
 """
-SMA100 Temas + %5 Mum Boyu - CANLI TARAMA BOTU
-Bu bir strateji/otomatik islem botu DEGILDIR - sadece tarama ve Telegram uyarisi yapar.
-Islem karari kullaniciya aittir.
-
-Kosullar (her ikisi de saglanmali):
-1) Mum govdesi >= %5   ->  |close - open| / open * 100 >= BODY_PCT
-2) Mum SMA100'e temas ediyor -> low <= SMA100 <= high (mumun araligi SMA100'u iceriyor)
-
-Filtre: 24s hacim >= 3M USDT
-Borsa/Piyasa: Binance Futures USDT-M perpetual
-Zaman dilimi: 15 dakika
-Tarama sikligi: her 5 dakikada bir
-Cikti: Telegram anlik uyari (her mum icin sembol basina sadece 1 kez)
+SMA100 Temas + Mum Boyu - CANLI TARAMA BOTU
+Kosullar:
+1) Mum govdesi >= BODY_PCT
+2) Mumun low-high araligi SMA100 degerini iceriyor (temas)
+Filtre: 24s hacim >= MIN_VOLUME_USDT
+Borsa: Binance Futures USDT-M perpetual
 """
 
 import requests
@@ -20,27 +13,25 @@ import time
 import os
 from datetime import datetime, timezone
 
-# ─────────────── AYARLAR ───────────────
-SMA_LEN = 100
-BODY_PCT = 5.0
-MIN_VOLUME_USDT = 3_000_000
-TIMEFRAME = "15m"
-SCAN_INTERVAL_SEC = 300          # 5 dakikada bir tarama
-KLINES_LIMIT = SMA_LEN + 10      # SMA100 icin yeterli gecmis veri
+# ─────────────── AYARLAR (ENV'DEN OKUNUR) ───────────────
+SMA_LEN           = int(os.environ.get("SMA_LEN", 100))
+BODY_PCT          = float(os.environ.get("BODY_PCT", 5.0))
+MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
+TIMEFRAME         = os.environ.get("TIMEFRAME", "15m")
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 300))
 
-BINANCE_FAPI = "https://fapi.binance.com"
-
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
+BINANCE_FAPI  = "https://fapi.binance.com"
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
-# Ayni mum icin ayni sembole tekrar uyari atmamak icin
-son_uyari_zamani = {}   # {symbol: candle_open_time_ms}
+KLINES_LIMIT = SMA_LEN + 10
+
+son_uyari_zamani = {}
 
 
 def send_telegram(text):
     if TELEGRAM_TOKEN == "BURAYA_TOKEN":
-        print("[UYARI] Telegram token tanimlanmamis, sadece konsola yaziliyor.")
-        print(text)
+        print("[UYARI] Telegram token tanimlanmamis.", flush=True)
         return
     try:
         requests.post(
@@ -49,15 +40,14 @@ def send_telegram(text):
             timeout=10,
         )
     except Exception as e:
-        print(f"Telegram gonderim hatasi: {e}")
+        print(f"Telegram gonderim hatasi: {e}", flush=True)
 
 
 def get_usdt_perpetual_symbols():
     url = f"{BINANCE_FAPI}/fapi/v1/exchangeInfo"
     r = requests.get(url, timeout=15)
-    data = r.json()
     symbols = []
-    for s in data["symbols"]:
+    for s in r.json()["symbols"]:
         if s["contractType"] == "PERPETUAL" and s["quoteAsset"] == "USDT" and s["status"] == "TRADING":
             symbols.append(s["symbol"])
     return symbols
@@ -66,9 +56,8 @@ def get_usdt_perpetual_symbols():
 def get_24h_volumes():
     url = f"{BINANCE_FAPI}/fapi/v1/ticker/24hr"
     r = requests.get(url, timeout=15)
-    data = r.json()
     vol_map = {}
-    for d in data:
+    for d in r.json():
         try:
             vol_map[d["symbol"]] = float(d["quoteVolume"])
         except (KeyError, ValueError):
@@ -76,9 +65,9 @@ def get_24h_volumes():
     return vol_map
 
 
-def get_klines(symbol, interval, limit):
+def get_klines(symbol):
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    params = {"symbol": symbol, "interval": TIMEFRAME, "limit": KLINES_LIMIT}
     try:
         r = requests.get(url, params=params, timeout=15)
         data = r.json()
@@ -97,82 +86,80 @@ def get_klines(symbol, interval, limit):
 
 
 def check_symbol(symbol):
-    df = get_klines(symbol, TIMEFRAME, KLINES_LIMIT)
+    df = get_klines(symbol)
     if df is None or len(df) < SMA_LEN + 2:
         return None
 
     df["sma100"] = df["close"].rolling(SMA_LEN).mean()
 
-    # Son KAPANMIS mum (canli/tamamlanmamis mum degil, sondan bir onceki)
-    row = df.iloc[-2]
+    # Son kapanmis mum (tamamlanmamis canli mum degil)
+    row    = df.iloc[-2]
     sma100 = df["sma100"].iloc[-2]
 
     if pd.isna(sma100):
         return None
 
-    body_pct = abs(row["close"] - row["open"]) / row["open"] * 100
+    body_pct    = abs(row["close"] - row["open"]) / row["open"] * 100
     touches_sma = row["low"] <= sma100 <= row["high"]
 
     if body_pct >= BODY_PCT and touches_sma:
         return {
-            "symbol": symbol,
+            "symbol":    symbol,
             "open_time": int(row["open_time"]),
-            "body_pct": body_pct,
+            "body_pct":  body_pct,
             "direction": "YESIL (yukselen)" if row["close"] > row["open"] else "KIRMIZI (dusen)",
-            "close": row["close"],
-            "sma100": sma100,
+            "close":     row["close"],
+            "sma100":    sma100,
         }
     return None
 
 
 def scan_once():
-    print(f"\n[{datetime.now(timezone.utc).isoformat()}] Tarama basliyor...")
-    symbols = get_usdt_perpetual_symbols()
-    volumes = get_24h_volumes()
+    print(f"\n[{datetime.now(timezone.utc).isoformat()}] Tarama basliyor...", flush=True)
+    symbols  = get_usdt_perpetual_symbols()
+    volumes  = get_24h_volumes()
     filtered = [s for s in symbols if volumes.get(s, 0) >= MIN_VOLUME_USDT]
-    print(f"{len(filtered)} coin hacim filtresini gecti, taraniyor...")
+    print(f"{len(filtered)} coin hacim filtresini gecti.", flush=True)
 
     bulunan = 0
     for symbol in filtered:
         try:
             sonuc = check_symbol(symbol)
         except Exception as e:
-            print(f"{symbol} hata: {e}")
+            print(f"{symbol} hata: {e}", flush=True)
             continue
 
         if sonuc is None:
             continue
 
-        # Ayni mum icin daha once uyari attiysak tekrar atma
         if son_uyari_zamani.get(symbol) == sonuc["open_time"]:
             continue
         son_uyari_zamani[symbol] = sonuc["open_time"]
 
         bulunan += 1
         mesaj = (
-            f"SMA100 TEMAS + %5 MUM\n\n"
-            f"Sembol: {symbol}\n"
-            f"Yon: {sonuc['direction']}\n"
-            f"Mum Govdesi: %{sonuc['body_pct']:.2f}\n"
-            f"Kapanis: {sonuc['close']}\n"
-            f"SMA100: {sonuc['sma100']:.6f}\n"
-            f"Zaman dilimi: {TIMEFRAME}"
+            f"SMA{SMA_LEN} TEMAS + %{BODY_PCT} MUM\n\n"
+            f"Sembol   : {sonuc['symbol']}\n"
+            f"Yon      : {sonuc['direction']}\n"
+            f"Govde    : %{sonuc['body_pct']:.2f}\n"
+            f"Kapanis  : {sonuc['close']}\n"
+            f"SMA{SMA_LEN}  : {sonuc['sma100']:.6f}\n"
+            f"Timeframe: {TIMEFRAME}"
         )
-        print(mesaj)
+        print(mesaj, flush=True)
         send_telegram(mesaj)
-
         time.sleep(0.1)
 
-    print(f"Tarama bitti. {bulunan} yeni sinyal bulundu.")
+    print(f"Tarama bitti. {bulunan} yeni sinyal bulundu.", flush=True)
 
 
 def main():
-    print("SMA100 Temas + %5 Mum Boyu tarama botu baslatildi.")
+    print(f"Bot baslatildi | BODY_PCT=%{BODY_PCT} | SMA={SMA_LEN} | TF={TIMEFRAME} | MIN_VOL={MIN_VOLUME_USDT:,.0f}", flush=True)
     while True:
         try:
             scan_once()
         except Exception as e:
-            print(f"Genel tarama hatasi: {e}")
+            print(f"Genel hata: {e}", flush=True)
         time.sleep(SCAN_INTERVAL_SEC)
 
 
