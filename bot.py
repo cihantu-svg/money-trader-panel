@@ -20,6 +20,7 @@ Sadece TUM katmanlar ayni anda tutarsa sinyal uretilir (AND mantigi).
 Render.com'da background worker olarak calisir, her 5 dakikada bir tarar.
 """
 
+import os
 import time
 import requests
 from datetime import datetime, timezone
@@ -50,8 +51,8 @@ MIN_24H_VOLUME_USDT = 3_000_000
 COOLDOWN_HOURS = 4
 SCAN_INTERVAL_SECONDS = 300  # 5 dakikada bir tara
 
-TELEGRAM_BOT_TOKEN = "BURAYA_TELEGRAM_BOT_TOKEN"
-TELEGRAM_CHAT_ID = "BURAYA_CHAT_ID"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 last_signal_time = {}
 
@@ -274,6 +275,9 @@ def run_scan_cycle():
 
 
 def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[HATA] TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID ortam degiskeni bos/tanimli degil. Render'da Environment sekmesinden kontrol et.")
+        return
     send_telegram_message("✅ Kirilim + Volume Delta Teyit Scanner baslatildi.")
     while True:
         run_scan_cycle()
