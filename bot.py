@@ -48,6 +48,7 @@ DELTA_LOOKBACK = 20
 DELTA_SPIKE_MULTIPLIER = 5.0
 
 MIN_24H_VOLUME_USDT = 3_000_000
+MIN_CANDLE_VOLUME_USDT = 3_000_000  # sinyal mumunun kendi hacmi min bu kadar olmali
 COOLDOWN_HOURS = 4
 SCAN_INTERVAL_SECONDS = 300  # 5 dakikada bir tara
 
@@ -183,6 +184,11 @@ def analyze_symbol(symbol: str):
     current_close = closes[-1]
     prev_close = closes[-2]
     current_volume = volumes[-1]
+    current_quote_volume = float(current_kline[7])  # o mumun USDT cinsinden gercek hacmi
+
+    # ---- 0) MUM BAZINDA MIN. HACIM FILTRESI ----
+    if current_quote_volume < MIN_CANDLE_VOLUME_USDT:
+        return
 
     # ---- 1) KIRILIM SEVIYELERI (mevcut mum haric, onceki BREAKOUT_LOOKBACK mum) ----
     resistance_level = max(highs[-(BREAKOUT_LOOKBACK + 1):-1])
@@ -243,6 +249,7 @@ def analyze_symbol(symbol: str):
         f"<b>Coin:</b> {symbol}\n"
         f"<b>Yon:</b> {direction}\n"
         f"<b>Fiyat:</b> {current_close}\n"
+        f"<b>Mum Hacmi:</b> {current_quote_volume:,.0f} USDT\n"
         f"<b>RSI:</b> {rsi_value:.1f}\n"
         f"<b>MACD Hist:</b> {hist:.6f}\n"
         f"<b>Hacim / Ortalama:</b> {current_volume / vol_sma20:.2f}x\n"
