@@ -2,6 +2,7 @@ import requests
 import pandas as pd
 import time
 import os
+import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -11,22 +12,27 @@ BODY_PCT          = float(os.environ.get("BODY_PCT", 5.0))
 MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
 TIMEFRAME         = os.environ.get("TIMEFRAME", "15m")
 
-# RENDER KOTA KORUMASI: 15 dakikada bir çalışacak şekilde sabitlendi (900 sn)
-SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 900)) 
-CANDLES_TO_CHECK  = 3  # Güvenlik için son 3 kapanmış mum
-MAX_WORKERS       = 15 # Render CPU dostu thread sayısı
+# RENDER KOTA KORUMASI: 15 dakikada bir calisacak sekilde sabitlendi (900 sn)
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 900))
+CANDLES_TO_CHECK  = 3  # Guvenlik icin son 3 kapanmis mum
+MAX_WORKERS       = 15  # Render CPU dostu thread sayisi
 
 BINANCE_FAPI      = "https://fapi.binance.com"
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
-# RENDER KOTA KORUMASI: Minimum veri çekmek için limit 105 yapıldı
-KLINES_LIMIT      = SMA_LEN + 5
+# SMA_LEN + 10: kline agirligi (limit<100 -> 1, 100-500 -> 2) zaten sabit,
+# +5 yerine +10 kullanmanin ekstra maliyeti yok ama guvenlik payi daha genis
+KLINES_LIMIT      = SMA_LEN + 10
 
-# Global HTTP Session (Paket başlıklarını küçülterek veri tasarrufu sağlar)
+# Global HTTP Session (Paket basliklarini kucultup baglanti yeniden kullanir)
 http_session = requests.Session()
 
 gonderilen_uyarilar = {}
+
+# Rate limit'e carpinca butun thread'leri bir sure yavaslatmak icin ortak bayrak
+rate_limit_lock = threading.Lock()
+rate_limited_until = 0.0  # bu unix zamanina kadar yeni istek atmadan once bekle
 
 
 def send_telegram(text):
@@ -39,22 +45,58 @@ def send_telegram(text):
             timeout=10,
         )
     except Exception as e:
-        print(f"Telegram hatası: {e}", flush=True)
+        print(f"Telegram hatasi: {e}", flush=True)
+
+
+def wait_if_rate_limited():
+    """Baska bir thread rate limit'e carptiysa, bu thread de kisa sure bekler."""
+    global rate_limited_until
+    now = time.time()
+    if now < rate_limited_until:
+        time.sleep(rate_limited_until - now)
 
 
 def check_symbol(symbol):
+    global rate_limited_until
+
+    wait_if_rate_limited()
+
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": TIMEFRAME, "limit": KLINES_LIMIT}
     try:
         r = http_session.get(url, params=params, timeout=10)
+    except Exception as e:
+        print(f"[{symbol}] Istek hatasi: {e}", flush=True)
+        return []
+
+    if r.status_code in (429, 418):
+        # 429 = rate limit asildi, 418 = IP gecici olarak ban'landi.
+        # Ban'a girmemek icin butun thread'leri ortak bir bekleme suresine sokuyoruz.
+        retry_after = r.headers.get("Retry-After")
+        bekleme = float(retry_after) if retry_after else (30 if r.status_code == 429 else 120)
+
+        with rate_limit_lock:
+            yeni_bitis = time.time() + bekleme
+            if yeni_bitis > rate_limited_until:
+                rate_limited_until = yeni_bitis
+
+        print(
+            f"[RATE LIMIT] {symbol} - HTTP {r.status_code} - {bekleme:.0f}sn bekleniyor "
+            f"(Retry-After header: {retry_after})",
+            flush=True,
+        )
+        return []
+
+    try:
         data = r.json()
-    except Exception:
+    except Exception as e:
+        print(f"[{symbol}] JSON parse hatasi: {e}", flush=True)
         return []
 
     if not isinstance(data, list) or len(data) < SMA_LEN + CANDLES_TO_CHECK + 1:
         return []
 
-    # Canlı (kapanmamış) mumu çıkartıyoruz, sadece kapanmış mumlar kalıyor
+    # Canli (kapanmamis) mumu cikartiyoruz, sadece kapanmis mumlar kaliyor
     closed_data = data[:-1]
 
     df = pd.DataFrame(closed_data, columns=[
@@ -62,7 +104,7 @@ def check_symbol(symbol):
         "close_time", "quote_volume", "trades",
         "taker_buy_base", "taker_buy_quote", "ignore"
     ])
-    
+
     for col in ["open", "high", "low", "close"]:
         df[col] = df[col].astype(float)
 
@@ -93,21 +135,23 @@ def check_symbol(symbol):
 
 def scan_once():
     print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Tarama başladı...", flush=True)
-    
+
     try:
         r = http_session.get(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", timeout=10)
         filtered = [
-            d["symbol"] for d in r.json() 
+            d["symbol"] for d in r.json()
             if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME_USDT
         ]
     except Exception as e:
-        print(f"Ticker hatası: {e}")
+        print(f"Ticker hatası: {e}", flush=True)
         return
 
     bulunan = 0
+    rate_limit_sayisi = 0
+
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_symbol = {executor.submit(check_symbol, sym): sym for sym in filtered}
-        
+
         for future in as_completed(future_to_symbol):
             symbol = future_to_symbol[future]
             try:
@@ -123,7 +167,7 @@ def scan_once():
 
                     gonderilenler.add(sonuc["open_time"])
                     bulunan += 1
-                    
+
                     mesaj = (
                         f"🎯 **SMA{SMA_LEN} TEMAS + %{BODY_PCT} MUM**\n\n"
                         f"• **Sembol**: {sonuc['symbol']}\n"
@@ -136,9 +180,16 @@ def scan_once():
                     print(f"[SİNYAL] {sonuc['symbol']} - %{sonuc['body_pct']:.2f}", flush=True)
                     send_telegram(mesaj)
             except Exception as e:
-                print(f"{symbol} hatası: {e}")
+                print(f"{symbol} hatası: {e}", flush=True)
 
-    print(f"Tarama bitti. {bulunan} yeni sinyal bulundu.", flush=True)
+    if time.time() < rate_limited_until:
+        rate_limit_sayisi = 1  # bu tur en az bir kez rate limit'e carpmis
+
+    print(
+        f"Tarama bitti. {bulunan} yeni sinyal bulundu."
+        + (" [UYARI: bu turda rate limit'e carpildi]" if rate_limit_sayisi else ""),
+        flush=True,
+    )
 
 
 def main():
