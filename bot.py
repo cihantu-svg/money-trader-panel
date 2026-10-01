@@ -137,7 +137,7 @@ def is_on_cooldown(symbol: str) -> bool:
 # ============ AŞAMA 1: 15M TETİKLENME KONTROLÜ ============
 def check_15m_trigger(symbol: str):
     if symbol in watchlist:
-        return  # Zaten takip listesindeyse tekrar bakma
+        return
 
     try:
         klines = get_klines(symbol, TRIGGER_TIMEFRAME, limit=3)
@@ -147,7 +147,6 @@ def check_15m_trigger(symbol: str):
     if len(klines) < 2:
         return
 
-    # Kapanmış son muma bakılır (klines[-2])
     last_closed = klines[-2]
     open_price = float(last_closed[1])
     close_price = float(last_closed[4])
@@ -158,21 +157,20 @@ def check_15m_trigger(symbol: str):
     change_pct = ((close_price - open_price) / open_price) * 100
 
     if abs(change_pct) >= TRIGGER_CHANGE_PCT:
-        direction = "YÜKSELİŞ (LONG)" if change_pct > 0 else "DÜŞÜŞ (SHORT)"
+        direction = "LONG" if change_pct > 0 else "SHORT"
         watchlist[symbol] = {
             "remaining_bars": WATCHLIST_BAR_LIMIT,
             "trigger_dir": direction,
             "trigger_time": datetime.now(timezone.utc).strftime('%H:%M:%S')
         }
-        print(f"🔥 [TETİKLENDİ] {symbol} 15m'de %{change_pct:.2f} hareket yaptı! Takip listesine eklendi ({WATCHLIST_BAR_LIMIT} bar).")
+        print(f" 🔥 [TETİKLENDİ] {symbol} (15m %{change_pct:.1f}) -> Takip Listesine Alındı!")
 
 
 # ============ AŞAMA 2: 1M KIRILIM ANALİZİ ============
 def analyze_1m_breakout(symbol: str):
     try:
         klines = get_klines(symbol, BREAKOUT_TIMEFRAME, limit=100)
-    except Exception as e:
-        print(f"[{symbol}] 1m Kline çekme hatası: {e}")
+    except Exception:
         return
 
     min_req = max(MACD_SLOW + MACD_SIGNAL, BREAKOUT_LOOKBACK + 1, DELTA_LOOKBACK + 1) + 5
@@ -193,7 +191,6 @@ def analyze_1m_breakout(symbol: str):
     if current_quote_volume < MIN_CANDLE_VOLUME_USDT:
         return
 
-    # 1) Kırılım Seviyeleri
     resistance_level = max(highs[-(BREAKOUT_LOOKBACK + 1):-1])
     support_level = min(lows[-(BREAKOUT_LOOKBACK + 1):-1])
 
@@ -209,18 +206,15 @@ def analyze_1m_breakout(symbol: str):
     if not (breakout_up or breakout_down):
         return
 
-    # 2) Hacim Onayı
     vol_sma20 = sum(volumes[-21:-1]) / 20
     volume_confirmed = current_volume > vol_sma20 * VOLUME_MULTIPLIER
 
-    # 3) Momentum Onayı
     rsi_value = calculate_rsi(closes, RSI_LENGTH)
     macd_line, signal_line, hist = calculate_macd(closes)
 
     mom_bullish = rsi_value > RSI_BULL_MIN and hist > 0 and macd_line > signal_line
     mom_bearish = rsi_value < RSI_BEAR_MAX and hist < 0 and macd_line < signal_line
 
-    # 4) Delta Teyidi
     previous_deltas = [abs(calculate_delta(k)) for k in klines[-(DELTA_LOOKBACK + 1):-1]]
     avg_abs_delta = sum(previous_deltas) / len(previous_deltas) if len(previous_deltas) > 0 else 1
     current_delta = calculate_delta(current_kline)
@@ -259,31 +253,38 @@ def analyze_1m_breakout(symbol: str):
         f"<b>Saat (UTC):</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}"
     )
 
-    print(message.replace("<b>", "").replace("</b>", ""))
+    print(f"🚀 [SİNYAL BİLDİRİMİ SÜRÜLDÜ] {symbol} - {direction}")
     send_telegram_message(message)
 
     last_signal_time[symbol] = time.time()
-    # Sinyal verildikten sonra takipten çıkarılır
     if symbol in watchlist:
         del watchlist[symbol]
 
 
 # ============ ANA DÖNGÜ ============
 def run_scan_cycle():
+    now_str = datetime.now(timezone.utc).strftime('%H:%M:%S')
+    
     try:
         symbols = get_usdt_perpetual_symbols()
     except Exception as e:
-        print(f"Sembol listesi çekme hatası: {e}")
+        print(f"[{now_str}] ❌ Sembol listesi çekme hatası: {e}")
         return
+
+    print(f"[{now_str}] 🔍 {len(symbols)} coin taranıyor (15m %{TRIGGER_CHANGE_PCT} hareketi aranıyor)...")
 
     # 1. AŞAMA: 15m %10 Hareket Yapanları Bul
     for symbol in symbols:
         check_15m_trigger(symbol)
-        time.sleep(0.05)
+        time.sleep(0.03)
 
     # 2. AŞAMA: Takip Listesindeki Coin'lerin 1m Kırılımını Tara
     active_coins = list(watchlist.keys())
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Takip Listesindeki Aktif Coin Sayısı: {len(active_coins)}")
+    
+    if len(active_coins) > 0:
+        print(f"[{now_str}] 📋 Takip Listesi ({len(active_coins)} Coin): {', '.join([f'{c}({watchlist[c][\"remaining_bars\"]}b)' for c in active_coins])}")
+    else:
+        print(f"[{now_str}] 💤 Takip listesinde coin yok.")
 
     for symbol in active_coins:
         analyze_1m_breakout(symbol)
@@ -292,9 +293,9 @@ def run_scan_cycle():
         if symbol in watchlist:
             watchlist[symbol]["remaining_bars"] -= 1
             if watchlist[symbol]["remaining_bars"] <= 0:
-                print(f"⏳ [ZAMAN AŞIMI] {symbol} için 100 bar boyunca kırılım gelmedi. Listeden çıkarıldı.")
+                print(f"⌛ [SÜRE DOLDU] {symbol} 100 bar boyunca kırılım yapmadı. Takipten çıkarıldı.")
                 del watchlist[symbol]
-        time.sleep(0.1)
+        time.sleep(0.05)
 
 
 def main():
@@ -302,6 +303,7 @@ def main():
         print("[HATA] TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID eksik!")
         return
 
+    print("🤖 Bot Başlatıldı...")
     send_telegram_message("✅ <b>2 Aşamalı (15m Trigger + 1m Breakout) Scanner Başlatıldı.</b>")
 
     while True:
