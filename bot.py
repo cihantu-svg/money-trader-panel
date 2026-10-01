@@ -282,7 +282,12 @@ def run_scan_cycle():
     active_coins = list(watchlist.keys())
     
     if len(active_coins) > 0:
-        print(f"[{now_str}] 📋 Takip Listesi ({len(active_coins)} Coin): {', '.join([f'{c}({watchlist[c][\"remaining_bars\"]}b)' for c in active_coins])}")
+        summary_list = []
+        for c in active_coins:
+            bars = watchlist[c]["remaining_bars"]
+            summary_list.append(f"{c}({bars}b)")
+        watchlist_summary = ", ".join(summary_list)
+        print(f"[{now_str}] 📋 Takip Listesi ({len(active_coins)} Coin): {watchlist_summary}")
     else:
         print(f"[{now_str}] 💤 Takip listesinde coin yok.")
 
