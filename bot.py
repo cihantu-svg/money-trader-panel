@@ -8,12 +8,12 @@ import requests
 
 # ─────────────── AYARLAR (ENV'DEN OKUNUR) ───────────────
 TIMEFRAME = os.environ.get("TIMEFRAME", "15m")
-SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))  # Kaç sn'de bir taranacak
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
 MAX_WORKERS = 15
 
-# Hacim ve Çarpan Sınırları (ENV)
-MIN_MUM_VOLUME_USDT = float(os.environ.get("MIN_MUM_VOLUME_USDT", 5_000_000))  # Varsayılan 5M$
-VOLUME_MULTIPLIER = float(os.environ.get("VOLUME_MULTIPLIER", 10.0))          # Varsayılan 10x
+# Hacim ve Çarpan Sınırları
+MIN_MUM_VOLUME_USDT = float(os.environ.get("MIN_MUM_VOLUME_USDT", 5_000_000))
+VOLUME_MULTIPLIER = float(os.environ.get("VOLUME_MULTIPLIER", 10.0))
 
 BINANCE_FAPI = "https://fapi.binance.com"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
@@ -103,7 +103,7 @@ def check_symbol_whale(symbol):
 
     # 2. ŞART: Hacim ortalamanın ENV'de belirtilen katına (örn: 10x) ulaştı mı?
     if multiplier >= VOLUME_MULTIPLIER:
-        # Delta Hesabı (Taker Buy Quote - Taker Sell Quote)
+        # Net Delta Hesabı (Taker Buy Quote - Taker Sell Quote)
         taker_buy_quote = last_candle["taker_buy_quote"]
         taker_sell_quote = last_volume - taker_buy_quote
         net_delta = taker_buy_quote - taker_sell_quote
