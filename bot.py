@@ -11,9 +11,10 @@ TIMEFRAME = os.environ.get("TIMEFRAME", "15m")
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
 MAX_WORKERS = 15
 
-# Hacim ve Çarpan Sınırları
+# Hacim, Çarpan ve Mum Boyu Sınırları
 MIN_MUM_VOLUME_USDT = float(os.environ.get("MIN_MUM_VOLUME_USDT", 5_000_000))
 VOLUME_MULTIPLIER = float(os.environ.get("VOLUME_MULTIPLIER", 10.0))
+MIN_CANDLE_CHANGE_PCT = float(os.environ.get("MIN_CANDLE_CHANGE_PCT", 5.0))  # Min %5 mum boyu
 
 BINANCE_FAPI = "https://fapi.binance.com"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
@@ -50,7 +51,6 @@ def check_symbol_whale(symbol):
     wait_if_rate_limited()
 
     url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    # Son 20 mum ortalaması + 1 canlı mum için 22 mum çekiyoruz
     params = {"symbol": symbol, "interval": TIMEFRAME, "limit": 22}
     
     try:
@@ -74,7 +74,6 @@ def check_symbol_whale(symbol):
     if not isinstance(data, list) or len(data) < 21:
         return []
 
-    # Canlı (kapanmamış) mumu çıkarıp sadece kapanmış son mumları alıyoruz
     closed_data = data[:-1]
 
     df = pd.DataFrame(closed_data, columns=[
@@ -83,15 +82,20 @@ def check_symbol_whale(symbol):
         "taker_buy_base", "taker_buy_quote", "ignore"
     ])
 
-    for col in ["quote_volume", "taker_buy_quote", "close", "open"]:
+    for col in ["quote_volume", "taker_buy_quote", "close", "open", "high", "low"]:
         df[col] = df[col].astype(float)
 
-    # Son kapanan mum
     last_candle = df.iloc[-1]
     last_volume = last_candle["quote_volume"]
 
-    # 1. ŞART: Mum hacmi ENV'deki sınırı (örn: 5M$) geçiyor mu?
+    # 1. ŞART: Minimum mum hacmi ($5M)
     if last_volume < MIN_MUM_VOLUME_USDT:
+        return []
+
+    # 2. ŞART: Mumun Fiyat Değişim Yüzdesi (En az %5 olmalı)
+    # Mum boyu (Yüksek/Düşük farkı veya Açılış/Kapanış farkına bakılabilir; burada Açılış/Kapanış değişimi alındı)
+    candle_change_pct = abs(last_candle["close"] - last_candle["open"]) / last_candle["open"] * 100
+    if candle_change_pct < MIN_CANDLE_CHANGE_PCT:
         return []
 
     # Önceki 20 mumun ortalama hacmi
@@ -101,9 +105,8 @@ def check_symbol_whale(symbol):
 
     multiplier = last_volume / prev_20_avg_volume
 
-    # 2. ŞART: Hacim ortalamanın ENV'de belirtilen katına (örn: 10x) ulaştı mı?
+    # 3. ŞART: Hacim ortalamanın katı (10x)
     if multiplier >= VOLUME_MULTIPLIER:
-        # Net Delta Hesabı (Taker Buy Quote - Taker Sell Quote)
         taker_buy_quote = last_candle["taker_buy_quote"]
         taker_sell_quote = last_volume - taker_buy_quote
         net_delta = taker_buy_quote - taker_sell_quote
@@ -117,6 +120,7 @@ def check_symbol_whale(symbol):
             "multiplier": multiplier,
             "net_delta": net_delta,
             "delta_direction": delta_direction,
+            "candle_change_pct": candle_change_pct,
             "close": last_candle["close"],
         }]
 
@@ -157,13 +161,14 @@ def scan_whales():
                         f"🐋 **WHALE TRACKER: HACİM & DELTA PATLAMASI**\n\n"
                         f"• **Sembol**: `{sonuc['symbol']}`\n"
                         f"• **Baskı Yönü**: {sonuc['delta_direction']}\n"
+                        f"• **Mum Boyu**: `%{sonuc['candle_change_pct']:.2f}`\n"
                         f"• **Mum Hacmi**: `${sonuc['volume_usdt']/1_000_000:.2f}M USDT`\n"
                         f"• **Hacim Artışı**: `{sonuc['multiplier']:.1f}x` (Son 20 mum ort.)\n"
                         f"• **Net Delta**: `${sonuc['net_delta']/1_000_000:.2f}M USDT`\n"
                         f"• **Kapanış**: `{sonuc['close']}`\n"
                         f"• **Zaman Dilimi**: `{TIMEFRAME}`"
                     )
-                    print(f"[WHALE DETECTED] {sonuc['symbol']} - {sonuc['multiplier']:.1f}x Hacim", flush=True)
+                    print(f"[WHALE DETECTED] {sonuc['symbol']} - %{sonuc['candle_change_pct']:.1f} Hareket", flush=True)
                     send_telegram(mesaj)
             except Exception as e:
                 print(f"{symbol} hatası: {e}", flush=True)
@@ -176,6 +181,7 @@ def main():
         f"Whale Tracker Başlatıldı | TF={TIMEFRAME} | "
         f"MinVol={MIN_MUM_VOLUME_USDT/1_000_000:.1f}M$ | "
         f"MinX={VOLUME_MULTIPLIER}x | "
+        f"MinMum=%{MIN_CANDLE_CHANGE_PCT} | "
         f"Aralık={SCAN_INTERVAL_SEC}sn",
         flush=True,
     )
