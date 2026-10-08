@@ -11,11 +11,10 @@ import requests
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")                  # Tarama zaman dilimi
 ADX_PERIOD = int(os.getenv("ADX_PERIOD", 14))              # ADX / DI Periyodu
 EMA_PERIOD = int(os.getenv("EMA_PERIOD", 100))             # EMA Periyodu
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 5.0))    # Min Mum Gövde Boyu (%)
-ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 20.0))    # Min ADX trend gücü
+MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 1.0))    # Min Mum Gövde Boyu (%) -> Gerçekçi %1.0 seviyesine çekildi
+ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 15.0))    # Min ADX trend gücü -> 15'e esnetildi
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme (Sn)
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Thread sayısı
-DEBUG_LOG = True                                           # Detaylı Elenme Loglarını Göster
 
 # Telegram Ayarları
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -119,30 +118,17 @@ def analyze_symbol(symbol: str):
         candle_body_pct = (abs(close_p - open_p) / open_p) * 100.0
         adx_val = curr['adx']
 
+        # Kesişim kontrolleri
         is_di_bull_cross = (prev['plus_di'] <= prev['minus_di']) and (curr['plus_di'] > curr['minus_di'])
         is_di_bear_cross = (prev['minus_di'] <= prev['plus_di']) and (curr['minus_di'] > curr['plus_di'])
 
         ema_val = curr['ema100']
-        prev_close = prev['close']
-        prev_ema = prev['ema100']
 
-        is_long = is_di_bull_cross and ((prev_close <= prev_ema and close_p > ema_val) or (close_p > ema_val)) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
-        is_short = is_di_bear_cross and ((prev_close >= prev_ema and close_p < ema_val) or (close_p < ema_val)) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
-
-        # DEBUG: Eğer Kesişim varsa ama diğer şartlardan elendiyse sebebini konsola bas
-        if (is_di_bull_cross or is_di_bear_cross) and DEBUG_LOG:
-            fail_reasons = []
-            if candle_body_pct < MIN_CANDLE_PCT:
-                fail_reasons.append(f"Mum Gövdesi Yetersiz (%{candle_body_pct:.2f} < %{MIN_CANDLE_PCT})")
-            if adx_val < ADX_THRESHOLD:
-                fail_reasons.append(f"ADX Zayıf ({adx_val:.1f} < {ADX_THRESHOLD})")
-            if is_di_bull_cross and close_p <= ema_val:
-                fail_reasons.append(f"EMA 100 Altında Kalındı (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
-            if is_di_bear_cross and close_p >= ema_val:
-                fail_reasons.append(f"EMA 100 Üstünde Kalındı (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
-            
-            if fail_reasons:
-                print(f"⚠️ [{symbol}] DI Kesişimi Yakalandı Ama Elendi -> " + " | ".join(fail_reasons))
+        # LONG Koşulu: +DI -DI'yi kesti + Mum >= %1.0 + ADX >= 15 + Fiyat EMA100 Üstünde
+        is_long = is_di_bull_cross and (close_p >= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
+        
+        # SHORT Koşulu: -DI +DI'yi kesti + Mum >= %1.0 + ADX >= 15 + Fiyat EMA100 Altında
+        is_short = is_di_bear_cross and (close_p <= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
 
         if not (is_long or is_short):
             return None
@@ -161,7 +147,7 @@ def analyze_symbol(symbol: str):
             "direction": direction
         }
 
-    except Exception as e:
+    except Exception:
         return None
 
 
@@ -205,7 +191,7 @@ def run_scanner():
 
 
 def main():
-    print("🚀 DETAYLI LOGLU A+ SCANNER BAŞLATILDI")
+    print("🚀 OPTİMİZE EDİLMİŞ A+ SCANNER BAŞLATILDI")
     while True:
         try:
             run_scanner()
