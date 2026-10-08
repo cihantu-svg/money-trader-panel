@@ -13,7 +13,7 @@ MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
 TIMEFRAME         = os.environ.get("TIMEFRAME", "15m")
 
 # RENDER KOTA KORUMASI: 15 dakikada bir calisacak sekilde sabitlendi (900 sn)
-SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 900))
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
 CANDLES_TO_CHECK  = 3  # Guvenlik icin son 3 kapanmis mum
 MAX_WORKERS       = 15  # Render CPU dostu thread sayisi
 
