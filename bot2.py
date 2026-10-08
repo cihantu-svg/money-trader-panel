@@ -1,10 +1,10 @@
-import requests
-import pandas as pd
-import time
 import os
+import time
 import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import pandas as pd
+import requests
 
 # ─────────────── AYARLAR (ENV'DEN OKUNUR) ───────────────
 SMA_LEN           = int(os.environ.get("SMA_LEN", 100))
@@ -12,27 +12,25 @@ BODY_PCT          = float(os.environ.get("BODY_PCT", 5.0))
 MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
 TIMEFRAME         = os.environ.get("TIMEFRAME", "15m")
 
-# RENDER KOTA KORUMASI: 15 dakikada bir calisacak sekilde sabitlendi (900 sn)
+# RENDER KOTA KORUMASI: Varsayılan 180 sn (3dk) yapıldı
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
-CANDLES_TO_CHECK  = 3  # Guvenlik icin son 3 kapanmis mum
-MAX_WORKERS       = 15  # Render CPU dostu thread sayisi
+CANDLES_TO_CHECK  = 3  # Güvenlik için son 3 kapanmış mum
+MAX_WORKERS        = 15 # Render CPU dostu thread sayısı
 
 BINANCE_FAPI      = "https://fapi.binance.com"
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
-# SMA_LEN + 10: kline agirligi (limit<100 -> 1, 100-500 -> 2) zaten sabit,
-# +5 yerine +10 kullanmanin ekstra maliyeti yok ama guvenlik payi daha genis
 KLINES_LIMIT      = SMA_LEN + 10
 
-# Global HTTP Session (Paket basliklarini kucultup baglanti yeniden kullanir)
+# Global HTTP Session
 http_session = requests.Session()
 
 gonderilen_uyarilar = {}
 
-# Rate limit'e carpinca butun thread'leri bir sure yavaslatmak icin ortak bayrak
+# Rate limit kilit mekanizması
 rate_limit_lock = threading.Lock()
-rate_limited_until = 0.0  # bu unix zamanina kadar yeni istek atmadan once bekle
+rate_limited_until = 0.0
 
 
 def send_telegram(text):
@@ -49,7 +47,6 @@ def send_telegram(text):
 
 
 def wait_if_rate_limited():
-    """Baska bir thread rate limit'e carptiysa, bu thread de kisa sure bekler."""
     global rate_limited_until
     now = time.time()
     if now < rate_limited_until:
@@ -70,8 +67,6 @@ def check_symbol(symbol):
         return []
 
     if r.status_code in (429, 418):
-        # 429 = rate limit asildi, 418 = IP gecici olarak ban'landi.
-        # Ban'a girmemek icin butun thread'leri ortak bir bekleme suresine sokuyoruz.
         retry_after = r.headers.get("Retry-After")
         bekleme = float(retry_after) if retry_after else (30 if r.status_code == 429 else 120)
 
@@ -96,7 +91,6 @@ def check_symbol(symbol):
     if not isinstance(data, list) or len(data) < SMA_LEN + CANDLES_TO_CHECK + 1:
         return []
 
-    # Canli (kapanmamis) mumu cikartiyoruz, sadece kapanmis mumlar kaliyor
     closed_data = data[:-1]
 
     df = pd.DataFrame(closed_data, columns=[
@@ -113,13 +107,27 @@ def check_symbol(symbol):
     sonuclar = []
     for i in range(1, 1 + CANDLES_TO_CHECK):
         row = df.iloc[-i]
+        prev_row = df.iloc[-i - 1]  # Bir önceki mum (Kırılım kontrolü için)
+        
         sma100 = row["sma100"]
+        prev_sma100 = prev_row["sma100"]
 
-        if pd.isna(sma100):
+        if pd.isna(sma100) or pd.isna(prev_sma100):
             continue
 
         body_pct = abs(row["close"] - row["open"]) / row["open"] * 100
-        touches_sma = row["low"] <= sma100 <= row["high"]
+        
+        # 1. Birebir Dokunma
+        direct_touch = (row["low"] <= sma100 <= row["high"])
+        
+        # 2. Milimetrik Yakınlık (%0.3 tolerans - Dibinden sıçramalar için)
+        near_touch = abs(row["low"] - sma100) / sma100 <= 0.003 or abs(row["high"] - sma100) / sma100 <= 0.003
+        
+        # 3. Net Kırılım (Önceki mum SMA100 altındaydı, bu mum üstüne sıçradı)
+        bullish_break = (prev_row["close"] < prev_sma100) and (row["close"] > sma100)
+        bearish_break = (prev_row["close"] > prev_sma100) and (row["close"] < sma100)
+
+        touches_sma = direct_touch or near_touch or bullish_break or bearish_break
 
         if body_pct >= BODY_PCT and touches_sma:
             sonuclar.append({
@@ -169,7 +177,7 @@ def scan_once():
                     bulunan += 1
 
                     mesaj = (
-                        f"🎯 **SMA{SMA_LEN} TEMAS + %{BODY_PCT} MUM**\n\n"
+                        f"🎯 **SMA{SMA_LEN} TEMAS/KIRILIM + %{BODY_PCT} MUM**\n\n"
                         f"• **Sembol**: {sonuc['symbol']}\n"
                         f"• **Yön**: {sonuc['direction']}\n"
                         f"• **Gövde Boyu**: %{sonuc['body_pct']:.2f}\n"
@@ -183,7 +191,7 @@ def scan_once():
                 print(f"{symbol} hatası: {e}", flush=True)
 
     if time.time() < rate_limited_until:
-        rate_limit_sayisi = 1  # bu tur en az bir kez rate limit'e carpmis
+        rate_limit_sayisi = 1
 
     print(
         f"Tarama bitti. {bulunan} yeni sinyal bulundu."
