@@ -6,17 +6,18 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# YAPILANDIRMA VE EŞİK DEĞERLERİ
+# YAPILANDIRMA VE EŞİK DEĞERLERİ (ENV Üzerinden Değiştirilebilir)
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")                  # Tarama zaman dilimi
 ADX_PERIOD = int(os.getenv("ADX_PERIOD", 14))              # ADX / DI Periyodu
-EMA_PERIOD = int(os.getenv("EMA_PERIOD", 100))             # EMA Periyodu
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 1.0))    # Min Mum Gövde Boyu (%) -> Gerçekçi %1.0 seviyesine çekildi
-ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 15.0))    # Min ADX trend gücü -> 15'e esnetildi
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme (Sn)
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Thread sayısı
+EMA_PERIOD = int(os.getenv("EMA_PERIOD", 100))             # EMA Periyodu (EMA 100)
+MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 5.0))    # Min Mum Gövde Boyu (%)
+ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 20.0))    # Min ADX trend gücü
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme süresi (Saniye)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Eşzamanlı istek sayısı (Thread)
+DEBUG_LOG = os.getenv("DEBUG_LOG", "true").lower() == "true" # Elenme loglarını göster/gizle
 
-# Telegram Ayarları
+# Telegram Ayarları (İsteğe bağlı)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -118,17 +119,32 @@ def analyze_symbol(symbol: str):
         candle_body_pct = (abs(close_p - open_p) / open_p) * 100.0
         adx_val = curr['adx']
 
-        # Kesişim kontrolleri
+        # Kesişim Kontrolleri
         is_di_bull_cross = (prev['plus_di'] <= prev['minus_di']) and (curr['plus_di'] > curr['minus_di'])
         is_di_bear_cross = (prev['minus_di'] <= prev['plus_di']) and (curr['minus_di'] > curr['plus_di'])
 
         ema_val = curr['ema100']
 
-        # LONG Koşulu: +DI -DI'yi kesti + Mum >= %1.0 + ADX >= 15 + Fiyat EMA100 Üstünde
+        # LONG & SHORT Koşulları
         is_long = is_di_bull_cross and (close_p >= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
-        
-        # SHORT Koşulu: -DI +DI'yi kesti + Mum >= %1.0 + ADX >= 15 + Fiyat EMA100 Altında
         is_short = is_di_bear_cross and (close_p <= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
+
+        # ----------------------------------------------------------------------
+        # DETAYLI LOG KAYDI (Kesişim Var Ama Elendiyse Sebebini Yazdırır)
+        # ----------------------------------------------------------------------
+        if (is_di_bull_cross or is_di_bear_cross) and DEBUG_LOG and not (is_long or is_short):
+            fail_reasons = []
+            if candle_body_pct < MIN_CANDLE_PCT:
+                fail_reasons.append(f"Mum Gövdesi Yetersiz (%{candle_body_pct:.2f} < %{MIN_CANDLE_PCT})")
+            if adx_val < ADX_THRESHOLD:
+                fail_reasons.append(f"ADX Zayıf ({adx_val:.1f} < {ADX_THRESHOLD})")
+            if is_di_bull_cross and close_p < ema_val:
+                fail_reasons.append(f"Fiyat EMA 100 Altında (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
+            if is_di_bear_cross and close_p > ema_val:
+                fail_reasons.append(f"Fiyat EMA 100 Üstünde (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
+            
+            if fail_reasons:
+                print(f"⚠️ [{symbol}] DI Kesişimi Yakalandı Ama Elendi -> " + " | ".join(fail_reasons))
 
         if not (is_long or is_short):
             return None
@@ -153,7 +169,7 @@ def analyze_symbol(symbol: str):
 
 def run_scanner():
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"\n[{now} UTC] 🔍 A+ Strateji Taraması Başlatıldı...")
+    print(f"\n[{now} UTC] 🔍 A+ Strateji Taraması Başlatıldı (Min Mum: %{MIN_CANDLE_PCT})...")
 
     symbols = get_usdt_symbols()
     if not symbols:
@@ -191,7 +207,8 @@ def run_scanner():
 
 
 def main():
-    print("🚀 OPTİMİZE EDİLMİŞ A+ SCANNER BAŞLATILDI")
+    print("🚀 A+ STRATEJİ SCANNER BOTU BAŞLATILDI")
+    print(f"ENV Ayarları -> Min Mum: %{MIN_CANDLE_PCT} | ADX Eşik: >{ADX_THRESHOLD} | EMA: {EMA_PERIOD} | Debug Log: {DEBUG_LOG}")
     while True:
         try:
             run_scanner()
