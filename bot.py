@@ -6,18 +6,18 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# YAPILANDIRMA VE EŞİK DEĞERLERİ (ENV Üzerinden Değiştirilebilir)
+# YAPILANDIRMA VE EŞİK DEĞERLERİ
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")                  # Tarama zaman dilimi
 ADX_PERIOD = int(os.getenv("ADX_PERIOD", 14))              # ADX / DI Periyodu
 EMA_PERIOD = int(os.getenv("EMA_PERIOD", 100))             # EMA Periyodu (EMA 100)
 MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 5.0))    # Min Mum Gövde Boyu (%)
 ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 20.0))    # Min ADX trend gücü
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme süresi (Saniye)
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Eşzamanlı istek sayısı (Thread)
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme (Saniye)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Thread sayısı
 DEBUG_LOG = os.getenv("DEBUG_LOG", "true").lower() == "true" # Elenme loglarını göster/gizle
 
-# Telegram Ayarları (İsteğe bağlı)
+# Telegram Ayarları
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -41,7 +41,7 @@ def calculate_indicators(df, adx_period=14, ema_period=100):
     # 1. EMA 100 Hesabı
     df['ema100'] = df['close'].ewm(span=ema_period, adjust=False).mean()
 
-    # 2. ADX / DI Hesabı
+    # 2. ADX / DI Hesabı (Wilder's DMI)
     df['up_move'] = df['high'] - df['high'].shift(1)
     df['down_move'] = df['low'].shift(1) - df['low']
     
@@ -100,7 +100,7 @@ def analyze_symbol(symbol: str):
             'taker_buy_quote', 'ignore'
         ])
 
-        # Canlı mumu çıkarıp kapalı mumları analiz et
+        # Canlı mumu çıkarıp tamamlanan son kapalı mumları al
         closed_df = df.iloc[:-1].copy()
         
         closed_df['open'] = closed_df['open'].astype(float)
@@ -111,27 +111,31 @@ def analyze_symbol(symbol: str):
 
         df_ind = calculate_indicators(closed_df, adx_period=ADX_PERIOD, ema_period=EMA_PERIOD)
 
-        curr = df_ind.iloc[-1]
-        prev = df_ind.iloc[-2]
+        curr = df_ind.iloc[-1]  # Son tamamlanan mum
+        prev = df_ind.iloc[-2]  # Bir önceki mum
 
         open_p = curr['open']
         close_p = curr['close']
         candle_body_pct = (abs(close_p - open_p) / open_p) * 100.0
         adx_val = curr['adx']
 
-        # Kesişim Kontrolleri
-        is_di_bull_cross = (prev['plus_di'] <= prev['minus_di']) and (curr['plus_di'] > curr['minus_di'])
-        is_di_bear_cross = (prev['minus_di'] <= prev['plus_di']) and (curr['minus_di'] > curr['plus_di'])
+        curr_pdi, curr_mdi = curr['plus_di'], curr['minus_di']
+        prev_pdi, prev_mdi = prev['plus_di'], prev['minus_di']
+
+        # KESİN KESİŞİM KONTROLÜ (Geçiş Teyidi)
+        # Long Kesişim: Bir önceki mumda +DI <= -DI iken, şu anki mumda +DI > -DI oldu.
+        is_di_bull_cross = (prev_pdi < prev_mdi) and (curr_pdi > curr_mdi)
+        
+        # Short Kesişim: Bir önceki mumda -DI <= +DI iken, şu anki mumda -DI > +DI oldu.
+        is_di_bear_cross = (prev_mdi < prev_pdi) and (curr_mdi > curr_pdi)
 
         ema_val = curr['ema100']
 
-        # LONG & SHORT Koşulları
+        # Koşullar
         is_long = is_di_bull_cross and (close_p >= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
         is_short = is_di_bear_cross and (close_p <= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
 
-        # ----------------------------------------------------------------------
-        # DETAYLI LOG KAYDI (Kesişim Var Ama Elendiyse Sebebini Yazdırır)
-        # ----------------------------------------------------------------------
+        # DEBUG LOG (Sadece Gerçekten Kesişim Yaşanmışsa Elenme Nedenini Gösterir)
         if (is_di_bull_cross or is_di_bear_cross) and DEBUG_LOG and not (is_long or is_short):
             fail_reasons = []
             if candle_body_pct < MIN_CANDLE_PCT:
@@ -139,12 +143,13 @@ def analyze_symbol(symbol: str):
             if adx_val < ADX_THRESHOLD:
                 fail_reasons.append(f"ADX Zayıf ({adx_val:.1f} < {ADX_THRESHOLD})")
             if is_di_bull_cross and close_p < ema_val:
-                fail_reasons.append(f"Fiyat EMA 100 Altında (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
+                fail_reasons.append(f"EMA 100 Altında (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
             if is_di_bear_cross and close_p > ema_val:
-                fail_reasons.append(f"Fiyat EMA 100 Üstünde (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
+                fail_reasons.append(f"EMA 100 Üstünde (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
             
             if fail_reasons:
-                print(f"⚠️ [{symbol}] DI Kesişimi Yakalandı Ama Elendi -> " + " | ".join(fail_reasons))
+                cross_type = "LONG" if is_di_bull_cross else "SHORT"
+                print(f"⚠️ [{symbol}] {cross_type} Kesişimi Oldu (Önceki: +DI:{prev_pdi:.1f}/-DI:{prev_mdi:.1f} -> Son: +DI:{curr_pdi:.1f}/-DI:{curr_mdi:.1f}) Ama Elendi -> " + " | ".join(fail_reasons))
 
         if not (is_long or is_short):
             return None
@@ -157,8 +162,8 @@ def analyze_symbol(symbol: str):
             "ema100": ema_val,
             "candle_body_pct": candle_body_pct,
             "adx": adx_val,
-            "plus_di": curr['plus_di'],
-            "minus_di": curr['minus_di'],
+            "plus_di": curr_pdi,
+            "minus_di": curr_mdi,
             "volume": curr['quote_volume'],
             "direction": direction
         }
@@ -207,8 +212,8 @@ def run_scanner():
 
 
 def main():
-    print("🚀 A+ STRATEJİ SCANNER BOTU BAŞLATILDI")
-    print(f"ENV Ayarları -> Min Mum: %{MIN_CANDLE_PCT} | ADX Eşik: >{ADX_THRESHOLD} | EMA: {EMA_PERIOD} | Debug Log: {DEBUG_LOG}")
+    print("🚀 NET KESİŞİM TEYİTLİ A+ SCANNER BAŞLATILDI")
+    print(f"ENV Ayarları -> Min Mum: %{MIN_CANDLE_PCT} | ADX Eşik: >{ADX_THRESHOLD} | EMA: {EMA_PERIOD}")
     while True:
         try:
             run_scanner()
