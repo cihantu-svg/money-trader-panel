@@ -8,15 +8,16 @@ import requests
 # ==============================================================================
 # YAPILANDIRMA VE EŞİK DEĞERLERİ
 # ==============================================================================
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")                  # Tarama zaman dilimi (5m, 15m, 1h)
-ADX_PERIOD = int(os.getenv("ADX_PERIOD", 14))              # ADX / DI Hesaplama periyodu
-EMA_PERIOD = int(os.getenv("EMA_PERIOD", 100))             # EMA Periyodu (EMA 100)
+TIMEFRAME = os.getenv("TIMEFRAME", "15m")                  # Tarama zaman dilimi
+ADX_PERIOD = int(os.getenv("ADX_PERIOD", 14))              # ADX / DI Periyodu
+EMA_PERIOD = int(os.getenv("EMA_PERIOD", 100))             # EMA Periyodu
 MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 5.0))    # Min Mum Gövde Boyu (%)
 ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 20.0))    # Min ADX trend gücü
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme süresi (Saniye)
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Eşzamanlı istek sayısı
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme (Sn)
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Thread sayısı
+DEBUG_LOG = True                                           # Detaylı Elenme Loglarını Göster
 
-# Telegram Ayarları (İsteğe bağlı)
+# Telegram Ayarları
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -26,13 +27,8 @@ API_BASE = "https://fapi.binance.com"
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
@@ -40,9 +36,6 @@ def send_telegram_alert(message: str):
 
 
 def calculate_indicators(df, adx_period=14, ema_period=100):
-    """
-    EMA 100 ve ADX / DI hesaplar
-    """
     df = df.copy()
     
     # 1. EMA 100 Hesabı
@@ -93,7 +86,7 @@ def analyze_symbol(symbol: str):
         params = {
             "symbol": symbol,
             "interval": TIMEFRAME,
-            "limit": EMA_PERIOD + 30 # EMA 100 ve ADX hesaplamak için yeterli mum
+            "limit": EMA_PERIOD + 30
         }
         res = requests.get(url, params=params, timeout=5)
         klines = res.json()
@@ -107,7 +100,7 @@ def analyze_symbol(symbol: str):
             'taker_buy_quote', 'ignore'
         ])
 
-        # Canlı mumu (tamamlanmamış) çıkarıp sadece kapalı mumları hesapla
+        # Canlı mumu çıkarıp kapalı mumları analiz et
         closed_df = df.iloc[:-1].copy()
         
         closed_df['open'] = closed_df['open'].astype(float)
@@ -116,47 +109,40 @@ def analyze_symbol(symbol: str):
         closed_df['close'] = closed_df['close'].astype(float)
         closed_df['quote_volume'] = closed_df['quote_volume'].astype(float)
 
-        # İndikatörleri hesapla
         df_ind = calculate_indicators(closed_df, adx_period=ADX_PERIOD, ema_period=EMA_PERIOD)
 
         curr = df_ind.iloc[-1]
         prev = df_ind.iloc[-2]
 
-        # ----------------------------------------------------------------------
-        # ŞART 1: Mum Gövde Boyu >= %5
-        # ----------------------------------------------------------------------
         open_p = curr['open']
         close_p = curr['close']
         candle_body_pct = (abs(close_p - open_p) / open_p) * 100.0
-
-        if candle_body_pct < MIN_CANDLE_PCT:
-            return None
-
-        # ----------------------------------------------------------------------
-        # ŞART 2: ADX/DI Kesişimi ve ADX Trend Gücü
-        # ----------------------------------------------------------------------
         adx_val = curr['adx']
-        if adx_val < ADX_THRESHOLD:
-            return None
 
         is_di_bull_cross = (prev['plus_di'] <= prev['minus_di']) and (curr['plus_di'] > curr['minus_di'])
         is_di_bear_cross = (prev['minus_di'] <= prev['plus_di']) and (curr['minus_di'] > curr['plus_di'])
 
-        if not (is_di_bull_cross or is_di_bear_cross):
-            return None
-
-        # ----------------------------------------------------------------------
-        # ŞART 3: EMA 100 Kırılımı veya EMA 100 Tarafında Olma
-        # ----------------------------------------------------------------------
         ema_val = curr['ema100']
         prev_close = prev['close']
         prev_ema = prev['ema100']
 
-        # LONG: +DI -DI'yi kesti, Mum >= %5, Fiyat EMA100'ü yukarı kesti veya üzerinde
-        is_long = is_di_bull_cross and ((prev_close <= prev_ema and close_p > ema_val) or (close_p > ema_val))
+        is_long = is_di_bull_cross and ((prev_close <= prev_ema and close_p > ema_val) or (close_p > ema_val)) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
+        is_short = is_di_bear_cross and ((prev_close >= prev_ema and close_p < ema_val) or (close_p < ema_val)) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
 
-        # SHORT: -DI +DI'yi kesti, Mum >= %5, Fiyat EMA100'ü aşağı kesti veya altında
-        is_short = is_di_bear_cross and ((prev_close >= prev_ema and close_p < ema_val) or (close_p < ema_val))
+        # DEBUG: Eğer Kesişim varsa ama diğer şartlardan elendiyse sebebini konsola bas
+        if (is_di_bull_cross or is_di_bear_cross) and DEBUG_LOG:
+            fail_reasons = []
+            if candle_body_pct < MIN_CANDLE_PCT:
+                fail_reasons.append(f"Mum Gövdesi Yetersiz (%{candle_body_pct:.2f} < %{MIN_CANDLE_PCT})")
+            if adx_val < ADX_THRESHOLD:
+                fail_reasons.append(f"ADX Zayıf ({adx_val:.1f} < {ADX_THRESHOLD})")
+            if is_di_bull_cross and close_p <= ema_val:
+                fail_reasons.append(f"EMA 100 Altında Kalındı (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
+            if is_di_bear_cross and close_p >= ema_val:
+                fail_reasons.append(f"EMA 100 Üstünde Kalındı (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
+            
+            if fail_reasons:
+                print(f"⚠️ [{symbol}] DI Kesişimi Yakalandı Ama Elendi -> " + " | ".join(fail_reasons))
 
         if not (is_long or is_short):
             return None
@@ -175,13 +161,13 @@ def analyze_symbol(symbol: str):
             "direction": direction
         }
 
-    except Exception:
+    except Exception as e:
         return None
 
 
 def run_scanner():
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"\n[{now} UTC] 🔍 A+ Strateji Taraması Başlatıldı (ADX/DI + %5 Mum + EMA100)...")
+    print(f"\n[{now} UTC] 🔍 A+ Strateji Taraması Başlatıldı...")
 
     symbols = get_usdt_symbols()
     if not symbols:
@@ -197,11 +183,11 @@ def run_scanner():
             if result:
                 detected_signals.append(result)
 
-    print(f"[Tamamlandı] Taranan Çift: {len(symbols)} | Tespit Edilen A+ Sinyal: {len(detected_signals)}")
+    print(f"[Tamamlandı] Taranan Çift: {len(symbols)} | Tespit Edilen Sinyal: {len(detected_signals)}")
 
     for s in detected_signals:
         is_long = s['direction'] == 'LONG'
-        badge = "🟢 A+ LONG SİNYALİ (ADX/DI + %5 Mum + EMA100)" if is_long else "🔴 A+ SHORT SİNYALİ (ADX/DI + %5 Mum + EMA100)"
+        badge = "🟢 A+ LONG SİNYALİ" if is_long else "🔴 A+ SHORT SİNYALİ"
         
         log_msg = (
             f"========================================\n"
@@ -212,8 +198,6 @@ def run_scanner():
             f"Mum Gövde Boyu: %{s['candle_body_pct']:.2f}\n"
             f"ADX Gücü: {s['adx']:.1f}\n"
             f"+DI: {s['plus_di']:.1f} | -DI: {s['minus_di']:.1f}\n"
-            f"Mum Hacmi: ${s['volume'] / 1000000:.2f}M\n"
-            f"Zaman: {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}\n"
             f"========================================"
         )
         print(log_msg)
@@ -221,15 +205,12 @@ def run_scanner():
 
 
 def main():
-    print("🚀 A+ PYTHON TARAMA BOTU BAŞLATILDI")
-    print(f"Filtreler: EMA {EMA_PERIOD} | Min Mum: %{MIN_CANDLE_PCT} | ADX > {ADX_THRESHOLD}")
-    
+    print("🚀 DETAYLI LOGLU A+ SCANNER BAŞLATILDI")
     while True:
         try:
             run_scanner()
         except Exception as e:
             print(f"[Sistem Hatası] Tarama hatası: {e}")
-        
         time.sleep(SCAN_INTERVAL)
 
 
