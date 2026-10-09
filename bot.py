@@ -6,12 +6,11 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# YAPILANDIRMA VE EŞİK DEĞERLERİ
+# YAPILANDIRMA VE EŞİK DEĞERLERİ (ATR ve SMA Kaldırıldı)
 # ==============================================================================
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")                    # 5 Dakikalık Zaman Dilimi
-SMA_PERIOD = int(os.getenv("SMA_PERIOD", 100))
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 2.0))     # 5m için %2.0 Gövde Şartı (İsteğe göre 1.5 - 3.0 yapılabilir)
-VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", 3.0)) # 3 Katı Hacim/Delta
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")                    
+MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 2.0))     # Mum Gövde Şartı
+VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", 3.0)) # 3 Katı Hacim Sıçraması
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))         # 180 Saniye (3 Dakika)
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))
 DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
@@ -35,21 +34,9 @@ def send_telegram_alert(message: str):
 
 def calculate_strategy_indicators(df):
     df = df.copy()
-    
-    # 1. SMA 100 Hesabı
-    df['sma100'] = df['close'].rolling(window=SMA_PERIOD).mean()
-
-    # 2. ATR (Average True Range) - Sıkışma Kontrolü (14 Periyot)
-    high_low = df['high'] - df['low']
-    high_close = (df['high'] - df['close'].shift()).abs()
-    low_close = (df['low'] - df['close'].shift()).abs()
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df['atr'] = true_range.rolling(window=14).mean()
-
-    # 3. Delta Hesabı (Taker Buy Base - Taker Sell Base)
+    # Delta Hesabı (Taker Buy Base - Taker Sell Base)
     df['taker_sell_base'] = df['volume'] - df['taker_buy_base']
     df['delta'] = df['taker_buy_base'] - df['taker_sell_base']
-
     return df
 
 
@@ -69,12 +56,12 @@ def analyze_symbol(symbol: str):
         params = {
             "symbol": symbol,
             "interval": TIMEFRAME,
-            "limit": SMA_PERIOD + 40
+            "limit": 40
         }
         res = requests.get(url, params=params, timeout=5)
         klines = res.json()
 
-        if not klines or len(klines) < (SMA_PERIOD + 20):
+        if not klines or len(klines) < 30:
             return None
 
         df = pd.DataFrame(klines, columns=[
@@ -91,16 +78,10 @@ def analyze_symbol(symbol: str):
 
         df_ind = calculate_strategy_indicators(closed_df)
 
-        m1 = df_ind.iloc[-2]  # 1. Mum (Kırılım Mumu)
+        m1 = df_ind.iloc[-2]  # 1. Mum (Kırılım / Hareket Mumu)
         m2 = df_ind.iloc[-1]  # 2. Mum (Teyit Mumu)
         
         avg_volume = df_ind['volume'].iloc[-25:-2].mean()
-        avg_atr = df_ind['atr'].iloc[-25:-2].mean()
-
-        # 1. ADIM: SIKIŞMA KONTROLÜ (ATR)
-        is_consolidated = m1['atr'] <= (avg_atr * 1.5)
-        if not is_consolidated:
-            return None
 
         m1_body_pct = (abs(m1['close'] - m1['open']) / m1['open']) * 100.0
         is_volume_spike = m1['volume'] >= (avg_volume * VOLUME_MULTIPLIER)
@@ -108,32 +89,32 @@ def analyze_symbol(symbol: str):
         if not is_volume_spike or (m1_body_pct < MIN_CANDLE_PCT):
             return None
 
-        # --- YÖN KONTROLÜ (LONG vs SHORT) ---
+        # --- YÖN KONTROLÜ (LONG vs SHORT - SMA Olmadan Saf Kırılım ve Delta) ---
         
-        # LONG ŞARTLARI
-        m1_breaks_sma_up = (m1['open'] < m1['sma100']) and (m1['close'] > m1['sma100'])
-        is_positive_delta = m1['delta'] > 0
+        # LONG ŞARTLARI: Yeşil gövde, pozitif 3x hacim deltası, 2. mumda yukarı kapanış ve kesintisiz pozitif delta
+        m1_green = m1['close'] > m1['open']
+        is_positive_delta_1 = m1['delta'] > 0
         m2_closes_higher = m2['close'] > m1['close']
-        m2_positive_delta = m2['delta'] > 0
+        is_positive_delta_2 = m2['delta'] > 0
 
         is_valid_long = (
-            m1_breaks_sma_up and 
-            is_positive_delta and 
+            m1_green and 
+            is_positive_delta_1 and 
             m2_closes_higher and 
-            m2_positive_delta
+            is_positive_delta_2
         )
 
-        # SHORT ŞARTLARI
-        m1_breaks_sma_down = (m1['open'] > m1['sma100']) and (m1['close'] < m1['sma100'])
-        is_negative_delta = m1['delta'] < 0
+        # SHORT ŞARTLARI: Kırmızı gövde, negatif 3x hacim deltası, 2. mumda aşağı kapanış ve kesintisiz negatif delta
+        m1_red = m1['close'] < m1['open']
+        is_negative_delta_1 = m1['delta'] < 0
         m2_closes_lower = m2['close'] < m1['close']
-        m2_negative_delta = m2['delta'] < 0
+        is_negative_delta_2 = m2['delta'] < 0
 
         is_valid_short = (
-            m1_breaks_sma_down and 
-            is_negative_delta and 
+            m1_red and 
+            is_negative_delta_1 and 
             m2_closes_lower and 
-            m2_negative_delta
+            is_negative_delta_2
         )
 
         if not (is_valid_long or is_valid_short):
@@ -145,7 +126,6 @@ def analyze_symbol(symbol: str):
             "symbol": symbol,
             "direction": direction,
             "price": m2['close'],
-            "sma100": m2['sma100'],
             "m1_body": m1_body_pct,
             "m1_vol_multi": m1['volume'] / avg_volume,
             "m1_delta": m1['delta'],
@@ -158,7 +138,7 @@ def analyze_symbol(symbol: str):
 
 def run_scanner():
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"\n[{now} UTC] 🔍 5m Çift Yönlü Teyitli Kırılım Taraması Başlatıldı...")
+    print(f"\n[{now} UTC] 🔍 Saf Kırılım + Kesintisiz Delta Taraması Başlatıldı...")
 
     symbols = get_usdt_symbols()
     if not symbols:
@@ -178,14 +158,13 @@ def run_scanner():
 
     for s in detected_signals:
         is_long = s['direction'] == 'LONG'
-        badge = "🟢 A+ TEYİTLİ BREAKOUT SİNYALİ (LONG)" if is_long else "🔴 A+ TEYİTLİ BREAKOUT SİNYALİ (SHORT)"
+        badge = "🟢 SAF KIRILIM + DELTA SİNYALİ (LONG)" if is_long else "🔴 SAF KIRILIM + DELTA SİNYALİ (SHORT)"
         
         log_msg = (
             f"========================================\n"
             f"{badge}\n"
             f"Sembol: {s['symbol'].replace('USDT', '')}/USDT\n"
             f"Fiyat (2. Mum Kapanış): ${s['price']}\n"
-            f"SMA 100: ${s['sma100']:.4f}\n"
             f"1. Mum Gövdesi: %{s['m1_body']:.2f}\n"
             f"Hacim Çarpanı: {s['m1_vol_multi']:.1f}x\n"
             f"1. Mum Delta: {s['m1_delta']:,.0f}\n"
@@ -197,7 +176,7 @@ def run_scanner():
 
 
 def main():
-    print("🚀 5M ÇİFT YÖNLÜ TEYİTLİ DELTA BREAKOUT BOTU AKTİF")
+    print("🚀 SAF DELTA BREAKOUT BOTU AKTİF (Filtresiz Mod)")
     print(f"Ayarlar -> Zaman Dilimi: {TIMEFRAME} | Tarama Aralığı: {SCAN_INTERVAL}s | Min Gövde: %{MIN_CANDLE_PCT} | Hacim Katı: {VOLUME_MULTIPLIER}x")
     while True:
         try:
