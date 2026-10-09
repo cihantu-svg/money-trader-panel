@@ -15,7 +15,7 @@ MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 5.0))    # Min Mum Gövde Boy
 ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 20.0))    # Min ADX trend gücü
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme (Saniye)
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Thread sayısı
-DEBUG_LOG = os.getenv("DEBUG_LOG", "true").lower() == "true" # Elenme loglarını göster/gizle
+DEBUG_LOG = False # Elenme loglarını göster/gizle
 
 # Telegram Ayarları
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
