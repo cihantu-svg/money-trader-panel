@@ -6,16 +6,16 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# YAPILANDIRMA VE EŞİK DEĞERLERİ
+# YAPILANDIRMA VE EŞİK DEĞERLERİ (ENV Üzerinden Okunur)
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")                  # Tarama zaman dilimi
 ADX_PERIOD = int(os.getenv("ADX_PERIOD", 14))              # ADX / DI Periyodu
 EMA_PERIOD = int(os.getenv("EMA_PERIOD", 100))             # EMA Periyodu (EMA 100)
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 5.0))    # Min Mum Gövde Boyu (%)
-ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 20.0))    # Min ADX trend gücü
+MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 3.0))    # Min Mum Gövde Boyu (%) -> Önerilen: %3.0 (ENV'den değiştirilebilir)
+ADX_THRESHOLD = float(os.getenv("ADX_THRESHOLD", 15.0))    # Min ADX trend gücü
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))       # Taramalar arası bekleme (Saniye)
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))            # Thread sayısı
-DEBUG_LOG = False # Elenme loglarını göster/gizle
+DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true" # Elenme logları (Default: kapalı)
 
 # Telegram Ayarları
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -100,56 +100,59 @@ def analyze_symbol(symbol: str):
             'taker_buy_quote', 'ignore'
         ])
 
-        # Canlı mumu çıkarıp tamamlanan son kapalı mumları al
+        # Canlı mumu çıkarıp kapalı mumları al
         closed_df = df.iloc[:-1].copy()
         
-        closed_df['open'] = closed_df['open'].astype(float)
-        closed_df['high'] = closed_df['high'].astype(float)
-        closed_df['low'] = closed_df['low'].astype(float)
-        closed_df['close'] = closed_df['close'].astype(float)
-        closed_df['quote_volume'] = closed_df['quote_volume'].astype(float)
+        for col in ['open', 'high', 'low', 'close', 'quote_volume']:
+            closed_df[col] = closed_df[col].astype(float)
 
         df_ind = calculate_indicators(closed_df, adx_period=ADX_PERIOD, ema_period=EMA_PERIOD)
 
-        curr = df_ind.iloc[-1]  # Son tamamlanan mum
-        prev = df_ind.iloc[-2]  # Bir önceki mum
-
+        curr = df_ind.iloc[-1]
+        
         open_p = curr['open']
         close_p = curr['close']
         candle_body_pct = (abs(close_p - open_p) / open_p) * 100.0
         adx_val = curr['adx']
-
-        curr_pdi, curr_mdi = curr['plus_di'], curr['minus_di']
-        prev_pdi, prev_mdi = prev['plus_di'], prev['minus_di']
-
-        # KESİN KESİŞİM KONTROLÜ (Geçiş Teyidi)
-        # Long Kesişim: Bir önceki mumda +DI <= -DI iken, şu anki mumda +DI > -DI oldu.
-        is_di_bull_cross = (prev_pdi < prev_mdi) and (curr_pdi > curr_mdi)
-        
-        # Short Kesişim: Bir önceki mumda -DI <= +DI iken, şu anki mumda -DI > +DI oldu.
-        is_di_bear_cross = (prev_mdi < prev_pdi) and (curr_mdi > curr_pdi)
-
         ema_val = curr['ema100']
 
-        # Koşullar
-        is_long = is_di_bull_cross and (close_p >= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
-        is_short = is_di_bear_cross and (close_p <= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
+        # ----------------------------------------------------------------------
+        # SON 3 MUM İÇERİSİNDE KESİŞİM ARAMA (Sinyal Kaçırmama Penceresi)
+        # ----------------------------------------------------------------------
+        has_bull_cross = False
+        has_bear_cross = False
 
-        # DEBUG LOG (Sadece Gerçekten Kesişim Yaşanmışsa Elenme Nedenini Gösterir)
-        if (is_di_bull_cross or is_di_bear_cross) and DEBUG_LOG and not (is_long or is_short):
+        for i in range(1, 4):  # Son 3 mumu tara
+            c_row = df_ind.iloc[-i]
+            p_row = df_ind.iloc[-i-1]
+            
+            # Long Kesişim: +DI, -DI'yi yukarı kesti mi?
+            if (p_row['plus_di'] <= p_row['minus_di']) and (c_row['plus_di'] > c_row['minus_di']):
+                has_bull_cross = True
+            # Short Kesişim: -DI, +DI'yi yukarı kesti mi?
+            if (p_row['minus_di'] <= p_row['plus_di']) and (c_row['minus_di'] > c_row['plus_di']):
+                has_bear_cross = True
+
+        # ŞARTLAR:
+        # 1. Son 3 mumda kesişim gerçekleşmiş olması
+        # 2. Fiyatın EMA100'ün doğru tarafında bulunması
+        # 3. Mum gövdesinin belirtilen eşiği karşılaması
+        # 4. ADX trend gücünün eşiği geçmesi
+        is_long = has_bull_cross and (close_p >= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
+        is_short = has_bear_cross and (close_p <= ema_val) and (candle_body_pct >= MIN_CANDLE_PCT) and (adx_val >= ADX_THRESHOLD)
+
+        # Debug loglar istenirse aktifleşir
+        if (has_bull_cross or has_bear_cross) and DEBUG_LOG and not (is_long or is_short):
             fail_reasons = []
             if candle_body_pct < MIN_CANDLE_PCT:
-                fail_reasons.append(f"Mum Gövdesi Yetersiz (%{candle_body_pct:.2f} < %{MIN_CANDLE_PCT})")
+                fail_reasons.append(f"Mum Yetersiz (%{candle_body_pct:.2f} < %{MIN_CANDLE_PCT})")
             if adx_val < ADX_THRESHOLD:
                 fail_reasons.append(f"ADX Zayıf ({adx_val:.1f} < {ADX_THRESHOLD})")
-            if is_di_bull_cross and close_p < ema_val:
-                fail_reasons.append(f"EMA 100 Altında (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
-            if is_di_bear_cross and close_p > ema_val:
-                fail_reasons.append(f"EMA 100 Üstünde (Fiyat: ${close_p} | EMA: ${ema_val:.4f})")
-            
-            if fail_reasons:
-                cross_type = "LONG" if is_di_bull_cross else "SHORT"
-                print(f"⚠️ [{symbol}] {cross_type} Kesişimi Oldu (Önceki: +DI:{prev_pdi:.1f}/-DI:{prev_mdi:.1f} -> Son: +DI:{curr_pdi:.1f}/-DI:{curr_mdi:.1f}) Ama Elendi -> " + " | ".join(fail_reasons))
+            if has_bull_cross and close_p < ema_val:
+                fail_reasons.append("EMA100 Altında")
+            if has_bear_cross and close_p > ema_val:
+                fail_reasons.append("EMA100 Üstünde")
+            print(f"⚠️ [{symbol}] Kesişim Var Ama Elendi -> " + " | ".join(fail_reasons))
 
         if not (is_long or is_short):
             return None
@@ -162,8 +165,8 @@ def analyze_symbol(symbol: str):
             "ema100": ema_val,
             "candle_body_pct": candle_body_pct,
             "adx": adx_val,
-            "plus_di": curr_pdi,
-            "minus_di": curr_mdi,
+            "plus_di": curr['plus_di'],
+            "minus_di": curr['minus_di'],
             "volume": curr['quote_volume'],
             "direction": direction
         }
@@ -174,7 +177,7 @@ def analyze_symbol(symbol: str):
 
 def run_scanner():
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"\n[{now} UTC] 🔍 A+ Strateji Taraması Başlatıldı (Min Mum: %{MIN_CANDLE_PCT})...")
+    print(f"\n[{now} UTC] 🔍 ADX/EMA Breakout Taraması Başlatıldı (Min Mum: %{MIN_CANDLE_PCT})...")
 
     symbols = get_usdt_symbols()
     if not symbols:
@@ -212,8 +215,8 @@ def run_scanner():
 
 
 def main():
-    print("🚀 NET KESİŞİM TEYİTLİ A+ SCANNER BAŞLATILDI")
-    print(f"ENV Ayarları -> Min Mum: %{MIN_CANDLE_PCT} | ADX Eşik: >{ADX_THRESHOLD} | EMA: {EMA_PERIOD}")
+    print("🚀 OPTİMİZE ADX/DI BREAKOUT SCANNER BAŞLATILDI")
+    print(f"ENV Ayarları -> Min Mum: %{MIN_CANDLE_PCT} | ADX Eşik: >{ADX_THRESHOLD} | EMA: {EMA_PERIOD} | Debug Log: {DEBUG_LOG}")
     while True:
         try:
             run_scanner()
