@@ -6,13 +6,14 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# YAPILANDIRMA (Detaylı Log Modu)
+# YAPILANDIRMA (1M USDT Hacim Filtreli Saf Delta Modu)
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "1m")                    
 MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 0.8))     
 VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", 1.5)) 
+MIN_24H_VOLUME_USDT = float(os.getenv("MIN_24H_VOLUME_USDT", 1000000)) # 1 Milyon USDT Hacim Eşiği
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))          
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 8))               
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -33,17 +34,30 @@ def send_telegram_alert(message: str):
 
 def calculate_delta(df):
     df = df.copy()
-    # Binance Taker Buy/Sell tabanlı delta
     df['taker_sell_base'] = df['volume'] - df['taker_buy_base']
     df['delta'] = df['taker_buy_base'] - df['taker_sell_base']
     return df
 
 
-def get_usdt_symbols():
+def get_liquid_usdt_symbols():
+    """ 1M USDT üzeri hacme sahip pariteleri filtreler """
     try:
         response = requests.get(f"{API_BASE}/fapi/v1/ticker/24hr", timeout=10)
-        tickers = response.json()
-        return [t['symbol'] for t in tickers if t['symbol'].endswith('USDT')]
+        data = response.json()
+        
+        if isinstance(data, dict):
+            print(f"[Binance API Yanıtı / Hata]: {data}")
+            return []
+            
+        liquid_symbols = []
+        if isinstance(data, list):
+            for t in data:
+                if isinstance(t, dict) and t.get('symbol', '').endswith('USDT'):
+                    quote_vol = float(t.get('quoteVolume', 0)) 
+                    if quote_vol >= MIN_24H_VOLUME_USDT:
+                        liquid_symbols.append(t['symbol'])
+                        
+        return liquid_symbols
     except Exception as e:
         print(f"[Hata] Ticker verisi alınamadı: {e}")
         return []
@@ -60,7 +74,7 @@ def analyze_symbol(symbol: str):
         res = requests.get(url, params=params, timeout=5)
         klines = res.json()
 
-        if not klines or len(klines) < 30:
+        if not isinstance(klines, list) or len(klines) < 30:
             return None
 
         df = pd.DataFrame(klines, columns=[
@@ -69,7 +83,6 @@ def analyze_symbol(symbol: str):
             'taker_buy_quote', 'ignore'
         ])
 
-        # Canlı mumu çıkar, kapanmış son mumlar üzerinden net teyit al
         closed_df = df.iloc[:-1].copy()
         
         for col in ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base']:
@@ -77,19 +90,17 @@ def analyze_symbol(symbol: str):
 
         df_ind = calculate_delta(closed_df)
 
-        m1 = df_ind.iloc[-2]  # 1. Mum (Kırılım mumu)
-        m2 = df_ind.iloc[-1]  # 2. Mum (Teyit mumu)
+        m1 = df_ind.iloc[-2]  
+        m2 = df_ind.iloc[-1]  
         
         avg_volume = df_ind['volume'].iloc[-25:-2].mean()
 
         m1_body_pct = (abs(m1['close'] - m1['open']) / m1['open']) * 100.0
         is_volume_spike = m1['volume'] >= (avg_volume * VOLUME_MULTIPLIER)
 
-        # Eğer gövde veya hacim şartı tutmuyorsa sessizce geç
         if not is_volume_spike or (m1_body_pct < MIN_CANDLE_PCT):
             return None
 
-        # --- YÖN KONTROLÜ ---
         m1_green = m1['close'] > m1['open']
         is_positive_delta_1 = m1['delta'] > 0
         m2_closes_higher = m2['close'] > m1['close']
@@ -115,9 +126,6 @@ def analyze_symbol(symbol: str):
         )
 
         if not (is_valid_long or is_valid_short):
-            # Şartları sağlayan bir mum bulduk ama 2. mum teyidi veya delta tutmadı!
-            # Bunu konsola yazdıralım ki nerede takıldığını görelim.
-            print(f"[Filtreye Takıldı] {symbol} -> Hacim/Gövde geçti ancak 2. Mum / Delta teyidi uymadı.")
             return None
 
         direction = "LONG" if is_valid_long else "SHORT"
@@ -132,17 +140,18 @@ def analyze_symbol(symbol: str):
             "m2_delta": m2['delta']
         }
 
-    except Exception as e:
+    except Exception:
         return None
 
 
 def run_scanner():
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"\n[{now} UTC] 🔍 Tarama Başlatıldı ({TIMEFRAME})...")
-
-    symbols = get_usdt_symbols()
+    
+    symbols = get_liquid_usdt_symbols()
+    print(f"\n[{now} UTC] 🔍 Tarama Başlatıldı ({TIMEFRAME}) | 1M+ USDT Hacimli Çift Sayısı: {len(symbols)}")
+    
     if not symbols:
-        print("[!] Taranacak sembol bulunamadı.")
+        print("[!] Taranacak geçerli sembol bulunamadı.")
         return
 
     detected_signals = []
@@ -158,7 +167,7 @@ def run_scanner():
 
     for s in detected_signals:
         is_long = s['direction'] == 'LONG'
-        badge = "🟢 SİNYAL (LONG)" if is_long else "🔴 SİNYAL (SHORT)"
+        badge = "🟢 SAF SİNYAL (LONG)" if is_long else "🔴 SAF SİNYAL (SHORT)"
         
         log_msg = (
             f"========================================\n"
@@ -167,6 +176,8 @@ def run_scanner():
             f"Fiyat: ${s['price']}\n"
             f"1. Mum Gövdesi: %{s['m1_body']:.2f}\n"
             f"Hacim Çarpanı: {s['m1_vol_multi']:.1f}x\n"
+            f"M1 Delta: {s['m1_delta']:,.0f}\n"
+            f"M2 Delta: {s['m2_delta']:,.0f}\n"
             f"========================================"
         )
         print(log_msg)
@@ -174,7 +185,7 @@ def run_scanner():
 
 
 def main():
-    print("🚀 HATA AYIKLAMA MODU AKTİF")
+    print("🚀 1M+ USDT HACİM FİLTRELİ SAF DELTA BOTU AKTİF")
     while True:
         try:
             run_scanner()
