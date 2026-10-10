@@ -1,17 +1,20 @@
 import os
 import time
 from datetime import datetime, timezone
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
 
 # ==============================================================================
-# YAPILANDIRMA VE EŞİK DEĞERLERİ (ATR ve SMA Kaldırıldı)
+# YAPILANDIRMA
 # ==============================================================================
-TIMEFRAME = os.getenv("TIMEFRAME", "5m")                    
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 2.0))     # Mum Gövde Şartı
-VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", 3.0)) # 3 Katı Hacim Sıçraması
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))         # 180 Saniye (3 Dakika)
+TIMEFRAME = os.getenv("TIMEFRAME", "5m")
+MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 2.0))
+VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", 3.0))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))
 DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
 
@@ -20,120 +23,134 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 API_BASE = "https://fapi.binance.com"
 
+session = requests.Session()
+session.mount("https://", HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS))
+
+# Aynı mum için tekrar bildirim göndermemek için: {symbol: m2_open_time}
+last_alerted = {}
+
 
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Uyarı] Telegram ayarlı değil (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID boş).")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
     try:
-        requests.post(url, json=payload, timeout=5)
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code != 200:
+            print(f"[Hata] Telegram {r.status_code}: {r.text[:200]}")
     except Exception as e:
         print(f"[Hata] Telegram bildirimi gönderilemedi: {e}")
 
 
 def calculate_strategy_indicators(df):
     df = df.copy()
-    # Delta Hesabı (Taker Buy Base - Taker Sell Base)
-    df['taker_sell_base'] = df['volume'] - df['taker_buy_base']
-    df['delta'] = df['taker_buy_base'] - df['taker_sell_base']
+    df["taker_sell_base"] = df["volume"] - df["taker_buy_base"]
+    df["delta"] = df["taker_buy_base"] - df["taker_sell_base"]
     return df
 
 
 def get_usdt_symbols():
     try:
-        response = requests.get(f"{API_BASE}/fapi/v1/ticker/24hr", timeout=10)
-        tickers = response.json()
-        return [t['symbol'] for t in tickers if t['symbol'].endswith('USDT')]
+        r = session.get(f"{API_BASE}/fapi/v1/exchangeInfo", timeout=15)
+        if r.status_code != 200:
+            print(f"[Hata] exchangeInfo HTTP {r.status_code}: {r.text[:200]}")
+            return []
+        data = r.json()
+        return [
+            s["symbol"]
+            for s in data.get("symbols", [])
+            if s.get("quoteAsset") == "USDT"
+            and s.get("status") == "TRADING"
+            and s.get("contractType") == "PERPETUAL"
+        ]
     except Exception as e:
-        print(f"[Hata] Ticker verisi alınamadı: {e}")
+        print(f"[Hata] Sembol listesi alınamadı: {e}")
         return []
 
 
 def analyze_symbol(symbol: str):
+    """(durum, veri) döner. Durum: api_error, rate_limit, short_data,
+    no_spike, no_direction, signal, exception"""
     try:
-        url = f"{API_BASE}/fapi/v1/klines"
-        params = {
-            "symbol": symbol,
-            "interval": TIMEFRAME,
-            "limit": 40
-        }
-        res = requests.get(url, params=params, timeout=5)
-        klines = res.json()
+        res = session.get(
+            f"{API_BASE}/fapi/v1/klines",
+            params={"symbol": symbol, "interval": TIMEFRAME, "limit": 40},
+            timeout=10,
+        )
 
-        if not klines or len(klines) < 30:
-            return None
+        if res.status_code in (418, 429):
+            return "rate_limit", f"HTTP {res.status_code}"
+        if res.status_code != 200:
+            return "api_error", f"HTTP {res.status_code}: {res.text[:100]}"
+
+        klines = res.json()
+        if not isinstance(klines, list) or len(klines) < 30:
+            return "short_data", None
 
         df = pd.DataFrame(klines, columns=[
-            'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-            'taker_buy_quote', 'ignore'
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_volume", "trades", "taker_buy_base",
+            "taker_buy_quote", "ignore",
         ])
 
-        # Canlı mumu çıkar, kapanmış son mumlar üzerinden net teyit al
+        # Canlı (kapanmamış) mumu çıkar
         closed_df = df.iloc[:-1].copy()
-        
-        for col in ['open', 'high', 'low', 'close', 'volume', 'taker_buy_base']:
+        for col in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
             closed_df[col] = closed_df[col].astype(float)
 
         df_ind = calculate_strategy_indicators(closed_df)
 
-        m1 = df_ind.iloc[-2]  # 1. Mum (Kırılım / Hareket Mumu)
-        m2 = df_ind.iloc[-1]  # 2. Mum (Teyit Mumu)
-        
-        avg_volume = df_ind['volume'].iloc[-25:-2].mean()
+        m1 = df_ind.iloc[-2]  # Hareket mumu
+        m2 = df_ind.iloc[-1]  # Teyit mumu
 
-        m1_body_pct = (abs(m1['close'] - m1['open']) / m1['open']) * 100.0
-        is_volume_spike = m1['volume'] >= (avg_volume * VOLUME_MULTIPLIER)
+        avg_volume = df_ind["volume"].iloc[-25:-2].mean()
+        if avg_volume <= 0 or m1["open"] <= 0:
+            return "short_data", None
 
-        if not is_volume_spike or (m1_body_pct < MIN_CANDLE_PCT):
-            return None
+        m1_body_pct = abs(m1["close"] - m1["open"]) / m1["open"] * 100.0
+        vol_multi = m1["volume"] / avg_volume
 
-        # --- YÖN KONTROLÜ (LONG vs SHORT - SMA Olmadan Saf Kırılım ve Delta) ---
-        
-        # LONG ŞARTLARI: Yeşil gövde, pozitif 3x hacim deltası, 2. mumda yukarı kapanış ve kesintisiz pozitif delta
-        m1_green = m1['close'] > m1['open']
-        is_positive_delta_1 = m1['delta'] > 0
-        m2_closes_higher = m2['close'] > m1['close']
-        is_positive_delta_2 = m2['delta'] > 0
+        if vol_multi < VOLUME_MULTIPLIER or m1_body_pct < MIN_CANDLE_PCT:
+            return "no_spike", None
 
         is_valid_long = (
-            m1_green and 
-            is_positive_delta_1 and 
-            m2_closes_higher and 
-            is_positive_delta_2
+            m1["close"] > m1["open"]
+            and m1["delta"] > 0
+            and m2["close"] > m1["close"]
+            and m2["delta"] > 0
         )
-
-        # SHORT ŞARTLARI: Kırmızı gövde, negatif 3x hacim deltası, 2. mumda aşağı kapanış ve kesintisiz negatif delta
-        m1_red = m1['close'] < m1['open']
-        is_negative_delta_1 = m1['delta'] < 0
-        m2_closes_lower = m2['close'] < m1['close']
-        is_negative_delta_2 = m2['delta'] < 0
-
         is_valid_short = (
-            m1_red and 
-            is_negative_delta_1 and 
-            m2_closes_lower and 
-            is_negative_delta_2
+            m1["close"] < m1["open"]
+            and m1["delta"] < 0
+            and m2["close"] < m1["close"]
+            and m2["delta"] < 0
         )
+
+        if DEBUG_LOG:
+            print(
+                f"[DEBUG] {symbol} hacim/gövde geçti | x{vol_multi:.1f} %{m1_body_pct:.2f} | "
+                f"m1_delta={m1['delta']:.0f} m2_delta={m2['delta']:.0f} | "
+                f"long={is_valid_long} short={is_valid_short}"
+            )
 
         if not (is_valid_long or is_valid_short):
-            return None
+            return "no_direction", None
 
-        direction = "LONG" if is_valid_long else "SHORT"
-
-        return {
+        return "signal", {
             "symbol": symbol,
-            "direction": direction,
-            "price": m2['close'],
+            "direction": "LONG" if is_valid_long else "SHORT",
+            "price": m2["close"],
             "m1_body": m1_body_pct,
-            "m1_vol_multi": m1['volume'] / avg_volume,
-            "m1_delta": m1['delta'],
-            "m2_delta": m2['delta']
+            "m1_vol_multi": vol_multi,
+            "m1_delta": m1["delta"],
+            "m2_delta": m2["delta"],
+            "m2_open_time": int(m2["open_time"]),
         }
 
-    except Exception:
-        return None
+    except Exception as e:
+        return "exception", f"{symbol}: {type(e).__name__}: {e}"
 
 
 def run_scanner():
@@ -145,22 +162,43 @@ def run_scanner():
         print("[!] Taranacak sembol bulunamadı.")
         return
 
-    detected_signals = []
+    stats = Counter()
+    errors = []
+    signals = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_symbol = {executor.submit(analyze_symbol, sym): sym for sym in symbols}
-        for future in as_completed(future_to_symbol):
-            result = future.result()
-            if result:
-                detected_signals.append(result)
+        futures = {executor.submit(analyze_symbol, s): s for s in symbols}
+        for f in as_completed(futures):
+            status, data = f.result()
+            stats[status] += 1
+            if status == "signal":
+                signals.append(data)
+            elif status in ("api_error", "rate_limit", "exception") and len(errors) < 5:
+                errors.append(f"{futures[f]} -> {data}")
 
-    print(f"[Tamamlandı] Taranan Çift: {len(symbols)} | Teyitli Sinyal: {len(detected_signals)}")
+    print(
+        f"[Tamamlandı] Taranan: {len(symbols)} | "
+        f"Hacim/gövde filtresi geçen: {stats['no_direction'] + stats['signal']} | "
+        f"Sinyal: {stats['signal']}"
+    )
+    print(f"[İstatistik] {dict(stats)}")
 
-    for s in detected_signals:
-        is_long = s['direction'] == 'LONG'
+    if errors:
+        print("[Hata örnekleri]")
+        for e in errors:
+            print(f"  - {e}")
+    if stats["rate_limit"]:
+        print("[!] Rate limit alındı: MAX_WORKERS'ı düşür veya SCAN_INTERVAL'ı artır.")
+
+    for s in signals:
+        # Aynı teyit mumu için tekrar bildirim gönderme
+        if last_alerted.get(s["symbol"]) == s["m2_open_time"]:
+            continue
+        last_alerted[s["symbol"]] = s["m2_open_time"]
+
+        is_long = s["direction"] == "LONG"
         badge = "🟢 SAF KIRILIM + DELTA SİNYALİ (LONG)" if is_long else "🔴 SAF KIRILIM + DELTA SİNYALİ (SHORT)"
-        
-        log_msg = (
+        msg = (
             f"========================================\n"
             f"{badge}\n"
             f"Sembol: {s['symbol'].replace('USDT', '')}/USDT\n"
@@ -171,13 +209,18 @@ def run_scanner():
             f"2. Mum Delta (Teyit): {s['m2_delta']:,.0f}\n"
             f"========================================"
         )
-        print(log_msg)
-        send_telegram_alert(log_msg)
+        print(msg)
+        send_telegram_alert(msg)
 
 
 def main():
     print("🚀 SAF DELTA BREAKOUT BOTU AKTİF (Filtresiz Mod)")
-    print(f"Ayarlar -> Zaman Dilimi: {TIMEFRAME} | Tarama Aralığı: {SCAN_INTERVAL}s | Min Gövde: %{MIN_CANDLE_PCT} | Hacim Katı: {VOLUME_MULTIPLIER}x")
+    print(
+        f"Ayarlar -> Zaman Dilimi: {TIMEFRAME} | Tarama Aralığı: {SCAN_INTERVAL}s | "
+        f"Min Gövde: %{MIN_CANDLE_PCT} | Hacim Katı: {VOLUME_MULTIPLIER}x"
+    )
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Uyarı] Telegram değişkenleri boş, sinyaller sadece konsola yazılacak.")
     while True:
         try:
             run_scanner()
