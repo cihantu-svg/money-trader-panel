@@ -20,7 +20,7 @@ MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))
 DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
 AVG_WINDOW = 23
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 API_BASE = "https://fapi.binance.com"
