@@ -6,7 +6,7 @@ import pandas as pd
 import requests
 
 # ==============================================================================
-# YAPILANDIRMA (1M USDT Hacim Filtreli Saf Delta Modu)
+# YAPILANDIRMA (Güvenli API Modu)
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "1m")                    
 MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 0.8))     
@@ -40,22 +40,35 @@ def calculate_delta(df):
 
 
 def get_liquid_usdt_symbols():
-    """ 1M USDT üzeri hacme sahip pariteleri filtreler """
+    """ Binance API'den güvenli şekilde hacim verisini çeker ve string indeks hatasını önler """
     try:
-        response = requests.get(f"{API_BASE}/fapi/v1/ticker/24hr", timeout=10)
+        url = f"{API_BASE}/fapi/v1/ticker/24hr"
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        # HTTP durum kodu kontrolü
+        if response.status_code != 200:
+            print(f"[Binance Hata] HTTP Durum Kodu: {response.status_code} - Yanıt: {response.text[:200]}")
+            return []
+
         data = response.json()
         
-        if isinstance(data, dict):
-            print(f"[Binance API Yanıtı / Hata]: {data}")
+        # Gelen verinin kesinlikle bir liste olup olmadığını kontrol et
+        if not isinstance(data, list):
+            print(f"[Binance Hata] Beklenen liste formatı gelmedi, tip: {type(data)}. İçerik: {str(data)[:200]}")
             return []
             
         liquid_symbols = []
-        if isinstance(data, list):
-            for t in data:
-                if isinstance(t, dict) and t.get('symbol', '').endswith('USDT'):
-                    quote_vol = float(t.get('quoteVolume', 0)) 
-                    if quote_vol >= MIN_24H_VOLUME_USDT:
-                        liquid_symbols.append(t['symbol'])
+        for t in data:
+            if isinstance(t, dict):
+                symbol = t.get('symbol', '')
+                if symbol.endswith('USDT'):
+                    try:
+                        quote_vol = float(t.get('quoteVolume', 0))
+                        if quote_vol >= MIN_24H_VOLUME_USDT:
+                            liquid_symbols.append(symbol)
+                    except (ValueError, TypeError):
+                        continue
                         
         return liquid_symbols
     except Exception as e:
@@ -185,7 +198,7 @@ def run_scanner():
 
 
 def main():
-    print("🚀 1M+ USDT HACİM FİLTRELİ SAF DELTA BOTU AKTİF")
+    print("🚀 GÜVENLİ HACİM FİLTRELİ SAF DELTA BOTU AKTİF")
     while True:
         try:
             run_scanner()
