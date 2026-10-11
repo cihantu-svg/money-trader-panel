@@ -1,242 +1,240 @@
 import os
+import re
 import time
-import math
 from datetime import datetime, timezone
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import pandas as pd
+import numpy as np
 import requests
-from requests.adapters import HTTPAdapter
 
 # ==============================================================================
-# YAPILANDIRMA
+# AYARLAR (hepsinin varsayılanı hazır, dokunmana gerek yok)
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "1m")
-MIN_CANDLE_PCT = float(os.getenv("MIN_CANDLE_PCT", 2.0))
-VOLUME_MULTIPLIER = float(os.getenv("VOLUME_MULTIPLIER", 3.0))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 10))
-DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
-AVG_WINDOW = 23
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", 8))
+MIN_QUOTE_VOL = float(os.getenv("MIN_QUOTE_VOL", 1_000_000))   # 24s hacim alt sınırı (USDT)
+
+RANGE_BARS = int(os.getenv("RANGE_BARS", 20))        # kırılacak range: son 20 mum
+VOL_MULT = float(os.getenv("VOL_MULT", 2.0))         # teyit mumu hacmi >= 2 x normal
+IMBALANCE = float(os.getenv("IMBALANCE", 0.4))       # |delta| / hacim >= 0.4 (hacim tek taraftan akıyor)
+MIN_RUN_PCT = float(os.getenv("MIN_RUN_PCT", 1.5))   # kırılım mumundan son teyide toplam hareket >= %1.5
+COOLDOWN_MIN = int(os.getenv("COOLDOWN_MIN", 30))    # aynı coinde tekrar bildirim aralığı
+LOOKBACK_BARS = 3                                    # son kaç mumda biten sinyal aransın
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 API_BASE = "https://fapi.binance.com"
-
-
-def tf_seconds(tf: str) -> int:
-    return int(tf[:-1]) * {"m": 60, "h": 3600, "d": 86400}[tf[-1]]
-
-
-# Bir taramada kaç mum çifti geriye bakılacak (taramalar arası kapanan mumları da yakalar)
-LOOKBACK_PAIRS = int(os.getenv("LOOKBACK_PAIRS", math.ceil(SCAN_INTERVAL / tf_seconds(TIMEFRAME)) + 1))
-# Çok eski sinyalleri göndermemek için üst sınır
-LOOKBACK_PAIRS = max(1, min(LOOKBACK_PAIRS, 8))
-
 session = requests.Session()
-session.mount("https://", HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS))
+ban_until = 0.0
+symbols_cache = {"ts": 0.0, "list": []}
+last_alert = {}
 
-last_alerted = {}  # {symbol: m2_open_time}
 
-
-def send_telegram_alert(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Uyarı] Telegram ayarlı değil (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID boş).")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
+# ==============================================================================
+# BINANCE İSTEĞİ (ban / limit korumalı)
+# ==============================================================================
+def api_get(path, params=None, timeout=10):
+    global ban_until
+    if time.time() < ban_until:
+        return None
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"[Hata] Telegram {r.status_code}: {r.text[:200]}")
-    except Exception as e:
-        print(f"[Hata] Telegram bildirimi gönderilemedi: {e}")
+        res = session.get(f"{API_BASE}{path}", params=params, timeout=timeout)
+    except Exception:
+        return None
+
+    if res.status_code == 418:
+        m = re.search(r"banned until (\d+)", res.text)
+        ban_until = int(m.group(1)) / 1000.0 + 5 if m else time.time() + 300
+    elif res.status_code == 429:
+        ban_until = time.time() + int(res.headers.get("Retry-After", 30)) + 2
+    else:
+        used = int(res.headers.get("X-MBX-USED-WEIGHT-1M", 0) or 0)
+        if used >= 1800:                      # limite yaklaşınca bir sonraki dakikaya kadar bekle
+            ban_until = time.time() + (61 - time.time() % 60)
+    return res
 
 
-def get_usdt_symbols():
+def get_symbols():
+    if symbols_cache["list"] and time.time() - symbols_cache["ts"] < 3600:
+        return symbols_cache["list"]
+
+    info = api_get("/fapi/v1/exchangeInfo", timeout=20)
+    tick = api_get("/fapi/v1/ticker/24hr", timeout=20)
+    if info is None or tick is None or info.status_code != 200 or tick.status_code != 200:
+        print("[Hata] Sembol listesi alınamadı (ban/limit olabilir).")
+        return symbols_cache["list"]
+
+    tradable = {
+        s["symbol"] for s in info.json().get("symbols", [])
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING"
+        and s.get("contractType") == "PERPETUAL"
+    }
+    vols = {t["symbol"]: float(t["quoteVolume"]) for t in tick.json()}
+    symbols_cache["list"] = [s for s in tradable if vols.get(s, 0) >= MIN_QUOTE_VOL]
+    symbols_cache["ts"] = time.time()
+    return symbols_cache["list"]
+
+
+# ==============================================================================
+# ŞELALE SİNYALİ
+# ==============================================================================
+def find_signal(arr):
+    """arr sütunları: 0 open_time, 1 open, 2 high, 3 low, 4 close, 5 volume, 9 taker_buy_base.
+    Kırılım mumu (b) + 2 teyit mumu (b+1, b+2). Teyit mumları aynı yönde, güçlü ve tek taraflı olmalı."""
+    n = len(arr)
+    o, h, l, c, v = arr[:, 1], arr[:, 2], arr[:, 3], arr[:, 4], arr[:, 5]
+    d = 2.0 * arr[:, 9] - v        # delta = taker alış - taker satış
+
+    for off in range(LOOKBACK_BARS):
+        e = n - 1 - off            # son teyit mumu
+        b = e - 2                  # kırılım mumu
+        if b - RANGE_BARS < 0:
+            break
+        rng_hi = h[b - RANGE_BARS:b].max()
+        rng_lo = l[b - RANGE_BARS:b].min()
+        vbase = v[b - RANGE_BARS:b].mean()
+        if vbase <= 0 or o[b] <= 0:
+            continue
+
+        for direction, sign in (("LONG", 1), ("SHORT", -1)):
+            broke = c[b] > rng_hi if sign == 1 else c[b] < rng_lo
+            if not broke:
+                continue
+
+            ok, prev = True, c[b]
+            for k in (b + 1, b + 2):
+                moving = (c[k] - prev) * sign > 0          # fiyat aynı yönde ilerliyor
+                flow = d[k] * sign > 0                     # delta aynı yönde
+                heavy = v[k] >= VOL_MULT * vbase           # hacim yüksek
+                onesided = abs(d[k]) >= IMBALANCE * v[k]   # hacmin çoğu tek taraftan
+                if not (moving and flow and heavy and onesided):
+                    ok = False
+                    break
+                prev = c[k]
+            if not ok:
+                continue
+
+            run = (c[e] - o[b]) / o[b] * 100.0 * sign
+            if run < MIN_RUN_PCT:
+                continue
+
+            return {
+                "direction": direction,
+                "level": rng_hi if sign == 1 else rng_lo,
+                "price": c[e],
+                "run": run,
+                "vol_x": float(np.mean([v[b + 1], v[b + 2]]) / vbase),
+                "imbalance": float(np.mean([abs(d[b + 1]) / v[b + 1], abs(d[b + 2]) / v[b + 2]])),
+                "time": int(arr[e, 0]),
+                "candles_ago": off,
+            }
+    return None
+
+
+def analyze_symbol(symbol):
     try:
-        r = session.get(f"{API_BASE}/fapi/v1/exchangeInfo", timeout=15)
-        if r.status_code != 200:
-            print(f"[Hata] exchangeInfo HTTP {r.status_code}: {r.text[:200]}")
-            return []
-        data = r.json()
-        return [
-            s["symbol"]
-            for s in data.get("symbols", [])
-            if s.get("quoteAsset") == "USDT"
-            and s.get("status") == "TRADING"
-            and s.get("contractType") == "PERPETUAL"
-        ]
-    except Exception as e:
-        print(f"[Hata] Sembol listesi alınamadı: {e}")
-        return []
-
-
-def analyze_symbol(symbol: str):
-    """(durum, veri) döner. Durum: api_error, rate_limit, short_data,
-    no_spike, no_direction, signal, exception"""
-    try:
-        res = session.get(
-            f"{API_BASE}/fapi/v1/klines",
-            params={"symbol": symbol, "interval": TIMEFRAME, "limit": 60},
-            timeout=10,
-        )
-        if res.status_code in (418, 429):
-            return "rate_limit", f"HTTP {res.status_code}"
+        res = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": TIMEFRAME, "limit": 60})
+        if res is None:
+            return "rate_limit", "ban/limit aktif"
         if res.status_code != 200:
             return "api_error", f"HTTP {res.status_code}: {res.text[:100]}"
-
-        klines = res.json()
-        if not isinstance(klines, list) or len(klines) < AVG_WINDOW + LOOKBACK_PAIRS + 3:
+        rows = res.json()
+        if not isinstance(rows, list) or len(rows) < RANGE_BARS + 6:
             return "short_data", None
 
-        df = pd.DataFrame(klines).iloc[:, :11].astype(float)
-        df.columns = [
-            "open_time", "open", "high", "low", "close", "volume",
-            "close_time", "quote_volume", "trades", "taker_buy_base", "taker_buy_quote",
-        ]
-
-        # Canlı (kapanmamış) mumu çıkar
-        now_ms = int(time.time() * 1000)
-        df = df[df["close_time"] < now_ms].reset_index(drop=True)
-
-        df["delta"] = 2.0 * df["taker_buy_base"] - df["volume"]  # alış - satış
-        df["body_pct"] = (df["close"] - df["open"]).abs() / df["open"] * 100.0
-        # Her mum için kendisinden ÖNCEKİ 23 mumun hacim ortalaması
-        df["vol_avg"] = df["volume"].rolling(AVG_WINDOW).mean().shift(1)
-
-        n = len(df)
-        passed_spike = False
-
-        # offset=0 -> en güncel çift, offset büyüdükçe geçmişe gider
-        for offset in range(LOOKBACK_PAIRS):
-            i2 = n - 1 - offset
-            i1 = i2 - 1
-            if i1 < AVG_WINDOW:
-                break
-
-            m1, m2 = df.iloc[i1], df.iloc[i2]
-            if pd.isna(m1["vol_avg"]) or m1["vol_avg"] <= 0 or m1["open"] <= 0:
-                continue
-
-            vol_multi = m1["volume"] / m1["vol_avg"]
-            if vol_multi < VOLUME_MULTIPLIER or m1["body_pct"] < MIN_CANDLE_PCT:
-                continue
-            passed_spike = True
-
-            is_long = (
-                m1["close"] > m1["open"] and m1["delta"] > 0
-                and m2["close"] > m1["close"] and m2["delta"] > 0
-            )
-            is_short = (
-                m1["close"] < m1["open"] and m1["delta"] < 0
-                and m2["close"] < m1["close"] and m2["delta"] < 0
-            )
-
-            if DEBUG_LOG:
-                print(
-                    f"[DEBUG] {symbol} offset={offset} hacim/gövde geçti | x{vol_multi:.1f} "
-                    f"%{m1['body_pct']:.2f} | m1_delta={m1['delta']:.0f} m2_delta={m2['delta']:.0f} "
-                    f"| long={is_long} short={is_short}"
-                )
-
-            if is_long or is_short:
-                return "signal", {
-                    "symbol": symbol,
-                    "direction": "LONG" if is_long else "SHORT",
-                    "price": m2["close"],
-                    "m1_body": m1["body_pct"],
-                    "m1_vol_multi": vol_multi,
-                    "m1_delta": m1["delta"],
-                    "m2_delta": m2["delta"],
-                    "m2_open_time": int(m2["open_time"]),
-                    "candles_ago": offset,
-                }
-
-        return ("no_direction" if passed_spike else "no_spike"), None
-
+        arr = np.array([[float(x) for x in r[:11]] for r in rows])
+        arr = arr[arr[:, 6] < time.time() * 1000]      # kapanmamış mumu at
+        sig = find_signal(arr)
+        if sig is None:
+            return "no_signal", None
+        sig["symbol"] = symbol
+        return "signal", sig
     except Exception as e:
         return "exception", f"{symbol}: {type(e).__name__}: {e}"
 
 
-def run_scanner():
-    t0 = time.time()
-    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    print(f"\n[{now} UTC] 🔍 Tarama başladı | {TIMEFRAME} | geriye bakış: {LOOKBACK_PAIRS} çift")
+# ==============================================================================
+# TELEGRAM + TARAMA DÖNGÜSÜ
+# ==============================================================================
+def send_telegram(msg):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Uyarı] Telegram ayarlı değil (TELEGRAM_TOKEN / TELEGRAM_CHAT_ID).")
+        return
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10,
+        )
+        if r.status_code != 200:
+            print(f"[Hata] Telegram {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[Hata] Telegram gönderilemedi: {e}")
 
-    symbols = get_usdt_symbols()
-    if not symbols:
-        print("[!] Taranacak sembol bulunamadı.")
+
+def run_scanner():
+    wait = ban_until - time.time()
+    if wait > 0:
+        print(f"[BAN/LIMIT] Binance istekleri duraklatıldı, {wait:.0f}s sonra devam.")
+        time.sleep(min(wait, 300))
         return
 
-    stats = Counter()
-    errors = []
-    signals = []
+    t0 = time.time()
+    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC] 🔍 Tarama | {TIMEFRAME}")
+    symbols = get_symbols()
+    if not symbols:
+        print("[!] Taranacak sembol yok.")
+        return
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(analyze_symbol, s): s for s in symbols}
-        for f in as_completed(futures):
+    stats, errors, signals = Counter(), [], []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(analyze_symbol, s): s for s in symbols}
+        for f in as_completed(futs):
             status, data = f.result()
             stats[status] += 1
             if status == "signal":
                 signals.append(data)
-            elif status in ("api_error", "rate_limit", "exception") and len(errors) < 5:
-                errors.append(f"{futures[f]} -> {data}")
+            elif status in ("api_error", "exception") and len(errors) < 3:
+                errors.append(f"{futs[f]} -> {data}")
 
     elapsed = time.time() - t0
-    print(
-        f"[Tamamlandı] {len(symbols)} sembol, {elapsed:.0f}s | "
-        f"Hacim/gövde geçen: {stats['no_direction'] + stats['signal']} | Sinyal: {stats['signal']}"
-    )
-    print(f"[İstatistik] {dict(stats)}")
-    if elapsed > SCAN_INTERVAL:
-        print(f"[!] Tarama {elapsed:.0f}s sürdü, SCAN_INTERVAL ({SCAN_INTERVAL}s) değerini aşıyor.")
-    if errors:
-        print("[Hata örnekleri]")
-        for e in errors:
-            print(f"  - {e}")
-    if stats["rate_limit"]:
-        print("[!] Rate limit alındı: MAX_WORKERS'ı düşür veya SCAN_INTERVAL'ı artır.")
+    print(f"[Tamamlandı] {len(symbols)} sembol, {elapsed:.0f}s | Sinyal: {stats['signal']} | {dict(stats)}")
+    for e in errors:
+        print(f"  - {e}")
 
     for s in signals:
-        if last_alerted.get(s["symbol"]) == s["m2_open_time"]:
+        if s["time"] - last_alert.get(s["symbol"], 0) < COOLDOWN_MIN * 60_000:
             continue
-        last_alerted[s["symbol"]] = s["m2_open_time"]
+        last_alert[s["symbol"]] = s["time"]
 
-        is_long = s["direction"] == "LONG"
-        badge = "🟢 SAF KIRILIM + DELTA SİNYALİ (LONG)" if is_long else "🔴 SAF KIRILIM + DELTA SİNYALİ (SHORT)"
-        ago = f"{s['candles_ago']} mum önce" if s["candles_ago"] else "şimdi"
+        icon = "🟢" if s["direction"] == "LONG" else "🔴"
         msg = (
             f"========================================\n"
-            f"{badge}\n"
-            f"Sembol: {s['symbol'].replace('USDT', '')}/USDT\n"
-            f"Zaman dilimi: {TIMEFRAME} (teyit: {ago})\n"
-            f"Fiyat (2. Mum Kapanış): ${s['price']}\n"
-            f"1. Mum Gövdesi: %{s['m1_body']:.2f}\n"
-            f"Hacim Çarpanı: {s['m1_vol_multi']:.1f}x\n"
-            f"1. Mum Delta: {s['m1_delta']:,.0f}\n"
-            f"2. Mum Delta (Teyit): {s['m2_delta']:,.0f}\n"
+            f"{icon} DELTA ŞELALE ({s['direction']})\n"
+            f"Sembol: {s['symbol'].replace('USDT', '')}/USDT | {TIMEFRAME}\n"
+            f"Kırılan seviye: {s['level']}\n"
+            f"Fiyat: {s['price']}\n"
+            f"Toplam hareket: %{s['run']:.2f}\n"
+            f"Hacim: {s['vol_x']:.1f}x | Tek taraflılık: %{s['imbalance'] * 100:.0f}\n"
             f"========================================"
         )
         print(msg)
-        send_telegram_alert(msg)
+        send_telegram(msg)
 
 
 def main():
-    print("🚀 SAF DELTA BREAKOUT BOTU AKTİF")
-    print(
-        f"Ayarlar -> Zaman Dilimi: {TIMEFRAME} | Tarama Aralığı: {SCAN_INTERVAL}s | "
-        f"Min Gövde: %{MIN_CANDLE_PCT} | Hacim Katı: {VOLUME_MULTIPLIER}x | Geriye bakış: {LOOKBACK_PAIRS} çift"
-    )
+    print("🚀 DELTA ŞELALE BOTU AKTİF")
+    print(f"{TIMEFRAME} | Tarama {SCAN_INTERVAL}s | Range {RANGE_BARS} mum | Hacim {VOL_MULT}x | "
+          f"Tek taraflılık %{IMBALANCE * 100:.0f} | Min hareket %{MIN_RUN_PCT} | Min 24s hacim {MIN_QUOTE_VOL:,.0f}")
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[Uyarı] Telegram değişkenleri boş, sinyaller sadece konsola yazılacak.")
     while True:
         try:
             run_scanner()
         except Exception as e:
-            print(f"[Sistem Hatası] Tarama döngüsü hatası: {e}")
+            print(f"[Sistem Hatası] {e}")
         time.sleep(SCAN_INTERVAL)
 
 
