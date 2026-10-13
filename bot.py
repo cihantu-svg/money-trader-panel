@@ -7,7 +7,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 # ==============================================================================
-# YAPILANDIRMA (15m Zaman Dilimi + 5m Tarama Sıklığı + SMA 100 Temas)
+# YAPILANDIRMA (15m Zaman Dilimi + 5m Tarama + Mükerrer Bildirim Koruması)
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")                    
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 300))         # 5 dakika (300 saniye)
@@ -31,6 +31,9 @@ API_BASE = "https://fapi.binance.com"
 
 session = requests.Session()
 session.mount("https://", HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS))
+
+# Aynı mum için tekrar bildirim gitmesini önlemek için hafıza: {symbol: open_time}
+last_alerted = {}
 
 
 def send_telegram_alert(message: str):
@@ -156,7 +159,8 @@ def analyze_symbol(symbol: str):
             "direction": direction,
             "price": m['close'],
             "rsi": m['rsi'],
-            "sma100": sma_val
+            "sma100": sma_val,
+            "open_time": int(m['open_time'])
         }
 
     except Exception:
@@ -178,13 +182,23 @@ def run_scanner():
                 detected_signals.append(res)
 
     for s in detected_signals:
+        sym = s["symbol"]
+        candle_time = s["open_time"]
+
+        # Mükerrer Bildirim Kontrolü: Aynı mum için daha önce alarm atıldıysa atla
+        if last_alerted.get(sym) == candle_time:
+            continue
+        
+        # Yeni mum zamanını kaydet
+        last_alerted[sym] = candle_time
+
         is_long = s['direction'] == 'LONG'
         badge = "🟢 15m KIRILIM AL (SMA 100 TEMASLI)" if is_long else "🔴 15m KIRILIM SAT (SMA 100 TEMASLI)"
         
         msg = (
             f"========================================\n"
             f"{badge}\n"
-            f"Sembol: {s['symbol'].replace('USDT', '')}/USDT\n"
+            f"Sembol: {sym.replace('USDT', '')}/USDT\n"
             f"Zaman Dilimi: {TIMEFRAME} (5dk Tarama)\n"
             f"Fiyat: ${s['price']}\n"
             f"SMA 100 Seviyesi: ${s['sma100']:.4f}\n"
@@ -196,7 +210,7 @@ def run_scanner():
 
 
 def main():
-    print(f"🚀 PINE SCRIPT KIRILIM + SMA 100 TEMAS TARAYICI AKTİF ({TIMEFRAME} - Her 5dk bir)")
+    print(f"🚀 PINE SCRIPT KIRILIM + SMA 100 TEMAS TARAYICI AKTİF ({TIMEFRAME} - Her 5dk bir - Mükerrer Korumalı)")
     while True:
         try:
             run_scanner()
