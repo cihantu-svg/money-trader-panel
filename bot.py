@@ -35,17 +35,19 @@ session.mount("https://", HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize
 # Aynı mum için tekrar bildirim gitmesini önlemek için hafıza: {symbol: open_time}
 last_alerted = {}
 
-
 def send_telegram_alert(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Uyarı] Telegram Token veya Chat ID ENV içinde bulunamadı!")
         return
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        session.post(url, json=payload, timeout=5)
+        r = session.post(url, json=payload, timeout=5)
+        if r.status_code != 200:
+            print(f"[Telegram Hata] Kod: {r.status_code} - Yanıt: {r.text}")
     except Exception as e:
         print(f"[Hata] Telegram bildirimi gönderilemedi: {e}")
-
 
 def get_usdt_symbols():
     try:
@@ -63,7 +65,6 @@ def get_usdt_symbols():
     except Exception as e:
         print(f"[Hata] Sembol listesi alınamadı: {e}")
         return []
-
 
 def calculate_indicators(df):
     df = df.copy()
@@ -93,7 +94,6 @@ def calculate_indicators(df):
     df['macd_hist'] = df['macd_line'] - df['signal_line']
     
     return df
-
 
 def analyze_symbol(symbol: str):
     try:
@@ -166,10 +166,10 @@ def analyze_symbol(symbol: str):
     except Exception:
         return None
 
-
 def run_scanner():
     now = datetime.now(timezone.utc).strftime("%H:%M:%S")
     symbols = get_usdt_symbols()
+    print(f"\n[{now} UTC] 🔍 Tarama Başlatıldı ({TIMEFRAME}) | Toplam Sembol: {len(symbols)}")
     if not symbols:
         return
 
@@ -181,6 +181,8 @@ def run_scanner():
             if res:
                 detected_signals.append(res)
 
+    print(f"[Tamamlandı] Teyitli Sinyal Sayısı: {len(detected_signals)}")
+
     for s in detected_signals:
         sym = s["symbol"]
         candle_time = s["open_time"]
@@ -189,7 +191,6 @@ def run_scanner():
         if last_alerted.get(sym) == candle_time:
             continue
         
-        # Yeni mum zamanını kaydet
         last_alerted[sym] = candle_time
 
         is_long = s['direction'] == 'LONG'
@@ -208,7 +209,6 @@ def run_scanner():
         print(msg)
         send_telegram_alert(msg)
 
-
 def main():
     print(f"🚀 PINE SCRIPT KIRILIM + SMA 100 TEMAS TARAYICI AKTİF ({TIMEFRAME} - Her 5dk bir - Mükerrer Korumalı)")
     while True:
@@ -217,7 +217,6 @@ def main():
         except Exception as e:
             print(f"[Hata] {e}")
         time.sleep(SCAN_INTERVAL)
-
 
 if __name__ == "__main__":
     main()
