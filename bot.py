@@ -24,7 +24,9 @@ RSI_BEAR = 40
 SMA_LEN = 100               
 TOUCH_TOLERANCE_PCT = 0.4   # SMA'ya temas için izin verilen tolerans yüzdesi (%)
 
-# Panelindeki isimlerle tam eşleşecek şekilde güncellendi:
+# GÜRÜLTÜ ENGELLEYİCİ: Kırılım mumu min %3 gövde büyüklüğünde olmalı
+MIN_CANDLE_BODY_PCT = 3.0   
+
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -129,7 +131,12 @@ def analyze_symbol(symbol: str):
         m1 = df.iloc[-2]  
         m = df.iloc[-1]   
 
-        # Kırılım Koşulları
+        # --- 1. MUM BOYU / GÖVDE KONTROLÜ (Min %3 Şartı) ---
+        candle_change_pct = abs((m['close'] - m['open']) / m['open']) * 100.0
+        if candle_change_pct < MIN_CANDLE_BODY_PCT:
+            return None
+
+        # --- 2. KIRILIM KOŞULLARI ---
         resistance_target = m['resistance'] * (1 + BO_BUFFER_PCT / 100)
         support_target = m['support'] * (1 - BO_BUFFER_PCT / 100)
 
@@ -142,7 +149,7 @@ def analyze_symbol(symbol: str):
         mom_bullish = m['rsi'] > RSI_BULL and m['macd_hist'] > 0 and m['macd_line'] > m['signal_line']
         mom_bearish = m['rsi'] < RSI_BEAR and m['macd_hist'] < 0 and m['macd_line'] < m['signal_line']
 
-        # --- SMA 100 TEMAS (TOUCH) ŞARTI ---
+        # --- 3. SMA 100 TEMAS (TOUCH) ŞARTI ---
         sma_val = m['sma100']
         touch_threshold = sma_val * (TOUCH_TOLERANCE_PCT / 100.0)
         is_touching_sma = (m['low'] <= sma_val + touch_threshold) and (m['high'] >= sma_val - touch_threshold)
@@ -161,6 +168,7 @@ def analyze_symbol(symbol: str):
             "price": m['close'],
             "rsi": m['rsi'],
             "sma100": sma_val,
+            "candle_change": candle_change_pct,
             "open_time": int(m['open_time'])
         }
 
@@ -188,14 +196,14 @@ def run_scanner():
         sym = s["symbol"]
         candle_time = s["open_time"]
 
-        # Mükerrer Bildirim Kontrolü: Aynı mum için daha önce alarm atıldıysa atla
+        # Mükerrer Bildirim Kontrolü
         if last_alerted.get(sym) == candle_time:
             continue
         
         last_alerted[sym] = candle_time
 
         is_long = s['direction'] == 'LONG'
-        badge = "🟢 15m KIRILIM AL (SMA 100 TEMASLI)" if is_long else "🔴 15m KIRILIM SAT (SMA 100 TEMASLI)"
+        badge = "🟢 15m KIRILIM AL (MIN %3 MUM + SMA 100)" if is_long else "🔴 15m KIRILIM SAT (MIN %3 MUM + SMA 100)"
         
         msg = (
             f"========================================\n"
@@ -203,6 +211,7 @@ def run_scanner():
             f"Sembol: {sym.replace('USDT', '')}/USDT\n"
             f"Zaman Dilimi: {TIMEFRAME} (5dk Tarama)\n"
             f"Fiyat: ${s['price']}\n"
+            f"Mum Değişimi: %{s['candle_change']:.2f}\n"
             f"SMA 100 Seviyesi: ${s['sma100']:.4f}\n"
             f"RSI: {s['rsi']:.1f}\n"
             f"========================================"
@@ -211,7 +220,7 @@ def run_scanner():
         send_telegram_alert(msg)
 
 def main():
-    print(f"🚀 PINE SCRIPT KIRILIM + SMA 100 TEMAS TARAYICI AKTİF ({TIMEFRAME} - Her 5dk bir - Mükerrer Korumalı)")
+    print(f"🚀 PINE SCRIPT KIRILIM + SMA 100 TEMAS TARAYICI AKTİF ({TIMEFRAME} - Min %3 Mum Boyu Şartı)")
     while True:
         try:
             run_scanner()
