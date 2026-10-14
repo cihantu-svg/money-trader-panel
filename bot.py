@@ -7,7 +7,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 # ==============================================================================
-# YAPILANDIRMA (Saf Kırılım + %5 Mum Boyu + 3dk Tarama)
+# YAPILANDIRMA (Saf Kırılım + %5 Mum Boyu + 3dk Tarama + Debug)
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")                    
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))         # 3 dakika (180 saniye)
@@ -49,16 +49,20 @@ def send_telegram_alert(message: str):
 def get_usdt_symbols():
     try:
         r = session.get(f"{API_BASE}/fapi/v1/exchangeInfo", timeout=15)
+        print(f"[Debug] Binance API Yanıt Kodu: {r.status_code}")
         if r.status_code != 200:
+            print(f"[Hata Detayı] Yanıt İçeriği: {r.text[:300]}")
             return []
         data = r.json()
-        return [
+        symbols = [
             s["symbol"]
             for s in data.get("symbols", [])
             if s.get("quoteAsset") == "USDT"
             and s.get("status") == "TRADING"
             and s.get("contractType") == "PERPETUAL"
         ]
+        print(f"[Debug] Toplam çekilen USDT perpetual sembol sayısı: {len(symbols)}")
+        return symbols
     except Exception as e:
         print(f"[Hata] Sembol listesi alınamadı: {e}")
         return []
