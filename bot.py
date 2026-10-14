@@ -7,7 +7,7 @@ import requests
 from requests.adapters import HTTPAdapter
 
 # ==============================================================================
-# YAPILANDIRMA (15m Zaman Dilimi + 5m Tarama + Mükerrer Bildirim Koruması)
+# YAPILANDIRMA (ENV İsimleri Panelle Eşitlendi)
 # ==============================================================================
 TIMEFRAME = os.getenv("TIMEFRAME", "15m")                    
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 300))         # 5 dakika (300 saniye)
@@ -24,7 +24,8 @@ RSI_BEAR = 40
 SMA_LEN = 100               
 TOUCH_TOLERANCE_PCT = 0.4   # SMA'ya temas için izin verilen tolerans yüzdesi (%)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+# Panelindeki isimlerle tam eşleşecek şekilde güncellendi:
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 API_BASE = "https://fapi.binance.com"
@@ -36,11 +37,11 @@ session.mount("https://", HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize
 last_alerted = {}
 
 def send_telegram_alert(message: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Uyarı] Telegram Token veya Chat ID ENV içinde bulunamadı!")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Uyarı] TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID ENV içinde bulunamadı!")
         return
         
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         r = session.post(url, json=payload, timeout=5)
