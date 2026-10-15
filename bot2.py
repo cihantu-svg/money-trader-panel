@@ -7,15 +7,14 @@ import pandas as pd
 import requests
 
 # ─────────────── AYARLAR (ENV'DEN OKUNUR) ───────────────
-SMA_LEN           = int(os.environ.get("SMA_LEN", 100))
-BODY_PCT          = float(os.environ.get("BODY_PCT", 5.0))
+SMA_LEN          = int(os.environ.get("SMA_LEN", 100))
+BODY_PCT         = float(os.environ.get("BODY_PCT", 5.0))
 MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
 TIMEFRAME         = os.environ.get("TIMEFRAME", "15m")
 
 # RENDER KOTA KORUMASI: Varsayılan 180 sn (3dk) yapıldı
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
-CANDLES_TO_CHECK  = 3  # Güvenlik için son 3 kapanmış mum
-MAX_WORKERS        = 15 # Render CPU dostu thread sayısı
+MAX_WORKERS       = 15 # Render CPU dostu thread sayısı
 
 BINANCE_FAPI      = "https://fapi.binance.com"
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
@@ -88,12 +87,11 @@ def check_symbol(symbol):
         print(f"[{symbol}] JSON parse hatasi: {e}", flush=True)
         return []
 
-    if not isinstance(data, list) or len(data) < SMA_LEN + CANDLES_TO_CHECK + 1:
+    if not isinstance(data, list) or len(data) < SMA_LEN + 2:
         return []
 
-    closed_data = data[:-1]
-
-    df = pd.DataFrame(closed_data, columns=[
+    # Tüm veriyi alıyoruz (en son mum şu an açık/canlı olan mumdur)
+    df = pd.DataFrame(data, columns=[
         "open_time", "open", "high", "low", "close", "volume",
         "close_time", "quote_volume", "trades",
         "taker_buy_base", "taker_buy_quote", "ignore"
@@ -105,25 +103,24 @@ def check_symbol(symbol):
     df["sma100"] = df["close"].rolling(SMA_LEN).mean()
 
     sonuclar = []
-    for i in range(1, 1 + CANDLES_TO_CHECK):
-        row = df.iloc[-i]
-        prev_row = df.iloc[-i - 1]  # Bir önceki mum (Kırılım kontrolü için)
-        
-        sma100 = row["sma100"]
-        prev_sma100 = prev_row["sma100"]
+    
+    # Açık olan (anlık devam eden) mum en sondaki mumdur (index -1)
+    row = df.iloc[-1]
+    prev_row = df.iloc[-2]  # Bir önceki kapanmış mum
 
-        if pd.isna(sma100) or pd.isna(prev_sma100):
-            continue
+    sma100 = row["sma100"]
+    prev_sma100 = prev_row["sma100"]
 
+    if not pd.isna(sma100) and not pd.isna(prev_sma100):
         body_pct = abs(row["close"] - row["open"]) / row["open"] * 100
         
         # 1. Birebir Dokunma
         direct_touch = (row["low"] <= sma100 <= row["high"])
         
-        # 2. Milimetrik Yakınlık (%0.3 tolerans - Dibinden sıçramalar için)
+        # 2. Milimetrik Yakınlık (%0.3 tolerans)
         near_touch = abs(row["low"] - sma100) / sma100 <= 0.003 or abs(row["high"] - sma100) / sma100 <= 0.003
         
-        # 3. Net Kırılım (Önceki mum SMA100 altındaydı, bu mum üstüne sıçradı)
+        # 3. Net Kırılım
         bullish_break = (prev_row["close"] < prev_sma100) and (row["close"] > sma100)
         bearish_break = (prev_row["close"] > prev_sma100) and (row["close"] < sma100)
 
@@ -138,11 +135,12 @@ def check_symbol(symbol):
                 "close":     row["close"],
                 "sma100":    sma100,
             })
+            
     return sonuclar
 
 
 def scan_once():
-    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Tarama başladı...", flush=True)
+    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Tarama başladı (Açık Mum Kontrolü)...", flush=True)
 
     try:
         r = http_session.get(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", timeout=10)
@@ -177,11 +175,11 @@ def scan_once():
                     bulunan += 1
 
                     mesaj = (
-                        f"🎯 **SMA{SMA_LEN} TEMAS/KIRILIM + %{BODY_PCT} MUM**\n\n"
+                        f"🎯 **AÇIK MUM | SMA{SMA_LEN} + %{BODY_PCT} GÖVDE**\n\n"
                         f"• **Sembol**: {sonuc['symbol']}\n"
                         f"• **Yön**: {sonuc['direction']}\n"
                         f"• **Gövde Boyu**: %{sonuc['body_pct']:.2f}\n"
-                        f"• **Kapanış**: {sonuc['close']}\n"
+                        f"• **Anlık Fiyat**: {sonuc['close']}\n"
                         f"• **SMA{SMA_LEN}**: {sonuc['sma100']:.6f}\n"
                         f"• **Zaman Dilimi**: {TIMEFRAME}"
                     )
@@ -201,7 +199,7 @@ def scan_once():
 
 
 def main():
-    print(f"Bot Başlatıldı | TF={TIMEFRAME} | Tarama Aralığı={SCAN_INTERVAL_SEC}sn", flush=True)
+    print(f"Bot Başlatıldı (Açık Mum Modu) | TF={TIMEFRAME} | Tarama Aralığı={SCAN_INTERVAL_SEC}sn", flush=True)
     while True:
         try:
             scan_once()
