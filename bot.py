@@ -7,9 +7,9 @@ import requests
 from requests.adapters import HTTPAdapter
 
 # ==============================================================================
-# YAPILANDIRMA (Saf Kırılım + %5 Mum Boyu + 3dk Tarama + Debug)
+# YAPILANDIRMA (ENV Destekli Saf Kırılım Tarayıcı)
 # ==============================================================================
-TIMEFRAME = os.getenv("TIMEFRAME", "15m")                    
+TIMEFRAME = os.getenv("TIMEFRAME", "1m")                    
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))         # 3 dakika (180 saniye)
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", 8))               
 DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
@@ -18,8 +18,8 @@ DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
 BO_LEN = 20                 
 BO_BUFFER_PCT = 0.5         
 
-# GÜRÜLTÜ ENGELLEYİCİ: Kırılım mumu min %5 gövde büyüklüğünde olmalı
-MIN_CANDLE_BODY_PCT = 5.0   
+# GÜRÜLTÜ ENGELLEYİCİ: Kırılım mumu min gövde büyüklüğü (ENV'den okunur, varsayılan %5)
+MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", 5.0))   
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -107,7 +107,7 @@ def analyze_symbol(symbol: str):
         m1 = df.iloc[-2]  
         m = df.iloc[-1]   
 
-        # --- 1. MUM BOYU / GÖVDE KONTROLÜ (Min %5 Şartı) ---
+        # --- 1. MUM BOYU / GÖVDE KONTROLÜ (ENV'den gelen Min Şart) ---
         candle_change_pct = ((m['close'] - m['open']) / m['open']) * 100.0
         abs_candle_change = abs(candle_change_pct)
         
@@ -165,13 +165,13 @@ def run_scanner():
         last_alerted[sym] = candle_time
 
         is_long = s['direction'] == 'LONG'
-        badge = "🟢 15m SAF KIRILIM AL (Min %5 Mum)" if is_long else "🔴 15m SAF KIRILIM SAT (Min %5 Mum)"
+        badge = f"🟢 {TIMEFRAME} SAF KIRILIM AL (Min %{MIN_CANDLE_BODY_PCT} Mum)" if is_long else f"🔴 {TIMEFRAME} SAF KIRILIM SAT (Min %{MIN_CANDLE_BODY_PCT} Mum)"
         
         msg = (
             f"========================================\n"
             f"{badge}\n"
             f"Sembol: {sym.replace('USDT', '')}/USDT\n"
-            f"Zaman Dilimi: {TIMEFRAME} (3dk Tarama)\n"
+            f"Zaman Dilimi: {TIMEFRAME} (Tarama Aralığı: {SCAN_INTERVAL}s)\n"
             f"Fiyat: ${s['price']}\n"
             f"Mum Değişimi: %{s['candle_change']:.2f}\n"
             f"========================================"
@@ -180,7 +180,7 @@ def run_scanner():
         send_telegram_alert(msg)
 
 def main():
-    print(f"🚀 SAF KIRILIM TARAYICI AKTİF ({TIMEFRAME} - Her 3dk bir - Min %5 Gövde)")
+    print(f"🚀 SAF KIRILIM TARAYICI AKTİF (Zaman Dilimi: {TIMEFRAME} - Her {SCAN_INTERVAL}sn - Min %{MIN_CANDLE_BODY_PCT} Gövde)")
     while True:
         try:
             run_scanner()
