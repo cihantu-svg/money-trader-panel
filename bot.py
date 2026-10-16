@@ -1,192 +1,228 @@
 import os
 import time
+import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
-from requests.adapters import HTTPAdapter
 
-# ==============================================================================
-# YAPILANDIRMA (ENV Destekli Saf Kırılım Tarayıcı)
-# ==============================================================================
-TIMEFRAME = os.getenv("TIMEFRAME", "1m")                    
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))         # 3 dakika (180 saniye)
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", 8))               
-DEBUG_LOG = os.getenv("DEBUG_LOG", "false").lower() == "true"
+# ─────────────── AYARLAR (ENV'DEN OKUNUR) ───────────────
+SMA_LEN           = int(os.environ.get("SMA_LEN", 100))
+BODY_PCT          = float(os.environ.get("BODY_PCT", 5.0))          # sinyal mumu min gövde %
+MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
+TIMEFRAME         = os.environ.get("TIMEFRAME", "5m")
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))   # 3 dk
+MAX_WORKERS       = int(os.environ.get("MAX_WORKERS", 8))
 
-# Kırılım Parametreleri
-BO_LEN = 20                 
-BO_BUFFER_PCT = 0.5         
+VOL_MULT          = float(os.environ.get("VOL_MULT", 1.5))          # teyit mumu hacim çarpanı
+TAKER_BUY_MIN     = float(os.environ.get("TAKER_BUY_MIN", 0.55))    # AL için alıcı oranı
+NEAR_TOUCH_PCT    = float(os.environ.get("NEAR_TOUCH_PCT", 0.3))    # SMA'ya yakınlık %
 
-# GÜRÜLTÜ ENGELLEYİCİ: Kırılım mumu min gövde büyüklüğü (ENV'den okunur, varsayılan %5)
-MIN_CANDLE_BODY_PCT = float(os.getenv("MIN_CANDLE_BODY_PCT", 5.0))   
+WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", 1800))  # Binance limiti 2400/dk
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+BINANCE_FAPI      = "https://fapi.binance.com"
+TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
+TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
-API_BASE = "https://fapi.binance.com"
+KLINES_LIMIT      = SMA_LEN + 12
 
-session = requests.Session()
-session.mount("https://", HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS))
+http_session = requests.Session()
+son_sinyal = {}  # {symbol: teyit mumu open_time} -> aynı mumda tekrar göndermemek için
 
-# Aynı mum için tekrar bildirim gitmesini önlemek için hafıza: {symbol: open_time}
-last_alerted = {}
+block_lock = threading.Lock()
+blocked_until = 0.0
 
-def send_telegram_alert(message: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[Uyarı] TELEGRAM_TOKEN veya TELEGRAM_CHAT_ID ENV içinde bulunamadı!")
+
+def send_telegram(text):
+    if TELEGRAM_TOKEN == "BURAYA_TOKEN":
+        print(text, flush=True)
         return
-        
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
-        r = session.post(url, json=payload, timeout=5)
-        if r.status_code != 200:
-            print(f"[Telegram Hata] Kod: {r.status_code} - Yanıt: {r.text}")
-    except Exception as e:
-        print(f"[Hata] Telegram bildirimi gönderilemedi: {e}")
-
-def get_usdt_symbols():
-    try:
-        r = session.get(f"{API_BASE}/fapi/v1/exchangeInfo", timeout=15)
-        print(f"[Debug] Binance API Yanıt Kodu: {r.status_code}")
-        if r.status_code != 200:
-            print(f"[Hata Detayı] Yanıt İçeriği: {r.text[:300]}")
-            return []
-        data = r.json()
-        symbols = [
-            s["symbol"]
-            for s in data.get("symbols", [])
-            if s.get("quoteAsset") == "USDT"
-            and s.get("status") == "TRADING"
-            and s.get("contractType") == "PERPETUAL"
-        ]
-        print(f"[Debug] Toplam çekilen USDT perpetual sembol sayısı: {len(symbols)}")
-        return symbols
-    except Exception as e:
-        print(f"[Hata] Sembol listesi alınamadı: {e}")
-        return []
-
-def calculate_levels(df):
-    df = df.copy()
-    # Kırılım Seviyeleri (Önceki 20 mumun en yüksek ve en düşük değerleri)
-    df['resistance'] = df['high'].shift(1).rolling(window=BO_LEN).max()
-    df['support'] = df['low'].shift(1).rolling(window=BO_LEN).min()
-    return df
-
-def analyze_symbol(symbol: str):
-    try:
-        res = session.get(
-            f"{API_BASE}/fapi/v1/klines",
-            params={"symbol": symbol, "interval": TIMEFRAME, "limit": 30},
+        http_session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
             timeout=10,
         )
-        if res.status_code in (418, 429):
-            return None
-        if res.status_code != 200:
-            return None
+    except Exception as e:
+        print(f"Telegram hatasi: {e}", flush=True)
 
-        klines = res.json()
-        if not isinstance(klines, list) or len(klines) < 25:
-            return None
 
-        df = pd.DataFrame(klines, columns=[
-            'open_time', 'open', 'high', 'low', 'close', 'volume',
-            'close_time', 'quote_volume', 'trades', 'taker_buy_base',
-            'taker_buy_quote', 'ignore'
-        ]).iloc[:, :11].astype(float)
+def set_block(seconds, neden):
+    """Tüm thread'ler için ortak bekleme koyar (sadece uzatır, kısaltmaz)."""
+    global blocked_until
+    yeni = time.time() + seconds
+    with block_lock:
+        if yeni <= blocked_until:
+            return
+        blocked_until = yeni
+    print(f"⛔ Rate limit koruması: {neden} | {int(seconds)} sn bekleniyor", flush=True)
+    if neden in ("418", "429"):
+        send_telegram(f"⛔ Binance {neden} aldı, bot {int(seconds)} sn duruyor.")
 
-        now_ms = int(time.time() * 1000)
-        df = df[df["close_time"] < now_ms].reset_index(drop=True)
 
-        if len(df) < BO_LEN + 2:
-            return None
+def block_remaining():
+    return max(0.0, blocked_until - time.time())
 
-        df = calculate_levels(df)
-        
-        m1 = df.iloc[-2]  
-        m = df.iloc[-1]   
 
-        # --- 1. MUM BOYU / GÖVDE KONTROLÜ (ENV'den gelen Min Şart) ---
-        candle_change_pct = ((m['close'] - m['open']) / m['open']) * 100.0
-        abs_candle_change = abs(candle_change_pct)
-        
-        if abs_candle_change < MIN_CANDLE_BODY_PCT:
-            return None
+def api_get(path, params=None):
+    """Tüm Binance isteklerinin geçtiği tek nokta: 418/429 ve weight koruması burada."""
+    if block_remaining() > 0:
+        return None
+    try:
+        r = http_session.get(f"{BINANCE_FAPI}{path}", params=params, timeout=10)
+    except Exception as e:
+        print(f"İstek hatası: {e}", flush=True)
+        return None
 
-        # --- 2. SAF KIRILIM KOŞULLARI ---
-        resistance_target = m['resistance'] * (1 + BO_BUFFER_PCT / 100)
-        support_target = m['support'] * (1 - BO_BUFFER_PCT / 100)
+    if r.status_code in (418, 429):
+        retry_after = r.headers.get("Retry-After")
+        try:
+            bekleme = float(retry_after)
+        except (TypeError, ValueError):
+            bekleme = 300 if r.status_code == 418 else 60
+        set_block(bekleme + 5, str(r.status_code))
+        return None
 
-        breakout_up = m['close'] > resistance_target and m1['close'] <= m['resistance']
-        breakout_down = m['close'] < support_target and m1['close'] >= m['support']
+    # Limite yaklaşınca dakika sıfırlanana kadar dur (418'e düşmemek için)
+    used = r.headers.get("X-MBX-USED-WEIGHT-1M")
+    if used and used.isdigit() and int(used) >= WEIGHT_SOFT_LIMIT:
+        set_block(61 - (time.time() % 60), "weight")
 
-        if not (breakout_up or breakout_down):
-            return None
-
-        direction = "LONG" if breakout_up else "SHORT"
-
-        return {
-            "symbol": symbol,
-            "direction": direction,
-            "price": m['close'],
-            "candle_change": candle_change_pct,
-            "open_time": int(m['open_time'])
-        }
-
+    if r.status_code != 200:
+        return None
+    try:
+        return r.json()
     except Exception:
         return None
 
-def run_scanner():
-    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    symbols = get_usdt_symbols()
-    print(f"\n[{now} UTC] 🔍 Saf Kırılım Taraması Başlatıldı ({TIMEFRAME}) | Toplam Sembol: {len(symbols)}")
-    if not symbols:
+
+def touches_sma(row, prev_row, sma, prev_sma):
+    direct = row["low"] <= sma <= row["high"]
+    near = (abs(row["low"] - sma) / sma * 100 <= NEAR_TOUCH_PCT or
+            abs(row["high"] - sma) / sma * 100 <= NEAR_TOUCH_PCT)
+    bull_cross = prev_row["close"] < prev_sma and row["close"] > sma
+    bear_cross = prev_row["close"] > prev_sma and row["close"] < sma
+    return direct or near or bull_cross or bear_cross
+
+
+def check_symbol(symbol):
+    data = api_get("/fapi/v1/klines",
+                   {"symbol": symbol, "interval": TIMEFRAME, "limit": KLINES_LIMIT})
+    if not isinstance(data, list) or len(data) < SMA_LEN + 8:
+        return None
+
+    df = pd.DataFrame(data, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades",
+        "taker_buy_base", "taker_buy_quote", "ignore"
+    ])
+    for col in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
+        df[col] = df[col].astype(float)
+    df["sma"] = df["close"].rolling(SMA_LEN).mean()
+
+    # Son mum canlı -> at. Sadece KAPANMIŞ mumlarla çalış.
+    c = df.iloc[:-1].reset_index(drop=True)
+    B = c.iloc[-1]       # teyit mumu (son kapanan)
+    A = c.iloc[-2]       # sinyal mumu
+    prevA = c.iloc[-3]
+
+    if pd.isna(A["sma"]) or pd.isna(prevA["sma"]) or pd.isna(B["sma"]):
+        return None
+
+    # 1) Sinyal mumu: %5+ gövde + SMA100 teması
+    body_pct = abs(A["close"] - A["open"]) / A["open"] * 100
+    if body_pct < BODY_PCT:
+        return None
+    if not touches_sma(A, prevA, A["sma"], prevA["sma"]):
+        return None
+
+    yon = "AL" if A["close"] > A["open"] else "SAT"
+
+    # 2) Teyit mumu: SMA'nın doğru tarafında kapanış + hacim + taker oranı
+    baz_hacim = c["volume"].iloc[-22:-2].mean()  # sinyal mumundan önceki 20 mum
+    if baz_hacim <= 0 or B["volume"] <= 0:
+        return None
+    hacim_x = B["volume"] / baz_hacim
+    taker_buy = B["taker_buy_base"] / B["volume"]
+
+    if yon == "AL":
+        ok = (B["close"] > B["sma"] and hacim_x >= VOL_MULT and taker_buy >= TAKER_BUY_MIN)
+    else:
+        ok = (B["close"] < B["sma"] and hacim_x >= VOL_MULT and taker_buy <= (1 - TAKER_BUY_MIN))
+    if not ok:
+        return None
+
+    return {
+        "symbol": symbol,
+        "yon": yon,
+        "open_time": int(B["open_time"]),
+        "body_pct": body_pct,
+        "hacim_x": hacim_x,
+        "taker_buy": taker_buy,
+        "close": B["close"],
+        "sma": B["sma"],
+        "uzaklik": (B["close"] - B["sma"]) / B["sma"] * 100,
+    }
+
+
+def scan_once():
+    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Tarama başladı...", flush=True)
+
+    tickers = api_get("/fapi/v1/ticker/24hr")
+    if not isinstance(tickers, list):
+        print("Ticker alınamadı, tarama atlandı.", flush=True)
         return
 
-    detected_signals = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_symbol = {executor.submit(analyze_symbol, sym): sym for sym in symbols}
-        for future in as_completed(future_to_symbol):
-            res = future.result()
-            if res:
-                detected_signals.append(res)
+    semboller = [
+        d["symbol"] for d in tickers
+        if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME_USDT
+    ]
 
-    print(f"[Tamamlandı] Teyitli Sinyal Sayısı: {len(detected_signals)}")
+    bulunan = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(check_symbol, s): s for s in semboller}
+        for f in as_completed(futures):
+            symbol = futures[f]
+            try:
+                s = f.result()
+            except Exception as e:
+                print(f"{symbol} hata: {e}", flush=True)
+                continue
+            if not s:
+                continue
+            if son_sinyal.get(symbol) == s["open_time"]:
+                continue
+            son_sinyal[symbol] = s["open_time"]
+            bulunan += 1
 
-    for s in detected_signals:
-        sym = s["symbol"]
-        candle_time = s["open_time"]
+            ikon = "🟢" if s["yon"] == "AL" else "🔴"
+            send_telegram(
+                f"{ikon} <b>SMA{SMA_LEN} TEYİTLİ {s['yon']}</b>\n\n"
+                f"• <b>Sembol</b>: {s['symbol']}\n"
+                f"• <b>Sinyal mumu gövde</b>: %{s['body_pct']:.2f}\n"
+                f"• <b>Teyit hacmi</b>: {s['hacim_x']:.1f}x\n"
+                f"• <b>Alıcı oranı</b>: %{s['taker_buy'] * 100:.0f}\n"
+                f"• <b>Fiyat</b>: {s['close']}\n"
+                f"• <b>SMA{SMA_LEN}</b>: {s['sma']:.6f} (%{s['uzaklik']:+.2f})\n"
+                f"• <b>Zaman Dilimi</b>: {TIMEFRAME}"
+            )
+            print(f"[SİNYAL] {s['symbol']} {s['yon']}", flush=True)
 
-        # Mükerrer Bildirim Kontrolü
-        if last_alerted.get(sym) == candle_time:
-            continue
-        
-        last_alerted[sym] = candle_time
+    print(f"Tarama bitti. {bulunan} yeni sinyal.", flush=True)
 
-        is_long = s['direction'] == 'LONG'
-        badge = f"🟢 {TIMEFRAME} SAF KIRILIM AL (Min %{MIN_CANDLE_BODY_PCT} Mum)" if is_long else f"🔴 {TIMEFRAME} SAF KIRILIM SAT (Min %{MIN_CANDLE_BODY_PCT} Mum)"
-        
-        msg = (
-            f"========================================\n"
-            f"{badge}\n"
-            f"Sembol: {sym.replace('USDT', '')}/USDT\n"
-            f"Zaman Dilimi: {TIMEFRAME} (Tarama Aralığı: {SCAN_INTERVAL}s)\n"
-            f"Fiyat: ${s['price']}\n"
-            f"Mum Değişimi: %{s['candle_change']:.2f}\n"
-            f"========================================"
-        )
-        print(msg)
-        send_telegram_alert(msg)
 
 def main():
-    print(f"🚀 SAF KIRILIM TARAYICI AKTİF (Zaman Dilimi: {TIMEFRAME} - Her {SCAN_INTERVAL}sn - Min %{MIN_CANDLE_BODY_PCT} Gövde)")
+    print(f"Bot başlatıldı | TF={TIMEFRAME} | Aralık={SCAN_INTERVAL_SEC}sn", flush=True)
     while True:
+        baslangic = time.time()
         try:
-            run_scanner()
+            scan_once()
         except Exception as e:
-            print(f"[Hata] {e}")
-        time.sleep(SCAN_INTERVAL)
+            print(f"Genel hata: {e}", flush=True)
+        # Ban/limit varsa bitene kadar bekle, yoksa normal aralığı tamamla
+        bekle = max(SCAN_INTERVAL_SEC - (time.time() - baslangic), block_remaining(), 1)
+        time.sleep(bekle)
+
 
 if __name__ == "__main__":
     main()
