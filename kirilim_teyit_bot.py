@@ -45,6 +45,23 @@ block_lock = threading.Lock()
 blocked_until = 0.0
 
 
+def send_telegram_dosya(yol, aciklama=""):
+    if TELEGRAM_TOKEN == "BURAYA_TOKEN":
+        return False
+    try:
+        with open(yol, "rb") as f:
+            r = http_session.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": aciklama},
+                files={"document": f},
+                timeout=30,
+            )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"Telegram dosya hatasi: {e}", flush=True)
+        return False
+
+
 def send_telegram(text):
     if TELEGRAM_TOKEN == "BURAYA_TOKEN":
         print(text, flush=True)
@@ -318,6 +335,8 @@ def gecmis_test():
             print(f"   {r['zaman_utc']} UTC  {r['symbol']:<14} {r['yon']:<3} "
                   f"{int(r['sure_dk'])} dk'da | maks %{r['maks_kar_pct']:.1f} | önce düşüş %{r['once_maks_dusus_pct']:.1f}")
     print("\n  Tüm sinyaller: sinyal_listesi.csv dosyasına yazıldı.")
+    if send_telegram_dosya("sinyal_listesi.csv", f"Geçmiş test: {len(df)} sinyal"):
+        print("  CSV Telegram'a da gönderildi.")
 
 
 def scan_once():
