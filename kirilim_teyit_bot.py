@@ -36,6 +36,8 @@ KLINES_LIMIT      = 200  # RSI/MACD ısınması için
 # Geçmiş testi (python kirilim_teyit_bot.py test)
 TEST_LIMIT        = int(os.environ.get("TEST_LIMIT", 1000))    # kaç mum geriye bakılsın (1000 = ~3.5 gün)
 HEDEF_PCT         = float(os.environ.get("HEDEF_PCT", 10))     # hedef kâr %
+STOP_LISTESI     = [float(x) for x in os.environ.get("STOP_LISTESI", "3,5,7,10").split(",")]  # denenecek stop %'leri
+FEE_PCT           = float(os.environ.get("FEE_PCT", 0.1))      # işlem başı toplam komisyon+kayma tahmini %
 UFUK_MUM          = int(os.environ.get("UFUK_MUM", 144))       # girişten sonra kaç mumda hedef aranır (144 = 12 saat)
 
 http_session = requests.Session()
@@ -271,6 +273,27 @@ def ileri_sonuc(c, b_idx, yon, giris):
     }
 
 
+def simule(c, b_idx, yon, giris, stop_pct):
+    """Önce stop mu hedef mi? Aynı mumda ikisi de olursa temkinli: stop. Dönüş: (sonuç, net %)."""
+    ileri = c.iloc[b_idx + 1: b_idx + 1 + UFUK_MUM]
+    if len(ileri) == 0:
+        return "veri_yok", 0.0
+    h, l, cl = ileri["high"].tolist(), ileri["low"].tolist(), ileri["close"].tolist()
+    for i in range(len(ileri)):
+        if yon == "AL":
+            stop_oldu = l[i] <= giris * (1 - stop_pct / 100)
+            hedef_oldu = h[i] >= giris * (1 + HEDEF_PCT / 100)
+        else:
+            stop_oldu = h[i] >= giris * (1 + stop_pct / 100)
+            hedef_oldu = l[i] <= giris * (1 - HEDEF_PCT / 100)
+        if stop_oldu:
+            return "stop", -stop_pct - FEE_PCT
+        if hedef_oldu:
+            return "hedef", HEDEF_PCT - FEE_PCT
+    son = (cl[-1] / giris - 1) * 100
+    return "ufuk_sonu", (son if yon == "AL" else -son) - FEE_PCT
+
+
 def gecmis_test():
     """python kirilim_teyit_bot.py test -> geçmiş sinyalleri sayar ve %HEDEF_PCT kâra ulaşanları listeler."""
     tickers = api_get("/fapi/v1/ticker/24hr")
@@ -297,6 +320,10 @@ def gecmis_test():
                 sonuc.update(ileri_sonuc(c, a + 1, sonuc["yon"], sonuc["close"]) or
                              {"hedef_vurdu": False, "sure_dk": None, "maks_kar_pct": 0,
                               "once_maks_dusus_pct": 0, "ileri_mum": 0})
+                for sp in STOP_LISTESI:
+                    s_sonuc, s_net = simule(c, a + 1, sonuc["yon"], sonuc["close"], sp)
+                    sonuc[f"sonuc_stop{sp:g}"] = s_sonuc
+                    sonuc[f"net_stop{sp:g}"] = s_net
                 liste.append(sonuc)
         return yerel, liste
 
@@ -334,6 +361,13 @@ def gecmis_test():
         for _, r in vuran.iterrows():
             print(f"   {r['zaman_utc']} UTC  {r['symbol']:<14} {r['yon']:<3} "
                   f"{int(r['sure_dk'])} dk'da | maks %{r['maks_kar_pct']:.1f} | önce düşüş %{r['once_maks_dusus_pct']:.1f}")
+    if len(tam):
+        print(f"\n── Stop simülasyonu (hedef +%{HEDEF_PCT:g}, komisyon+kayma %{FEE_PCT:g}/işlem, aynı mumda ikisi olursa stop sayılır) ──")
+        print(f"  {'Stop':>5} | {'hedef':>5} | {'stop':>5} | {'ufuk':>5} | {'kazanan%':>8} | {'ort net%':>8} | {'toplam net%':>11}")
+        for sp in STOP_LISTESI:
+            sc, nt = tam[f"sonuc_stop{sp:g}"], tam[f"net_stop{sp:g}"]
+            print(f"  %{sp:>4g} | {(sc == 'hedef').sum():>5} | {(sc == 'stop').sum():>5} | {(sc == 'ufuk_sonu').sum():>5} | "
+                  f"{(nt > 0).mean() * 100:>7.0f}% | {nt.mean():>8.2f} | {nt.sum():>11.1f}")
     print("\n  Tüm sinyaller: sinyal_listesi.csv dosyasına yazıldı.")
     if send_telegram_dosya("sinyal_listesi.csv", f"Geçmiş test: {len(df)} sinyal"):
         print("  CSV Telegram'a da gönderildi.")
