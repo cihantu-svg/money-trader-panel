@@ -1,6 +1,7 @@
 import os
 import time
 import threading
+from collections import deque
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
@@ -24,8 +25,9 @@ TAKER_BUY_MIN     = float(os.environ.get("TAKER_BUY_MIN", 0.55))
 MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
 TIMEFRAME         = os.environ.get("TIMEFRAME", "5m")
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))   # 3 dk
-MAX_WORKERS       = int(os.environ.get("MAX_WORKERS", 8))
-WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", 1800))  # Binance limiti 2400/dk
+MAX_WORKERS       = int(os.environ.get("MAX_WORKERS", 4))
+WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", 1200))  # Binance limiti 2400/dk (IP başına)
+LOCAL_WEIGHT_LIMIT = int(os.environ.get("LOCAL_WEIGHT_LIMIT", 800))  # bu sürecin kendi dakikalık weight tavanı
 
 BINANCE_FAPI      = "https://fapi.binance.com"
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
@@ -79,32 +81,95 @@ def send_telegram(text):
         print(f"Telegram hatasi: {e}", flush=True)
 
 
+BAN_DOSYASI = os.environ.get("BAN_DOSYASI", "/tmp/binance_ban_until.txt")  # aynı makinedeki tüm süreçler paylaşır
+LIMIT_PENCERE_SN = 60
+son_bildirim = 0.0
+
+weight_log = deque()
+weight_lock = threading.Lock()
+
+
+def ban_dosyadan_oku():
+    try:
+        with open(BAN_DOSYASI) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
+
+
+def ban_dosyaya_yaz(bitis):
+    try:
+        gecici = BAN_DOSYASI + ".tmp"
+        with open(gecici, "w") as f:
+            f.write(str(bitis))
+        os.replace(gecici, BAN_DOSYASI)
+    except Exception as e:
+        print(f"Ban dosyası yazılamadı: {e}", flush=True)
+
+
 def set_block(seconds, neden):
-    """Tüm thread'ler için ortak bekleme koyar (sadece uzatır, kısaltmaz)."""
-    global blocked_until
+    """Tüm thread'ler ve aynı makinedeki tüm süreçler için ortak bekleme koyar (sadece uzatır)."""
+    global blocked_until, son_bildirim
     yeni = time.time() + seconds
     with block_lock:
-        if yeni <= blocked_until:
+        if yeni <= max(blocked_until, ban_dosyadan_oku()):
             return
         blocked_until = yeni
+        ban_dosyaya_yaz(yeni)
+        bildir = neden in ("418", "429") and time.time() - son_bildirim > 600
+        if bildir:
+            son_bildirim = time.time()
     print(f"⛔ Rate limit koruması: {neden} | {int(seconds)} sn bekleniyor", flush=True)
-    if neden in ("418", "429"):
-        send_telegram(f"⛔ Binance {neden} aldı, bot {int(seconds)} sn duruyor.")
+    if bildir:
+        send_telegram(f"⛔ Binance {neden} aldı, bot {int(seconds)} sn duruyor. (Bildirim 10 dk'da bir gelir)")
 
 
 def block_remaining():
-    return max(0.0, blocked_until - time.time())
+    return max(0.0, max(blocked_until, ban_dosyadan_oku()) - time.time())
+
+
+def klines_agirlik(limit):
+    if limit < 100:
+        return 1
+    if limit < 500:
+        return 2
+    if limit <= 1000:
+        return 5
+    return 10
+
+
+def yerel_limit(agirlik):
+    """Kendi sayacımız: son 60 sn'de LOCAL_WEIGHT_LIMIT'i aşmadan istek atılmasını sağlar."""
+    while True:
+        with weight_lock:
+            simdi = time.time()
+            while weight_log and simdi - weight_log[0][0] > LIMIT_PENCERE_SN:
+                weight_log.popleft()
+            toplam = sum(w for _, w in weight_log)
+            if not weight_log or toplam + agirlik <= LOCAL_WEIGHT_LIMIT:
+                weight_log.append((simdi, agirlik))
+                return
+            bekleme = LIMIT_PENCERE_SN - (simdi - weight_log[0][0]) + 0.1
+        time.sleep(max(bekleme, 0.2))
 
 
 def api_get(path, params=None, bekle=False):
-    """Tüm Binance istekleri buradan geçer: 418/429 ve weight koruması burada.
+    """Tüm Binance istekleri buradan geçer: kendi weight sayacı + 418/429 koruması.
     bekle=True (test modu): limit varsa atlamaz, bekleyip tekrar dener."""
+    if "ticker" in path:
+        agirlik = 40
+    elif params and "limit" in params:
+        agirlik = klines_agirlik(int(params["limit"]))
+    else:
+        agirlik = 1
+
     for _ in range(4 if bekle else 1):
         kalan = block_remaining()
         if kalan > 0:
             if not bekle:
                 return None
             time.sleep(kalan + 0.5)
+        yerel_limit(agirlik)
         try:
             r = http_session.get(f"{BINANCE_FAPI}{path}", params=params, timeout=15)
         except Exception as e:
