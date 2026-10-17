@@ -33,6 +33,11 @@ TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
 KLINES_LIMIT      = 200  # RSI/MACD ısınması için
 
+# Geçmiş testi (python kirilim_teyit_bot.py test)
+TEST_LIMIT        = int(os.environ.get("TEST_LIMIT", 1000))    # kaç mum geriye bakılsın (1000 = ~3.5 gün)
+HEDEF_PCT         = float(os.environ.get("HEDEF_PCT", 10))     # hedef kâr %
+UFUK_MUM          = int(os.environ.get("UFUK_MUM", 144))       # girişten sonra kaç mumda hedef aranır (144 = 12 saat)
+
 http_session = requests.Session()
 son_sinyal = {}  # {symbol: teyit mumu open_time}
 
@@ -143,9 +148,9 @@ def hesapla_kirilim(c):
     return yon, direnc, destek
 
 
-def klines_al(symbol):
+def klines_al(symbol, limit=KLINES_LIMIT):
     data = api_get("/fapi/v1/klines",
-                   {"symbol": symbol, "interval": TIMEFRAME, "limit": KLINES_LIMIT})
+                   {"symbol": symbol, "interval": TIMEFRAME, "limit": limit})
     if not isinstance(data, list) or len(data) < 80:
         return None
     df = pd.DataFrame(data, columns=[
@@ -217,8 +222,40 @@ def check_symbol(symbol):
     return sonuc
 
 
+def ileri_sonuc(c, b_idx, yon, giris):
+    """Girişten (teyit mumu kapanışı) sonraki UFUK_MUM mumda hedefe ulaşıldı mı?"""
+    ileri = c.iloc[b_idx + 1: b_idx + 1 + UFUK_MUM]
+    if len(ileri) == 0:
+        return None
+    if yon == "AL":
+        hedef = giris * (1 + HEDEF_PCT / 100)
+        vurdu = (ileri["high"] >= hedef).tolist()
+        maks_kar = ileri["high"].max() / giris - 1
+    else:
+        hedef = giris * (1 - HEDEF_PCT / 100)
+        vurdu = (ileri["low"] <= hedef).tolist()
+        maks_kar = 1 - ileri["low"].min() / giris
+    if True in vurdu:
+        k = vurdu.index(True)
+        once = ileri.iloc[:k]
+        sure_mum = k + 1
+    else:
+        once, sure_mum = ileri, None
+    if len(once) > 0:
+        maks_dusus = (1 - once["low"].min() / giris) if yon == "AL" else (once["high"].max() / giris - 1)
+    else:
+        maks_dusus = 0.0
+    return {
+        "hedef_vurdu": sure_mum is not None,
+        "sure_dk": sure_mum * 5 if sure_mum else None,
+        "maks_kar_pct": maks_kar * 100,
+        "once_maks_dusus_pct": max(maks_dusus, 0) * 100,
+        "ileri_mum": len(ileri),
+    }
+
+
 def gecmis_test():
-    """python kirilim_teyit_bot.py test  -> son 200 mumda kaç kırılım / teyit olmuş sayar."""
+    """python kirilim_teyit_bot.py test -> geçmiş sinyalleri sayar ve %HEDEF_PCT kâra ulaşanları listeler."""
     tickers = api_get("/fapi/v1/ticker/24hr")
     if not isinstance(tickers, list):
         print("Ticker alınamadı.")
@@ -228,28 +265,59 @@ def gecmis_test():
     toplam = {"yok": 0, "seviye_x": 0, "hacim_x": 0, "taker_x": 0, "ok": 0}
 
     def isle(sym):
-        c = klines_al(sym)
+        c = klines_al(sym, TEST_LIMIT)
         if c is None:
             return None
         yon_l, direnc, destek = hesapla_kirilim(c)
         yerel = dict.fromkeys(toplam, 0)
+        liste = []
         for a in range(30, len(c) - 1):
-            asama, _ = degerlendir(c, yon_l, direnc, destek, a)
+            asama, sonuc = degerlendir(c, yon_l, direnc, destek, a)
             yerel[asama] += 1
-        return yerel
+            if sonuc:
+                sonuc["symbol"] = sym
+                sonuc["zaman_utc"] = datetime.fromtimestamp(sonuc["open_time"] / 1000 + 300, timezone.utc).strftime("%m-%d %H:%M")
+                sonuc.update(ileri_sonuc(c, a + 1, sonuc["yon"], sonuc["close"]) or
+                             {"hedef_vurdu": False, "sure_dk": None, "maks_kar_pct": 0,
+                              "once_maks_dusus_pct": 0, "ileri_mum": 0})
+                liste.append(sonuc)
+        return yerel, liste
 
+    sinyaller = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for r in ex.map(isle, semboller):
             if r:
-                for k, v in r.items():
+                for k, v in r[0].items():
                     toplam[k] += v
+                sinyaller.extend(r[1])
 
     kirilim = sum(v for k, v in toplam.items() if k != "yok")
-    saat = KLINES_LIMIT * 5 / 60
+    saat = TEST_LIMIT * 5 / 60
     print(f"\n{len(semboller)} sembol, yaklaşık son {saat:.0f} saat:")
     print(f"  Kırılım mumu (A) sayısı : {kirilim}")
     print(f"  Teyitte elenen          : seviye {toplam['seviye_x']} | hacim {toplam['hacim_x']} | taker {toplam['taker_x']}")
     print(f"  Teyitli sinyal          : {toplam['ok']}")
+
+    if not sinyaller:
+        return
+    df = pd.DataFrame(sinyaller).sort_values("open_time")
+    df.to_csv("sinyal_listesi.csv", index=False)
+
+    tam = df[df["ileri_mum"] >= UFUK_MUM]   # tüm ufku görebilenler
+    eksik = len(df) - len(tam)
+    vuran = tam[tam["hedef_vurdu"]]
+    print(f"\n── %{HEDEF_PCT:g} hedef testi (giriş: teyit mumu kapanışı, ufuk: {UFUK_MUM * 5 // 60} saat) ──")
+    print(f"  Değerlendirilen sinyal : {len(tam)}  (ufku dolmayan {eksik} sinyal hariç)")
+    if len(tam):
+        print(f"  %{HEDEF_PCT:g}'e ulaşan         : {len(vuran)}  (%{len(vuran) / len(tam) * 100:.0f})")
+        print(f"  Ortalama maks. kâr     : %{tam['maks_kar_pct'].mean():.1f}")
+        print(f"  Hedefe giderken ortalama önce düşüş: %{vuran['once_maks_dusus_pct'].mean() if len(vuran) else 0:.1f}")
+    if len(vuran):
+        print("\n  ✅ Hedefe ulaşanlar:")
+        for _, r in vuran.iterrows():
+            print(f"   {r['zaman_utc']} UTC  {r['symbol']:<14} {r['yon']:<3} "
+                  f"{int(r['sure_dk'])} dk'da | maks %{r['maks_kar_pct']:.1f} | önce düşüş %{r['once_maks_dusus_pct']:.1f}")
+    print("\n  Tüm sinyaller: sinyal_listesi.csv dosyasına yazıldı.")
 
 
 def scan_once():
