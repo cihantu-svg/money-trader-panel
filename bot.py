@@ -8,13 +8,15 @@ import requests
 
 # ─────────────── AYARLAR ───────────────
 TIMEFRAME         = os.environ.get("TIMEFRAME", "5m")
-LOOK              = int(os.environ.get("LOOK", 30))                 # divergence penceresi (mum)
-DIV_MIN_PCT       = float(os.environ.get("DIV_MIN_PCT", 5.0))       # CVD açığı / pencere hacmi, %
-MIN_DELTA_USDT    = float(os.environ.get("MIN_DELTA_USDT", 150_000))  # tek mum net delta (USDT)
-DELTA_RATIO       = float(os.environ.get("DELTA_RATIO", 0.35))      # |delta| / hacim
-DELTA_X           = float(os.environ.get("DELTA_X", 3.0))           # normal |delta| ortalamasının kaç katı
+LOOK              = int(os.environ.get("LOOK", 60))
+DIV_MIN_PCT       = float(os.environ.get("DIV_MIN_PCT", 12.0))        # CVD açığı / pencere hacmi, %
+MIN_CVD_USDT      = float(os.environ.get("MIN_CVD_USDT", 500_000))    # YENİ: CVD açığı en az (USDT)
+MIN_MOVE_PCT      = float(os.environ.get("MIN_MOVE_PCT", 3.0))        # YENİ: pencere fiyat hareketi en az %
+MIN_DELTA_USDT    = float(os.environ.get("MIN_DELTA_USDT", 300_000))
+DELTA_RATIO       = float(os.environ.get("DELTA_RATIO", 0.35))
+DELTA_X           = float(os.environ.get("DELTA_X", 3.0))
 
-MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
+MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 10_000_000))
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
 MAX_WORKERS       = int(os.environ.get("MAX_WORKERS", 8))
 WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", 1800))
@@ -89,7 +91,6 @@ def api_get(path, params=None):
 
 
 def para(x):
-    """USDT'yi okunur yaz: 1.2M, 350K"""
     a = abs(x)
     s = f"{a/1e6:.2f}M" if a >= 1e6 else f"{a/1e3:.0f}K"
     return ("-" if x < 0 else "+") + s
@@ -108,15 +109,15 @@ def check_symbol(symbol):
     for col in ["open", "high", "low", "close", "quote_volume", "taker_buy_quote"]:
         df[col] = df[col].astype(float)
 
-    c = df.iloc[:-1].reset_index(drop=True)          # sadece kapanmış mumlar
-    delta = 2 * c["taker_buy_quote"] - c["quote_volume"]   # USDT cinsinden net delta
+    c = df.iloc[:-1].reset_index(drop=True)
+    delta = 2 * c["taker_buy_quote"] - c["quote_volume"]
     cvd = delta.cumsum()
     qv = c["quote_volume"]
     close = c["close"]
     ot = int(c["open_time"].iloc[-1])
     sonuc = []
 
-    # 1) CVD DIVERGENCE
+    # 1) CVD DIVERGENCE (yüzde + USDT + fiyat hareketi şartı)
     pencere_hacim = qv.iloc[-LOOK:].sum()
     onceki_close = close.iloc[-LOOK - 1:-1]
     onceki_cvd = cvd.iloc[-LOOK - 1:-1]
@@ -124,13 +125,15 @@ def check_symbol(symbol):
     if close.iloc[-1] >= onceki_close.max():
         acik = onceki_cvd.max() - cvd.iloc[-1]
         guc = acik / pencere_hacim * 100
-        if guc >= DIV_MIN_PCT:
-            sonuc.append(("ZAYIF YÜKSELİŞ", "🟠", ot, guc, acik))
+        hareket = (close.iloc[-1] - onceki_close.min()) / onceki_close.min() * 100
+        if guc >= DIV_MIN_PCT and acik >= MIN_CVD_USDT and hareket >= MIN_MOVE_PCT:
+            sonuc.append(("ZAYIF YÜKSELİŞ", "🟠", ot, guc, acik, hareket))
     elif close.iloc[-1] <= onceki_close.min():
         acik = cvd.iloc[-1] - onceki_cvd.min()
         guc = acik / pencere_hacim * 100
-        if guc >= DIV_MIN_PCT:
-            sonuc.append(("ZAYIF DÜŞÜŞ", "🔵", ot, guc, -acik))
+        hareket = (onceki_close.max() - close.iloc[-1]) / onceki_close.max() * 100
+        if guc >= DIV_MIN_PCT and acik >= MIN_CVD_USDT and hareket >= MIN_MOVE_PCT:
+            sonuc.append(("ZAYIF DÜŞÜŞ", "🔵", ot, guc, -acik, hareket))
 
     # 2) DELTA PATLAMASI
     d = delta.iloc[-1]
@@ -139,13 +142,13 @@ def check_symbol(symbol):
     if abs(d) >= MIN_DELTA_USDT and abs(oran) >= DELTA_RATIO and normal > 0 and abs(d) >= normal * DELTA_X:
         yon = "ALIM PATLAMASI" if d > 0 else "SATIŞ PATLAMASI"
         ikon = "🟢" if d > 0 else "🔴"
-        sonuc.append((yon, ikon, ot, abs(d) / normal, d))
+        sonuc.append((yon, ikon, ot, abs(d) / normal, d, None))
 
     out = []
-    for tip, ikon, ot_, guc, tutar in sonuc:
+    for tip, ikon, ot_, guc, tutar, hareket in sonuc:
         out.append({
             "symbol": symbol, "tip": tip, "ikon": ikon, "open_time": ot_,
-            "guc": guc, "tutar": tutar, "fiyat": close.iloc[-1],
+            "guc": guc, "tutar": tutar, "hareket": hareket, "fiyat": close.iloc[-1],
             "delta": d, "oran": oran, "cvd_son": cvd.iloc[-1] - cvd.iloc[-LOOK - 1],
         })
     return out
@@ -181,7 +184,8 @@ def scan_once():
                 if "PATLAMASI" in s["tip"]:
                     ozel = f"• <b>Net delta</b>: {para(s['tutar'])} USDT (normalin {s['guc']:.1f}x)\n"
                 else:
-                    ozel = (f"• <b>CVD açığı</b>: {para(s['tutar'])} USDT (pencere hacminin %{s['guc']:.1f}'i)\n")
+                    ozel = (f"• <b>CVD açığı</b>: {para(s['tutar'])} USDT (pencere hacminin %{s['guc']:.1f}'i)\n"
+                            f"• <b>Fiyat hareketi ({LOOK} mum)</b>: %{s['hareket']:.1f}\n")
 
                 send_telegram(
                     f"{s['ikon']} <b>{s['tip']}</b>\n\n"
