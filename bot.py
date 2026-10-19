@@ -1,88 +1,64 @@
-import os
-import time
-import threading
+import os, time, threading
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import requests
 
-# ─────────────── AYARLAR ───────────────
-TIMEFRAME         = os.environ.get("TIMEFRAME", "5m")
-LOOK              = int(os.environ.get("LOOK", 60))
-DIV_MIN_PCT       = float(os.environ.get("DIV_MIN_PCT", 12.0))        # CVD açığı / pencere hacmi, %
-MIN_CVD_USDT      = float(os.environ.get("MIN_CVD_USDT", 500_000))    # YENİ: CVD açığı en az (USDT)
-MIN_MOVE_PCT      = float(os.environ.get("MIN_MOVE_PCT", 3.0))        # YENİ: pencere fiyat hareketi en az %
-MIN_DELTA_USDT    = float(os.environ.get("MIN_DELTA_USDT", 300_000))
-DELTA_RATIO       = float(os.environ.get("DELTA_RATIO", 0.35))
-DELTA_X           = float(os.environ.get("DELTA_X", 3.0))
+TIMEFRAME     = os.environ.get("TIMEFRAME", "5m")
+LOOK          = int(os.environ.get("LOOK", 12))
+MIN_CVD_USDT  = float(os.environ.get("MIN_CVD_USDT", 5_000_000))  # 12 mumda net para (USDT)
+MIN_RATIO     = float(os.environ.get("MIN_RATIO", 20))            # net delta / hacim, %
+MIN_MOVE_PCT  = float(os.environ.get("MIN_MOVE_PCT", 1.0))        # fiyat hareketi, %
+MIN_VOL_PCT   = float(os.environ.get("MIN_VOL_PCT", 0.30))        # ort. mum boyu, %
+MIN_DAY_PCT   = float(os.environ.get("MIN_DAY_PCT", 5.0))         # net para / 24s hacim, %
+COOLDOWN_MIN  = int(os.environ.get("COOLDOWN_MIN", 60))
+MIN_VOLUME    = float(os.environ.get("MIN_VOLUME_USDT", 10_000_000))
+SCAN_SEC      = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
+WORKERS       = int(os.environ.get("MAX_WORKERS", 8))
 
-MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 10_000_000))
-SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
-MAX_WORKERS       = int(os.environ.get("MAX_WORKERS", 8))
-WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", 1800))
+API   = "https://fapi.binance.com"
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
+CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
-BINANCE_FAPI      = "https://fapi.binance.com"
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
-
-http_session = requests.Session()
-son_sinyal = {}
-block_lock = threading.Lock()
+http = requests.Session()
+son = {}
 blocked_until = 0.0
+lock = threading.Lock()
 
 
-def send_telegram(text):
-    if TELEGRAM_TOKEN == "BURAYA_TOKEN":
+def tg(text):
+    if TOKEN == "BURAYA_TOKEN":
         print(text, flush=True)
         return
     try:
-        r = http_session.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
+        r = http.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                      data={"chat_id": CHAT, "text": text, "parse_mode": "HTML"}, timeout=10)
         if r.status_code != 200:
             print(f"Telegram HATA {r.status_code}: {r.text}", flush=True)
     except Exception as e:
         print(f"Telegram hatasi: {e}", flush=True)
 
 
-def set_block(seconds, neden):
+def get(path, params=None):
     global blocked_until
-    yeni = time.time() + seconds
-    with block_lock:
-        if yeni <= blocked_until:
-            return
-        blocked_until = yeni
-    print(f"⛔ Rate limit koruması: {neden} | {int(seconds)} sn bekleniyor", flush=True)
-    if neden in ("418", "429"):
-        send_telegram(f"⛔ Binance {neden} aldı, bot {int(seconds)} sn duruyor.")
-
-
-def block_remaining():
-    return max(0.0, blocked_until - time.time())
-
-
-def api_get(path, params=None):
-    if block_remaining() > 0:
+    if time.time() < blocked_until:
         return None
     try:
-        r = http_session.get(f"{BINANCE_FAPI}{path}", params=params, timeout=10)
+        r = http.get(API + path, params=params, timeout=10)
     except Exception as e:
         print(f"İstek hatası: {e}", flush=True)
         return None
     if r.status_code in (418, 429):
         try:
-            bekleme = float(r.headers.get("Retry-After"))
+            w = float(r.headers.get("Retry-After"))
         except (TypeError, ValueError):
-            bekleme = 300 if r.status_code == 418 else 60
-        set_block(bekleme + 5, str(r.status_code))
+            w = 300 if r.status_code == 418 else 60
+        with lock:
+            blocked_until = max(blocked_until, time.time() + w + 5)
+        tg(f"⛔ Binance {r.status_code}, bot {int(w)} sn duruyor.")
         return None
-    used = r.headers.get("X-MBX-USED-WEIGHT-1M")
-    if used and used.isdigit() and int(used) >= WEIGHT_SOFT_LIMIT:
-        set_block(61 - (time.time() % 60), "weight")
     if r.status_code != 200:
-        print(f"API {r.status_code}: {r.text[:200]}", flush=True)
+        print(f"API {r.status_code}: {r.text[:150]}", flush=True)
         return None
     try:
         return r.json()
@@ -92,125 +68,81 @@ def api_get(path, params=None):
 
 def para(x):
     a = abs(x)
-    s = f"{a/1e6:.2f}M" if a >= 1e6 else f"{a/1e3:.0f}K"
-    return ("-" if x < 0 else "+") + s
+    return ("-" if x < 0 else "+") + (f"{a/1e6:.2f}M" if a >= 1e6 else f"{a/1e3:.0f}K")
 
 
-def check_symbol(symbol):
-    data = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": TIMEFRAME, "limit": 200})
-    if not isinstance(data, list) or len(data) < LOOK + 30:
-        return []
+def check(item):
+    symbol, gun_hacim = item
+    data = get("/fapi/v1/klines", {"symbol": symbol, "interval": TIMEFRAME, "limit": 55})
+    if not isinstance(data, list) or len(data) < LOOK + 2:
+        return None
+    df = pd.DataFrame(data).iloc[:-1]            # canlı mumu at
+    high = df[2].astype(float)
+    low = df[3].astype(float)
+    close = df[4].astype(float)
+    qv = df[7].astype(float)
+    buy = df[10].astype(float)
+    delta = 2 * buy - qv
 
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
-    for col in ["open", "high", "low", "close", "quote_volume", "taker_buy_quote"]:
-        df[col] = df[col].astype(float)
+    net = delta.iloc[-LOOK:].sum()
+    hacim = qv.iloc[-LOOK:].sum()
+    son3 = delta.iloc[-3:].sum()
+    hareket = (close.iloc[-1] / close.iloc[-LOOK - 1] - 1) * 100
+    oran = net / hacim * 100 if hacim > 0 else 0
+    vol_pct = ((high - low) / close).mean() * 100
+    gun_pct = net / gun_hacim * 100 if gun_hacim > 0 else 0
 
-    c = df.iloc[:-1].reset_index(drop=True)
-    delta = 2 * c["taker_buy_quote"] - c["quote_volume"]
-    cvd = delta.cumsum()
-    qv = c["quote_volume"]
-    close = c["close"]
-    ot = int(c["open_time"].iloc[-1])
-    sonuc = []
+    if vol_pct < MIN_VOL_PCT or abs(gun_pct) < MIN_DAY_PCT:
+        return None
 
-    # 1) CVD DIVERGENCE (yüzde + USDT + fiyat hareketi şartı)
-    pencere_hacim = qv.iloc[-LOOK:].sum()
-    onceki_close = close.iloc[-LOOK - 1:-1]
-    onceki_cvd = cvd.iloc[-LOOK - 1:-1]
-
-    if close.iloc[-1] >= onceki_close.max():
-        acik = onceki_cvd.max() - cvd.iloc[-1]
-        guc = acik / pencere_hacim * 100
-        hareket = (close.iloc[-1] - onceki_close.min()) / onceki_close.min() * 100
-        if guc >= DIV_MIN_PCT and acik >= MIN_CVD_USDT and hareket >= MIN_MOVE_PCT:
-            sonuc.append(("ZAYIF YÜKSELİŞ", "🟠", ot, guc, acik, hareket))
-    elif close.iloc[-1] <= onceki_close.min():
-        acik = cvd.iloc[-1] - onceki_cvd.min()
-        guc = acik / pencere_hacim * 100
-        hareket = (onceki_close.max() - close.iloc[-1]) / onceki_close.max() * 100
-        if guc >= DIV_MIN_PCT and acik >= MIN_CVD_USDT and hareket >= MIN_MOVE_PCT:
-            sonuc.append(("ZAYIF DÜŞÜŞ", "🔵", ot, guc, -acik, hareket))
-
-    # 2) DELTA PATLAMASI
-    d = delta.iloc[-1]
-    oran = d / qv.iloc[-1] if qv.iloc[-1] > 0 else 0
-    normal = delta.iloc[-21:-1].abs().mean()
-    if abs(d) >= MIN_DELTA_USDT and abs(oran) >= DELTA_RATIO and normal > 0 and abs(d) >= normal * DELTA_X:
-        yon = "ALIM PATLAMASI" if d > 0 else "SATIŞ PATLAMASI"
-        ikon = "🟢" if d > 0 else "🔴"
-        sonuc.append((yon, ikon, ot, abs(d) / normal, d, None))
-
-    out = []
-    for tip, ikon, ot_, guc, tutar, hareket in sonuc:
-        out.append({
-            "symbol": symbol, "tip": tip, "ikon": ikon, "open_time": ot_,
-            "guc": guc, "tutar": tutar, "hareket": hareket, "fiyat": close.iloc[-1],
-            "delta": d, "oran": oran, "cvd_son": cvd.iloc[-1] - cvd.iloc[-LOOK - 1],
-        })
-    return out
+    if net >= MIN_CVD_USDT and oran >= MIN_RATIO and hareket >= MIN_MOVE_PCT and son3 > 0:
+        yon = "AL"
+    elif net <= -MIN_CVD_USDT and oran <= -MIN_RATIO and hareket <= -MIN_MOVE_PCT and son3 < 0:
+        yon = "SAT"
+    else:
+        return None
+    return dict(symbol=symbol, yon=yon, net=net, oran=oran, hareket=hareket,
+                son3=son3, fiyat=close.iloc[-1], vol_pct=vol_pct, gun_pct=gun_pct)
 
 
-def scan_once():
-    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Tarama başladı...", flush=True)
-    tickers = api_get("/fapi/v1/ticker/24hr")
-    if not isinstance(tickers, list):
-        print("Ticker alınamadı, tarama atlandı.", flush=True)
+def scan():
+    print(f"\n[{datetime.now(timezone.utc):%H:%M:%S}] Tarama...", flush=True)
+    t = get("/fapi/v1/ticker/24hr")
+    if not isinstance(t, list):
         return
-
-    semboller = [d["symbol"] for d in tickers
-                 if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME_USDT]
-
-    bulunan = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(check_symbol, s): s for s in semboller}
-        for f in as_completed(futures):
-            symbol = futures[f]
-            try:
-                liste = f.result()
-            except Exception as e:
-                print(f"{symbol} hata: {e}", flush=True)
-                continue
-            for s in liste:
-                key = (symbol, s["tip"])
-                if son_sinyal.get(key) == s["open_time"]:
-                    continue
-                son_sinyal[key] = s["open_time"]
-                bulunan += 1
-
-                if "PATLAMASI" in s["tip"]:
-                    ozel = f"• <b>Net delta</b>: {para(s['tutar'])} USDT (normalin {s['guc']:.1f}x)\n"
-                else:
-                    ozel = (f"• <b>CVD açığı</b>: {para(s['tutar'])} USDT (pencere hacminin %{s['guc']:.1f}'i)\n"
-                            f"• <b>Fiyat hareketi ({LOOK} mum)</b>: %{s['hareket']:.1f}\n")
-
-                send_telegram(
-                    f"{s['ikon']} <b>{s['tip']}</b>\n\n"
-                    f"• <b>Sembol</b>: {symbol}\n"
-                    f"{ozel}"
-                    f"• <b>Son mum delta</b>: {para(s['delta'])} USDT (%{s['oran']*100:+.0f})\n"
-                    f"• <b>CVD ({LOOK} mum)</b>: {para(s['cvd_son'])} USDT\n"
-                    f"• <b>Fiyat</b>: {s['fiyat']}\n"
-                    f"• <b>Zaman Dilimi</b>: {TIMEFRAME}"
-                )
-                print(f"[SİNYAL] {symbol} {s['tip']}", flush=True)
-
-    print(f"Tarama bitti. {len(semboller)} sembol | {bulunan} yeni sinyal.", flush=True)
+    items = [(d["symbol"], float(d["quoteVolume"])) for d in t
+             if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME]
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        sonuclar = list(ex.map(check, items))
+    n = 0
+    for s in filter(None, sonuclar):
+        key = (s["symbol"], s["yon"])
+        if time.time() - son.get(key, 0) < COOLDOWN_MIN * 60:
+            continue
+        son[key] = time.time()
+        n += 1
+        ikon = "🟢" if s["yon"] == "AL" else "🔴"
+        tg(f"{ikon} <b>PARA AKIŞI {s['yon']}</b>\n\n"
+           f"• <b>Sembol</b>: {s['symbol']}\n"
+           f"• <b>Net para ({LOOK} mum)</b>: {para(s['net'])} USDT (hacmin %{s['oran']:+.0f}'i)\n"
+           f"• <b>Günlük hacme oranı</b>: %{s['gun_pct']:+.1f}\n"
+           f"• <b>Son 3 mum</b>: {para(s['son3'])} USDT\n"
+           f"• <b>Fiyat hareketi</b>: %{s['hareket']:+.1f}\n"
+           f"• <b>Oynaklık (mum boyu)</b>: %{s['vol_pct']:.2f}\n"
+           f"• <b>Fiyat</b>: {s['fiyat']}\n"
+           f"• <b>TF</b>: {TIMEFRAME}")
+    print(f"{len(items)} sembol | {n} sinyal", flush=True)
 
 
 def main():
-    print(f"Delta/CVD botu başladı | TF={TIMEFRAME} | LOOK={LOOK}", flush=True)
-    send_telegram("✅ Delta/CVD botu başlatıldı.")
+    tg("✅ Para akışı botu başladı.")
     while True:
         t0 = time.time()
         try:
-            scan_once()
+            scan()
         except Exception as e:
             print(f"Genel hata: {e}", flush=True)
-        time.sleep(max(SCAN_INTERVAL_SEC - (time.time() - t0), block_remaining(), 1))
+        time.sleep(max(SCAN_SEC - (time.time() - t0), 1))
 
 
 if __name__ == "__main__":
