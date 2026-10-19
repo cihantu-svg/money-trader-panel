@@ -5,10 +5,14 @@ import pandas as pd
 import requests
 
 TIMEFRAME    = os.environ.get("TIMEFRAME", "5m")
-LOOK         = int(os.environ.get("LOOK", 6))                # 6 mum = 30 dk
-KAT          = float(os.environ.get("KAT", 3.0))             # net para, normalin kaç katı
-MIN_OI_PCT   = float(os.environ.get("MIN_OI_PCT", 0.5))      # OI artışı, %
-MIN_MOVE_PCT = float(os.environ.get("MIN_MOVE_PCT", 0.3))    # fiyat hareketi, %
+LOOK         = int(os.environ.get("LOOK", 6))                 # 6 mum = 30 dk
+KAT          = float(os.environ.get("KAT", 5.0))              # net para, normalin kaç katı
+MIN_OI_PCT   = float(os.environ.get("MIN_OI_PCT", 1.5))       # OI artışı, %
+MIN_MOVE_PCT = float(os.environ.get("MIN_MOVE_PCT", 0.8))     # fiyat hareketi, %
+SMA_LEN      = int(os.environ.get("SMA_LEN", 100))
+MAX_SMA_PCT  = float(os.environ.get("MAX_SMA_PCT", 3.0))      # SMA'ya max uzaklık, %
+KIR_ZORUNLU  = int(os.environ.get("KIR_ZORUNLU", 1))          # 1: SMA kırılımı şart
+KIR_BAR      = int(os.environ.get("KIR_BAR", 12))             # kırılım kaç mum içinde olsun
 COOLDOWN_MIN = int(os.environ.get("COOLDOWN_MIN", 60))
 MIN_VOLUME   = float(os.environ.get("MIN_VOLUME_USDT", 10_000_000))
 SCAN_SEC     = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
@@ -68,16 +72,17 @@ def para(x):
 
 
 def check(symbol):
-    data = get("/fapi/v1/klines", {"symbol": symbol, "interval": TIMEFRAME, "limit": 120})
-    if not isinstance(data, list) or len(data) < LOOK * 4:
+    data = get("/fapi/v1/klines", {"symbol": symbol, "interval": TIMEFRAME, "limit": 200})
+    if not isinstance(data, list) or len(data) < SMA_LEN + KIR_BAR + 2:
         return None
     df = pd.DataFrame(data).iloc[:-1]                 # canlı mumu at
-    close = df[4].astype(float)
-    delta = 2 * df[10].astype(float) - df[7].astype(float)   # USDT net delta
+    close = df[4].astype(float).reset_index(drop=True)
+    delta = (2 * df[10].astype(float) - df[7].astype(float)).reset_index(drop=True)
 
-    toplam = delta.rolling(LOOK).sum()                # her an için LOOK mumluk net para
+    # 1) Net para: coinin kendi normaline göre kaç kat
+    toplam = delta.rolling(LOOK).sum()
     net = toplam.iloc[-1]
-    normal = toplam.iloc[:-LOOK].abs().mean()         # coinin kendi normal akışı
+    normal = toplam.iloc[:-LOOK].abs().mean()
     if not normal or normal <= 0:
         return None
     kat = abs(net) / normal
@@ -92,7 +97,22 @@ def check(symbol):
     if kat < KAT:
         return None
 
-    # Son filtre: yeni para giriyor mu (OI). Sadece adaylar için sorulur.
+    # 2) SMA100: yakınlık + kırılım
+    sma = close.rolling(SMA_LEN).mean()
+    fark = (close.iloc[-1] / sma.iloc[-1] - 1) * 100
+    if abs(fark) > MAX_SMA_PCT:
+        return None
+    if KIR_ZORUNLU:
+        onceki_c = close.iloc[-KIR_BAR - 1:-1]
+        onceki_s = sma.iloc[-KIR_BAR - 1:-1]
+        if yon == "AL":
+            kirdi = close.iloc[-1] > sma.iloc[-1] and (onceki_c < onceki_s).any()
+        else:
+            kirdi = close.iloc[-1] < sma.iloc[-1] and (onceki_c > onceki_s).any()
+        if not kirdi:
+            return None
+
+    # 3) OI: yeni para giriyor mu (sadece adaylar için sorulur)
     oi = get("/futures/data/openInterestHist",
              {"symbol": symbol, "period": TIMEFRAME, "limit": LOOK + 1})
     if not isinstance(oi, list) or len(oi) < LOOK + 1:
@@ -106,7 +126,7 @@ def check(symbol):
         return None
 
     return dict(symbol=symbol, yon=yon, net=net, kat=kat, hareket=hareket,
-                oi=oi_pct, fiyat=close.iloc[-1])
+                oi=oi_pct, fark=fark, fiyat=close.iloc[-1])
 
 
 def scan():
@@ -131,6 +151,7 @@ def scan():
            f"• <b>Net para ({LOOK} mum)</b>: {para(s['net'])} USDT\n"
            f"• <b>Normalin katı</b>: {s['kat']:.1f}x\n"
            f"• <b>Open interest</b>: %{s['oi']:+.1f}\n"
+           f"• <b>SMA{SMA_LEN} uzaklık</b>: %{s['fark']:+.2f}\n"
            f"• <b>Fiyat hareketi</b>: %{s['hareket']:+.2f}\n"
            f"• <b>Fiyat</b>: {s['fiyat']}\n"
            f"• <b>TF</b>: {TIMEFRAME}")
@@ -138,7 +159,7 @@ def scan():
 
 
 def main():
-    tg("✅ Para akışı botu (sade sürüm) başladı.")
+    tg("✅ Para akışı botu (SMA100 filtreli) başladı.")
     while True:
         t0 = time.time()
         try:
