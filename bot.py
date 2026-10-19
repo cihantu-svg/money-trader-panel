@@ -1,20 +1,18 @@
-import os, time, threading
+import os, time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 import requests
 
-TIMEFRAME     = os.environ.get("TIMEFRAME", "5m")
-LOOK          = int(os.environ.get("LOOK", 12))
-MIN_CVD_USDT  = float(os.environ.get("MIN_CVD_USDT", 5_000_000))  # 12 mumda net para (USDT)
-MIN_RATIO     = float(os.environ.get("MIN_RATIO", 20))            # net delta / hacim, %
-MIN_MOVE_PCT  = float(os.environ.get("MIN_MOVE_PCT", 1.0))        # fiyat hareketi, %
-MIN_VOL_PCT   = float(os.environ.get("MIN_VOL_PCT", 0.30))        # ort. mum boyu, %
-MIN_DAY_PCT   = float(os.environ.get("MIN_DAY_PCT", 5.0))         # net para / 24s hacim, %
-COOLDOWN_MIN  = int(os.environ.get("COOLDOWN_MIN", 60))
-MIN_VOLUME    = float(os.environ.get("MIN_VOLUME_USDT", 10_000_000))
-SCAN_SEC      = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
-WORKERS       = int(os.environ.get("MAX_WORKERS", 8))
+TIMEFRAME    = os.environ.get("TIMEFRAME", "5m")
+LOOK         = int(os.environ.get("LOOK", 6))                # 6 mum = 30 dk
+KAT          = float(os.environ.get("KAT", 3.0))             # net para, normalin kaç katı
+MIN_OI_PCT   = float(os.environ.get("MIN_OI_PCT", 0.5))      # OI artışı, %
+MIN_MOVE_PCT = float(os.environ.get("MIN_MOVE_PCT", 0.3))    # fiyat hareketi, %
+COOLDOWN_MIN = int(os.environ.get("COOLDOWN_MIN", 60))
+MIN_VOLUME   = float(os.environ.get("MIN_VOLUME_USDT", 10_000_000))
+SCAN_SEC     = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
+WORKERS      = int(os.environ.get("MAX_WORKERS", 6))
 
 API   = "https://fapi.binance.com"
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
@@ -23,7 +21,6 @@ CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 http = requests.Session()
 son = {}
 blocked_until = 0.0
-lock = threading.Lock()
 
 
 def tg(text):
@@ -53,8 +50,7 @@ def get(path, params=None):
             w = float(r.headers.get("Retry-After"))
         except (TypeError, ValueError):
             w = 300 if r.status_code == 418 else 60
-        with lock:
-            blocked_until = max(blocked_until, time.time() + w + 5)
+        blocked_until = max(blocked_until, time.time() + w + 5)
         tg(f"⛔ Binance {r.status_code}, bot {int(w)} sn duruyor.")
         return None
     if r.status_code != 200:
@@ -71,38 +67,46 @@ def para(x):
     return ("-" if x < 0 else "+") + (f"{a/1e6:.2f}M" if a >= 1e6 else f"{a/1e3:.0f}K")
 
 
-def check(item):
-    symbol, gun_hacim = item
-    data = get("/fapi/v1/klines", {"symbol": symbol, "interval": TIMEFRAME, "limit": 55})
-    if not isinstance(data, list) or len(data) < LOOK + 2:
+def check(symbol):
+    data = get("/fapi/v1/klines", {"symbol": symbol, "interval": TIMEFRAME, "limit": 120})
+    if not isinstance(data, list) or len(data) < LOOK * 4:
         return None
-    df = pd.DataFrame(data).iloc[:-1]            # canlı mumu at
-    high = df[2].astype(float)
-    low = df[3].astype(float)
+    df = pd.DataFrame(data).iloc[:-1]                 # canlı mumu at
     close = df[4].astype(float)
-    qv = df[7].astype(float)
-    buy = df[10].astype(float)
-    delta = 2 * buy - qv
+    delta = 2 * df[10].astype(float) - df[7].astype(float)   # USDT net delta
 
-    net = delta.iloc[-LOOK:].sum()
-    hacim = qv.iloc[-LOOK:].sum()
-    son3 = delta.iloc[-3:].sum()
-    hareket = (close.iloc[-1] / close.iloc[-LOOK - 1] - 1) * 100
-    oran = net / hacim * 100 if hacim > 0 else 0
-    vol_pct = ((high - low) / close).mean() * 100
-    gun_pct = net / gun_hacim * 100 if gun_hacim > 0 else 0
-
-    if vol_pct < MIN_VOL_PCT or abs(gun_pct) < MIN_DAY_PCT:
+    toplam = delta.rolling(LOOK).sum()                # her an için LOOK mumluk net para
+    net = toplam.iloc[-1]
+    normal = toplam.iloc[:-LOOK].abs().mean()         # coinin kendi normal akışı
+    if not normal or normal <= 0:
         return None
+    kat = abs(net) / normal
+    hareket = (close.iloc[-1] / close.iloc[-LOOK - 1] - 1) * 100
 
-    if net >= MIN_CVD_USDT and oran >= MIN_RATIO and hareket >= MIN_MOVE_PCT and son3 > 0:
+    if net > 0 and hareket >= MIN_MOVE_PCT:
         yon = "AL"
-    elif net <= -MIN_CVD_USDT and oran <= -MIN_RATIO and hareket <= -MIN_MOVE_PCT and son3 < 0:
+    elif net < 0 and hareket <= -MIN_MOVE_PCT:
         yon = "SAT"
     else:
         return None
-    return dict(symbol=symbol, yon=yon, net=net, oran=oran, hareket=hareket,
-                son3=son3, fiyat=close.iloc[-1], vol_pct=vol_pct, gun_pct=gun_pct)
+    if kat < KAT:
+        return None
+
+    # Son filtre: yeni para giriyor mu (OI). Sadece adaylar için sorulur.
+    oi = get("/futures/data/openInterestHist",
+             {"symbol": symbol, "period": TIMEFRAME, "limit": LOOK + 1})
+    if not isinstance(oi, list) or len(oi) < LOOK + 1:
+        return None
+    oi_ilk = float(oi[0]["sumOpenInterestValue"])
+    oi_son = float(oi[-1]["sumOpenInterestValue"])
+    if oi_ilk <= 0:
+        return None
+    oi_pct = (oi_son / oi_ilk - 1) * 100
+    if oi_pct < MIN_OI_PCT:
+        return None
+
+    return dict(symbol=symbol, yon=yon, net=net, kat=kat, hareket=hareket,
+                oi=oi_pct, fiyat=close.iloc[-1])
 
 
 def scan():
@@ -110,10 +114,10 @@ def scan():
     t = get("/fapi/v1/ticker/24hr")
     if not isinstance(t, list):
         return
-    items = [(d["symbol"], float(d["quoteVolume"])) for d in t
-             if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME]
+    semboller = [d["symbol"] for d in t
+                 if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME]
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        sonuclar = list(ex.map(check, items))
+        sonuclar = list(ex.map(check, semboller))
     n = 0
     for s in filter(None, sonuclar):
         key = (s["symbol"], s["yon"])
@@ -124,18 +128,17 @@ def scan():
         ikon = "🟢" if s["yon"] == "AL" else "🔴"
         tg(f"{ikon} <b>PARA AKIŞI {s['yon']}</b>\n\n"
            f"• <b>Sembol</b>: {s['symbol']}\n"
-           f"• <b>Net para ({LOOK} mum)</b>: {para(s['net'])} USDT (hacmin %{s['oran']:+.0f}'i)\n"
-           f"• <b>Günlük hacme oranı</b>: %{s['gun_pct']:+.1f}\n"
-           f"• <b>Son 3 mum</b>: {para(s['son3'])} USDT\n"
-           f"• <b>Fiyat hareketi</b>: %{s['hareket']:+.1f}\n"
-           f"• <b>Oynaklık (mum boyu)</b>: %{s['vol_pct']:.2f}\n"
+           f"• <b>Net para ({LOOK} mum)</b>: {para(s['net'])} USDT\n"
+           f"• <b>Normalin katı</b>: {s['kat']:.1f}x\n"
+           f"• <b>Open interest</b>: %{s['oi']:+.1f}\n"
+           f"• <b>Fiyat hareketi</b>: %{s['hareket']:+.2f}\n"
            f"• <b>Fiyat</b>: {s['fiyat']}\n"
            f"• <b>TF</b>: {TIMEFRAME}")
-    print(f"{len(items)} sembol | {n} sinyal", flush=True)
+    print(f"{len(semboller)} sembol | {n} sinyal", flush=True)
 
 
 def main():
-    tg("✅ Para akışı botu başladı.")
+    tg("✅ Para akışı botu (sade sürüm) başladı.")
     while True:
         t0 = time.time()
         try:
