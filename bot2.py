@@ -1,10 +1,16 @@
 import os
+import csv
 import time
 import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import requests
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 # ─────────────── AYARLAR (ENV'DEN OKUNUR) ───────────────
 SMA_LEN          = int(os.environ.get("SMA_LEN", 100))
@@ -15,22 +21,36 @@ TIMEFRAME        = os.environ.get("TIMEFRAME", "15m")
 SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))
 MAX_WORKERS       = 15
 
+# Gün sonu raporu ayarları
+REPORT_HOUR       = int(os.environ.get("REPORT_HOUR", 21))     # 21 = akşam 9
+REPORT_MINUTE     = int(os.environ.get("REPORT_MINUTE", 0))
+REPORT_TZ         = os.environ.get("REPORT_TZ", "Europe/London")
+SIGNALS_FILE      = os.environ.get("SIGNALS_FILE", "signals.csv")
+
 BINANCE_FAPI      = "https://fapi.binance.com"
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
 KLINES_LIMIT      = SMA_LEN + 10
 
+try:
+    TZ = ZoneInfo(REPORT_TZ) if ZoneInfo else timezone.utc
+except Exception:
+    TZ = timezone.utc
+
 http_session = requests.Session()
 
-# Takip sözlükleri: Hangi sembolün hangi mumda ilk sinyal veya devam sinyali aldığını tutar
 ilk_sinyal_takibi = {}    # {symbol: open_time}
 devam_sinyal_takibi = {}  # {symbol: set(open_time)}
 
 rate_limit_lock = threading.Lock()
 rate_limited_until = 0.0
 
+csv_lock = threading.Lock()
+son_rapor_tarihi = None
 
+
+# ─────────────── TELEGRAM ───────────────
 def send_telegram(text):
     if TELEGRAM_TOKEN == "BURAYA_TOKEN":
         return
@@ -44,172 +64,192 @@ def send_telegram(text):
         print(f"Telegram hatasi: {e}", flush=True)
 
 
-def wait_if_rate_limited():
-    global rate_limited_until
-    now = time.time()
-    if now < rate_limited_until:
-        time.sleep(rate_limited_until - now)
-
-
-def check_symbol(symbol):
-    global rate_limited_until
-    wait_if_rate_limited()
-
-    url = f"{BINANCE_FAPI}/fapi/v1/klines"
-    params = {"symbol": symbol, "interval": TIMEFRAME, "limit": KLINES_LIMIT}
+def send_telegram_file(path, caption=""):
+    if TELEGRAM_TOKEN == "BURAYA_TOKEN":
+        return
     try:
-        r = http_session.get(url, params=params, timeout=10)
+        with open(path, "rb") as f:
+            http_session.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+                data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption},
+                files={"document": f},
+                timeout=30,
+            )
     except Exception as e:
-        print(f"[{symbol}] Istek hatasi: {e}", flush=True)
-        return None
+        print(f"Telegram dosya hatasi: {e}", flush=True)
 
-    if r.status_code in (429, 418):
-        retry_after = r.headers.get("Retry-After")
-        bekleme = float(retry_after) if retry_after else (30 if r.status_code == 429 else 120)
-        with rate_limit_lock:
-            yeni_bitis = time.time() + bekleme
-            if yeni_bitis > rate_limited_until:
-                rate_limited_until = yeni_bitis
-        return None
 
+# ─────────────── SİNYAL KAYDI (CSV) ───────────────
+SIGNAL_COLS = ["ts_ms", "open_time", "sembol", "tip", "yon", "govde_pct", "giris_fiyat", "sma"]
+
+
+def log_signal(sonuc):
+    """Her sinyali signals.csv'ye ekler."""
+    with csv_lock:
+        yeni = not os.path.exists(SIGNALS_FILE)
+        with open(SIGNALS_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if yeni:
+                w.writerow(SIGNAL_COLS)
+            w.writerow([
+                int(time.time() * 1000),
+                sonuc["open_time"],
+                sonuc["symbol"],
+                sonuc["tip"],
+                "LONG" if "YÜKSELEN" in sonuc["direction"] else "SHORT",
+                round(sonuc["body_pct"], 4),
+                sonuc["close"],
+                sonuc["sma100"],
+            ])
+
+
+# ─────────────── GÜN SONU RAPORU ───────────────
+def rapor_dosya_adi(tarih):
+    return f"gun_sonu_{tarih.strftime('%Y-%m-%d')}.csv"
+
+
+def sinyal_sonrasi_extremler(symbol, open_time):
+    """Sinyal mumundan bu yana en yüksek high ve en düşük low."""
     try:
+        r = http_session.get(
+            f"{BINANCE_FAPI}/fapi/v1/klines",
+            params={"symbol": symbol, "interval": TIMEFRAME, "startTime": int(open_time), "limit": 1500},
+            timeout=10,
+        )
         data = r.json()
+        if not isinstance(data, list) or not data:
+            return None, None
+        highs = [float(k[2]) for k in data]
+        lows = [float(k[3]) for k in data]
+        return max(highs), min(lows)
     except Exception:
-        return None
-
-    if not isinstance(data, list) or len(data) < SMA_LEN + 2:
-        return None
-
-    df = pd.DataFrame(data, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
-
-    for col in ["open", "high", "low", "close"]:
-        df[col] = df[col].astype(float)
-
-    df["sma100"] = df["close"].rolling(SMA_LEN).mean()
-
-    row = df.iloc[-1]       # Canlı / Anlık mum
-    prev_row = df.iloc[-2]  # Önceki kapanmış mum
-
-    sma100 = row["sma100"]
-    prev_sma100 = prev_row["sma100"]
-
-    if pd.isna(sma100) or pd.isna(prev_sma100):
-        return None
-
-    body_pct = abs(row["close"] - row["open"]) / row["open"] * 100
-    direction = "YÜKSELEN (Yeşil)" if row["close"] > row["open"] else "DÜŞEN (Kırmızı)"
-    prev_direction = "YÜKSELEN (Yeşil)" if prev_row["close"] > prev_row["open"] else "DÜŞEN (Kırmızı)"
-
-    # 1. İlk Sinyal Koşulları (SMA Temas/Kırılım + %5 Gövde)
-    direct_touch = (row["low"] <= sma100 <= row["high"])
-    near_touch = abs(row["low"] - sma100) / sma100 <= 0.003 or abs(row["high"] - sma100) / sma100 <= 0.003
-    bullish_break = (prev_row["close"] < prev_sma100) and (row["close"] > sma100)
-    bearish_break = (prev_row["close"] > prev_sma100) and (row["close"] < sma100)
-    touches_sma = direct_touch or near_touch or bullish_break or bearish_break
-
-    is_ilk_sinyal = (body_pct >= BODY_PCT) and touches_sma
-
-    # 2. Devam Mumu Koşulları (Önceki mumda sinyal alınmışsa ve bu mum da %5 büyük gövdeyle aynı yönde devam ediyorsa)
-    # Not: Devam mumunda tekrar SMA teması aranmaz, çünkü fiyat çoktan uzaklaşmıştır (soluksuz gidiyordur).
-    last_signal_open_time = ilk_sinyal_takibi.get(symbol)
-    is_devam_mumu = False
-    
-    if not is_ilk_sinyal and body_pct >= BODY_PCT:
-        # Eğer bir önceki mum (prev_row) ilk sinyali verdiyse VEYA yakın zamanda aktif bir sinyal zinciri varsa
-        if last_signal_open_time is not None:
-            # Önceki mumun open_time'ı ile şimdiki mumun open_time arasında ardışıklık kontrolü veya genel trend devamı
-            if int(prev_row["open_time"]) == last_signal_open_time and direction == prev_direction:
-                is_devam_mumu = True
-
-    if is_ilk_sinyal or is_devam_mumu:
-        return {
-            "symbol": symbol,
-            "open_time": int(row["open_time"]),
-            "body_pct": body_pct,
-            "direction": direction,
-            "close": row["close"],
-            "sma100": sma100,
-            "tip": "DEVAM" if is_devam_mumu else "ILK"
-        }
-
-    return None
+        return None, None
 
 
-def scan_once():
-    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Tarama başladı...", flush=True)
+def gun_sonu_raporu():
+    global son_rapor_tarihi
+    simdi = datetime.now(TZ)
+    gun_baslangic = simdi.replace(hour=0, minute=0, second=0, microsecond=0)
+    baslangic_ms = int(gun_baslangic.timestamp() * 1000)
 
-    try:
-        r = http_session.get(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", timeout=10)
-        filtered = [
-            d["symbol"] for d in r.json()
-            if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME_USDT
-        ]
-    except Exception as e:
-        print(f"Ticker hatası: {e}", flush=True)
+    print(f"\n[RAPOR] Gün sonu raporu hazırlanıyor ({simdi.strftime('%Y-%m-%d %H:%M')})...", flush=True)
+
+    if not os.path.exists(SIGNALS_FILE):
+        send_telegram("📊 <b>GÜN SONU RAPORU</b>\n\nBugün hiç sinyal kaydı yok.")
+        son_rapor_tarihi = simdi.date()
         return
 
-    bulunan = 0
+    with csv_lock:
+        df = pd.read_csv(SIGNALS_FILE)
+    df = df[df["ts_ms"] >= baslangic_ms]
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_symbol = {executor.submit(check_symbol, sym): sym for sym in filtered}
+    if df.empty:
+        send_telegram("📊 <b>GÜN SONU RAPORU</b>\n\nBugün hiç sinyal gelmedi.")
+        son_rapor_tarihi = simdi.date()
+        return
 
-        for future in as_completed(future_to_symbol):
-            symbol = future_to_symbol[future]
-            try:
-                sonuc = future.result()
-                if not sonuc:
-                    continue
+    # Güncel fiyat + 24s değişim + hacim (tek istekte hepsi)
+    try:
+        tickers = {d["symbol"]: d for d in http_session.get(f"{BINANCE_FAPI}/fapi/v1/ticker/24hr", timeout=15).json()}
+    except Exception as e:
+        print(f"Rapor ticker hatası: {e}", flush=True)
+        tickers = {}
 
-                open_time = sonuc["open_time"]
-                tip = sonuc["tip"]
+    satirlar = []
+    for _, s in df.iterrows():
+        sym = s["sembol"]
+        giris = float(s["giris_fiyat"])
+        long = s["yon"] == "LONG"
+        t = tickers.get(sym, {})
+        guncel = float(t["lastPrice"]) if "lastPrice" in t else None
+        if guncel is None:
+            continue
 
-                # Mükerrer kontrolü
-                if tip == "ILK":
-                    if ilk_sinyal_takibi.get(symbol) == open_time:
-                        continue
-                    ilk_sinyal_takibi[symbol] = open_time
-                    baslik = f"🎯 <b>AÇIK MUM | İLK SMA{SMA_LEN} KIRILIM SİNYALİ</b>"
-                else:  # DEVAM
-                    devam_set = devam_sinyal_takibi.setdefault(symbol, set())
-                    if open_time in devam_set:
-                        continue
-                    devam_set.add(open_time)
-                    # İLK HARFLERİ BÜYÜK VE DİKKAT ÇEKİCİ ŞEKİLDE
-                    baslik = "🔥🚨 <b>DEVAM MUMU! (SOLUKSUZ GİDİŞ)</b> 🚨🔥"
+        mx, mn = sinyal_sonrasi_extremler(sym, s["open_time"])
+        degisim = (guncel - giris) / giris * 100
+        yone_gore = degisim if long else -degisim
 
-                bulunan += 1
+        if mx is not None:
+            if long:
+                lehine = (mx - giris) / giris * 100
+                aleyhine = (mn - giris) / giris * 100
+            else:
+                lehine = (giris - mn) / giris * 100
+                aleyhine = (giris - mx) / giris * 100
+        else:
+            lehine = aleyhine = None
 
-                mesaj = (
-                    f"{baslik}\n\n"
-                    f"• <b>Sembol</b>: {sonuc['symbol']}\n"
-                    f"• <b>Yön</b>: {sonuc['direction']}\n"
-                    f"• <b>Gövde Boyu</b>: %{sonuc['body_pct']:.2f}\n"
-                    f"• <b>Anlık Fiyat</b>: {sonuc['close']}\n"
-                    f"• <b>SMA{SMA_LEN}</b>: {sonuc['sma100']:.6f}\n"
-                    f"• <b>Zaman Dilimi</b>: {TIMEFRAME}"
-                )
-                print(f"[SİNYAL - {tip}] {sonuc['symbol']} - %{sonuc['body_pct']:.2f}", flush=True)
-                send_telegram(mesaj)
+        yerel_zaman = datetime.fromtimestamp(s["ts_ms"] / 1000, TZ).strftime("%H:%M:%S")
 
-            except Exception as e:
-                print(f"{symbol} işleme hatası: {e}", flush=True)
+        satirlar.append({
+            "tarih": simdi.strftime("%Y-%m-%d"),
+            "sinyal_saati": yerel_zaman,
+            "sembol": sym,
+            "tip": s["tip"],
+            "yon": s["yon"],
+            "govde_pct": round(float(s["govde_pct"]), 2),
+            "giris_fiyat": giris,
+            "sma": s["sma"],
+            "rapor_fiyati": guncel,
+            "degisim_pct": round(degisim, 2),
+            "yone_gore_pct": round(yone_gore, 2),
+            "max_lehine_pct": round(lehine, 2) if lehine is not None else "",
+            "max_aleyhine_pct": round(aleyhine, 2) if aleyhine is not None else "",
+            "24s_degisim_pct": round(float(t.get("priceChangePercent", 0)), 2),
+            "24s_hacim_usdt": round(float(t.get("quoteVolume", 0))),
+            "sonuc": "KAZANDI" if yone_gore > 0 else "KAYBETTI",
+        })
 
-    print(f"Tarama bitti. {bulunan} yeni sinyal gönderildi.", flush=True)
+    if not satirlar:
+        send_telegram("📊 <b>GÜN SONU RAPORU</b>\n\nFiyat verisi alınamadı.")
+        son_rapor_tarihi = simdi.date()
+        return
+
+    rapor = pd.DataFrame(satirlar).sort_values("yone_gore_pct", ascending=False)
+    dosya = rapor_dosya_adi(simdi)
+    rapor.to_csv(dosya, index=False, encoding="utf-8-sig")  # utf-8-sig: Excel'de Türkçe düzgün açılır
+
+    # Özet
+    toplam = len(rapor)
+    kazanan = (rapor["yone_gore_pct"] > 0).sum()
+    ilk_sayi = (rapor["tip"] == "ILK").sum()
+    devam_sayi = (rapor["tip"] == "DEVAM").sum()
+    ort = rapor["yone_gore_pct"].mean()
+    en_iyi = rapor.head(5)
+    en_kotu = rapor.tail(5).iloc[::-1]
+
+    def satir(r):
+        return f"• {r['sembol']} ({r['yon']}, {r['tip']}): %{r['yone_gore_pct']:+.2f}"
+
+    mesaj = (
+        f"📊 <b>GÜN SONU RAPORU — {simdi.strftime('%d.%m.%Y')}</b>\n\n"
+        f"• Toplam sinyal: {toplam} (İlk: {ilk_sayi} | Devam: {devam_sayi})\n"
+        f"• Kazanan: {kazanan} | Kaybeden: {toplam - kazanan}\n"
+        f"• Başarı oranı: %{kazanan / toplam * 100:.1f}\n"
+        f"• Ortalama getiri (yöne göre): %{ort:+.2f}\n\n"
+        f"🏆 <b>En iyi 5</b>\n" + "\n".join(satir(r) for _, r in en_iyi.iterrows()) + "\n\n"
+        f"💥 <b>En kötü 5</b>\n" + "\n".join(satir(r) for _, r in en_kotu.iterrows())
+    )
+    send_telegram(mesaj)
+    send_telegram_file(dosya, caption=f"Detaylı rapor: {dosya}")
+
+    son_rapor_tarihi = simdi.date()
+    print(f"[RAPOR] Tamamlandı: {dosya} ({toplam} sinyal)", flush=True)
 
 
-def main():
-    print(f"Bot Başlatıldı (İlk + DEVAM Mumu Modu) | TF={TIMEFRAME} | Aralık={SCAN_INTERVAL_SEC}sn", flush=True)
-    while True:
-        try:
-            scan_once()
-        except Exception as e:
-            print(f"Genel Hata: {e}", flush=True)
-        time.sleep(SCAN_INTERVAL_SEC)
+def rapor_zamani_kontrol():
+    """Saat 21:00'i geçtiyse ve bugünün raporu yoksa raporu ayrı thread'de başlatır."""
+    global son_rapor_tarihi
+    simdi = datetime.now(TZ)
+    if (simdi.hour, simdi.minute) < (REPORT_HOUR, REPORT_MINUTE):
+        return
+    if son_rapor_tarihi == simdi.date():
+        return
+    if os.path.exists(rapor_dosya_adi(simdi)):  # bot yeniden başladıysa tekrar gönderme
+        son_rapor_tarihi = simdi.date()
+        return
+    son_rapor_tarihi = simdi.date()  # çift tetiklenmeyi önle
+    threading.Thread(target=gun_sonu_raporu, daemon=True).start()
 
 
-if __name__ == "__main__":
-    main()
+# ───────────────
