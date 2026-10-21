@@ -1,199 +1,55 @@
-import os
-import time
-import threading
-from collections import deque
+import os, time, requests
 from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 import pandas as pd
-import requests
 
-# ─────────────── AYARLAR (ENV'DEN OKUNUR) ───────────────
-# Kırılım (Pine "KIRILIM AL/SAT" modülü ile aynı varsayılanlar)
-BREAK_LEN         = int(os.environ.get("BREAK_LEN", 20))
-BO_BUFFER_PCT     = float(os.environ.get("BO_BUFFER_PCT", 0.5))
-BO_VOL_MULT       = float(os.environ.get("BO_VOL_MULT", 2.0))
-RSI_LEN           = int(os.environ.get("RSI_LEN", 14))
-RSI_BULL          = float(os.environ.get("RSI_BULL", 60))
-RSI_BEAR          = float(os.environ.get("RSI_BEAR", 40))
-MIN_BARS_BETWEEN  = int(os.environ.get("MIN_BARS_BETWEEN", 5))
-BODY_PCT          = float(os.environ.get("BODY_PCT", 0.0))          # istersen 5 yap: sinyal mumu min gövde %
+# ───────── AYARLAR ─────────
+TIMEFRAME   = os.environ.get("TIMEFRAME", "15m")
+DAYS        = int(os.environ.get("DAYS", 60))              # kaç gün geriye
+TOP_N       = int(os.environ.get("TOP_N", 80))             # hacme göre ilk kaç coin
+MIN_VOLUME  = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
+SMA_LEN     = int(os.environ.get("SMA_LEN", 100))
+BODY_PCT    = float(os.environ.get("BODY_PCT", 5.0))
+HORIZON     = int(os.environ.get("HORIZON", 16))           # 16 mum = 4 saat (15m'de)
+TP_PCT      = float(os.environ.get("TP_PCT", 3.0))         # hedef %
+SL_PCT      = float(os.environ.get("SL_PCT", 2.0))         # stop %
+COOLDOWN    = int(os.environ.get("COOLDOWN_BAR", 4))       # aynı coinde iki sinyal arası min mum
+PRE         = 20                                           # "önceki mumlar" penceresi
+WORKERS     = int(os.environ.get("MAX_WORKERS", 4))
 
-# Teyit mumu (kırılımdan sonraki mum)
-VOL_MULT          = float(os.environ.get("VOL_MULT", 1.5))
-TAKER_BUY_MIN     = float(os.environ.get("TAKER_BUY_MIN", 0.55))
+# 4 özelliğin "kural testi" eşikleri (benim varsayımım, değiştirebilirsiniz)
+HACIM_MIN   = float(os.environ.get("HACIM_MIN", 3.0))      # hacim normalin en az kaç katı
+GOVDE_MIN   = float(os.environ.get("GOVDE_KAT_MIN", 4.0))  # gövde önceki ort. gövdenin en az kaç katı
+EGIM_MIN    = float(os.environ.get("EGIM_MIN", -0.3))      # yöne göre SMA eğimi en az (%)
+ALT_MIN     = int(os.environ.get("ALT_MIN", 10))           # kırılım öncesi min mum sayısı
 
-MIN_VOLUME_USDT   = float(os.environ.get("MIN_VOLUME_USDT", 3_000_000))
-TIMEFRAME         = os.environ.get("TIMEFRAME", "5m")
-SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", 180))   # 3 dk
-MAX_WORKERS       = int(os.environ.get("MAX_WORKERS", 4))
-WEIGHT_SOFT_LIMIT = int(os.environ.get("WEIGHT_SOFT_LIMIT", 1200))  # Binance limiti 2400/dk (IP başına)
-LOCAL_WEIGHT_LIMIT = int(os.environ.get("LOCAL_WEIGHT_LIMIT", 800))  # bu sürecin kendi dakikalık weight tavanı
+API   = "https://fapi.binance.com"
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
+CHAT  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
-BINANCE_FAPI      = "https://fapi.binance.com"
-TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
-TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
-
-KLINES_LIMIT      = 200  # RSI/MACD ısınması için
-
-# Geçmiş testi (python kirilim_teyit_bot.py test)
-TEST_LIMIT        = int(os.environ.get("TEST_LIMIT", 1000))    # kaç mum geriye bakılsın (1000 = ~3.5 gün)
-HEDEF_PCT         = float(os.environ.get("HEDEF_PCT", 10))     # hedef kâr %
-STOP_LISTESI     = [float(x) for x in os.environ.get("STOP_LISTESI", "3,5,7,10").split(",")]  # denenecek stop %'leri
-BEKLEME_MUM       = int(os.environ.get("BEKLEME_MUM", 10))     # test10: kırılımdan sonra kaç mum teyit beklensin
-FEE_PCT           = float(os.environ.get("FEE_PCT", 0.1))      # işlem başı toplam komisyon+kayma tahmini %
-UFUK_MUM          = int(os.environ.get("UFUK_MUM", 144))       # girişten sonra kaç mumda hedef aranır (144 = 12 saat)
-
-http_session = requests.Session()
-son_sinyal = {}  # {symbol: teyit mumu open_time}
-
-block_lock = threading.Lock()
+http = requests.Session()
 blocked_until = 0.0
 
 
-def send_telegram_dosya(yol, aciklama=""):
-    if TELEGRAM_TOKEN == "BURAYA_TOKEN":
-        return False
-    try:
-        with open(yol, "rb") as f:
-            r = http_session.post(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
-                data={"chat_id": TELEGRAM_CHAT_ID, "caption": aciklama},
-                files={"document": f},
-                timeout=30,
-            )
-        return r.status_code == 200
-    except Exception as e:
-        print(f"Telegram dosya hatasi: {e}", flush=True)
-        return False
-
-
-def send_telegram(text):
-    if TELEGRAM_TOKEN == "BURAYA_TOKEN":
-        print(text, flush=True)
-        return
-    try:
-        http_session.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"Telegram hatasi: {e}", flush=True)
-
-
-BAN_DOSYASI = os.environ.get("BAN_DOSYASI", "/tmp/binance_ban_until.txt")  # aynı makinedeki tüm süreçler paylaşır
-LIMIT_PENCERE_SN = 60
-son_bildirim = 0.0
-
-weight_log = deque()
-weight_lock = threading.Lock()
-
-
-def ban_dosyadan_oku():
-    try:
-        with open(BAN_DOSYASI) as f:
-            return float(f.read().strip())
-    except Exception:
-        return 0.0
-
-
-def ban_dosyaya_yaz(bitis):
-    try:
-        gecici = BAN_DOSYASI + ".tmp"
-        with open(gecici, "w") as f:
-            f.write(str(bitis))
-        os.replace(gecici, BAN_DOSYASI)
-    except Exception as e:
-        print(f"Ban dosyası yazılamadı: {e}", flush=True)
-
-
-def set_block(seconds, neden):
-    """Tüm thread'ler ve aynı makinedeki tüm süreçler için ortak bekleme koyar (sadece uzatır)."""
-    global blocked_until, son_bildirim
-    yeni = time.time() + seconds
-    with block_lock:
-        if yeni <= max(blocked_until, ban_dosyadan_oku()):
-            return
-        blocked_until = yeni
-        ban_dosyaya_yaz(yeni)
-        bildir = neden in ("418", "429") and time.time() - son_bildirim > 600
-        if bildir:
-            son_bildirim = time.time()
-    print(f"⛔ Rate limit koruması: {neden} | {int(seconds)} sn bekleniyor", flush=True)
-    if bildir:
-        send_telegram(f"⛔ Binance {neden} aldı, bot {int(seconds)} sn duruyor. (Bildirim 10 dk'da bir gelir)")
-
-
-def block_remaining():
-    return max(0.0, max(blocked_until, ban_dosyadan_oku()) - time.time())
-
-
-def klines_agirlik(limit):
-    if limit < 100:
-        return 1
-    if limit < 500:
-        return 2
-    if limit <= 1000:
-        return 5
-    return 10
-
-
-def yerel_limit(agirlik):
-    """Kendi sayacımız: son 60 sn'de LOCAL_WEIGHT_LIMIT'i aşmadan istek atılmasını sağlar."""
-    while True:
-        with weight_lock:
-            simdi = time.time()
-            while weight_log and simdi - weight_log[0][0] > LIMIT_PENCERE_SN:
-                weight_log.popleft()
-            toplam = sum(w for _, w in weight_log)
-            if not weight_log or toplam + agirlik <= LOCAL_WEIGHT_LIMIT:
-                weight_log.append((simdi, agirlik))
-                return
-            bekleme = LIMIT_PENCERE_SN - (simdi - weight_log[0][0]) + 0.1
-        time.sleep(max(bekleme, 0.2))
-
-
-def api_get(path, params=None, bekle=False):
-    """Tüm Binance istekleri buradan geçer: kendi weight sayacı + 418/429 koruması.
-    bekle=True (test modu): limit varsa atlamaz, bekleyip tekrar dener."""
-    if "ticker" in path:
-        agirlik = 40
-    elif params and "limit" in params:
-        agirlik = klines_agirlik(int(params["limit"]))
-    else:
-        agirlik = 1
-
-    for _ in range(4 if bekle else 1):
-        kalan = block_remaining()
-        if kalan > 0:
-            if not bekle:
-                return None
-            time.sleep(kalan + 0.5)
-        yerel_limit(agirlik)
+def get(path, params=None):
+    global blocked_until
+    for _ in range(5):
+        w = blocked_until - time.time()
+        if w > 0:
+            time.sleep(w)
         try:
-            r = http_session.get(f"{BINANCE_FAPI}{path}", params=params, timeout=15)
-        except Exception as e:
-            print(f"İstek hatası: {e}", flush=True)
-            if bekle:
-                time.sleep(2)
-                continue
-            return None
-
+            r = http.get(API + path, params=params, timeout=15)
+        except Exception:
+            time.sleep(2)
+            continue
         if r.status_code in (418, 429):
-            retry_after = r.headers.get("Retry-After")
             try:
-                bekleme = float(retry_after)
+                w = float(r.headers.get("Retry-After"))
             except (TypeError, ValueError):
-                bekleme = 300 if r.status_code == 418 else 60
-            set_block(bekleme + 5, str(r.status_code))
-            if bekle:
-                continue
-            return None
-
-        used = r.headers.get("X-MBX-USED-WEIGHT-1M")
-        if used and used.isdigit() and int(used) >= WEIGHT_SOFT_LIMIT:
-            set_block(61 - (time.time() % 60), "weight")
-
+                w = 120 if r.status_code == 418 else 30
+            blocked_until = max(blocked_until, time.time() + w + 2)
+            continue
         if r.status_code != 200:
             return None
         try:
@@ -203,378 +59,172 @@ def api_get(path, params=None, bekle=False):
     return None
 
 
-def hesapla_kirilim(c):
-    """Pine KIRILIM AL/SAT mantığı: her kapanmış mum için 'AL' / 'SAT' / None listesi + seviyeler."""
-    close, high, low, open_, vol = c["close"], c["high"], c["low"], c["open"], c["volume"]
-
-    # RSI (Wilder)
-    delta = close.diff()
-    ort_kazanc = delta.clip(lower=0).ewm(alpha=1 / RSI_LEN, adjust=False).mean()
-    ort_kayip = (-delta.clip(upper=0)).ewm(alpha=1 / RSI_LEN, adjust=False).mean()
-    rsi = 100 - 100 / (1 + ort_kazanc / ort_kayip)
-
-    # MACD 12/26/9
-    macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
-    macd_sig = macd.ewm(span=9, adjust=False).mean()
-    hist = macd - macd_sig
-
-    # Seviyeler: önceki BREAK_LEN mumun tepesi / dibi (Pine'daki [1])
-    direnc = high.rolling(BREAK_LEN).max().shift(1)
-    destek = low.rolling(BREAK_LEN).min().shift(1)
-    vol_sma = vol.rolling(20).mean()
-
-    vol_ok = vol > vol_sma * BO_VOL_MULT
-    body_ok = (close - open_).abs() / open_ * 100 >= BODY_PCT
-
-    yukari = (close > direnc * (1 + BO_BUFFER_PCT / 100)) & (close.shift(1) <= direnc)
-    asagi = (close < destek * (1 - BO_BUFFER_PCT / 100)) & (close.shift(1) >= destek)
-
-    ham_al = yukari & vol_ok & body_ok & (rsi > RSI_BULL) & (hist > 0) & (macd > macd_sig)
-    ham_sat = asagi & vol_ok & body_ok & (rsi < RSI_BEAR) & (hist < 0) & (macd < macd_sig)
-
-    # Spam önleme: iki sinyal arası min MIN_BARS_BETWEEN mum
-    al_l, sat_l = ham_al.tolist(), ham_sat.tolist()
-    yon = [None] * len(c)
-    son = None
-    for i in range(len(c)):
-        if al_l[i] or sat_l[i]:
-            if son is None or i - son >= MIN_BARS_BETWEEN:
-                yon[i] = "AL" if al_l[i] else "SAT"
-                son = i
-    return yon, direnc, destek
-
-
-def klines_al(symbol, limit=KLINES_LIMIT, bekle=False):
-    """limit > 1000 ise geriye doğru parça parça çeker."""
-    kalan, bitis, parcalar = limit, None, []
-    while kalan > 0:
-        n = min(1000, kalan)
-        params = {"symbol": symbol, "interval": TIMEFRAME, "limit": n}
-        if bitis:
-            params["endTime"] = bitis
-        data = api_get("/fapi/v1/klines", params, bekle=bekle)
+def fetch(symbol):
+    start = int((time.time() - DAYS * 86400) * 1000)
+    rows = []
+    while True:
+        data = get("/fapi/v1/klines", {"symbol": symbol, "interval": TIMEFRAME,
+                                       "startTime": start, "limit": 1500})
         if not isinstance(data, list) or not data:
             break
-        parcalar.insert(0, data)
-        kalan -= len(data)
-        bitis = int(data[0][0]) - 1
-        if len(data) < n:
+        rows += data
+        if len(data) < 1500:
             break
-    tum = [m for p in parcalar for m in p]
-    if len(tum) < 80:
-        return None
-    df = pd.DataFrame(tum, columns=[
-        "open_time", "open", "high", "low", "close", "volume",
-        "close_time", "quote_volume", "trades",
-        "taker_buy_base", "taker_buy_quote", "ignore"
-    ])
-    for col in ["open", "high", "low", "close", "volume", "taker_buy_base"]:
-        df[col] = df[col].astype(float)
-    # Son mum canlı -> at. Sadece KAPANMIŞ mumlarla çalış.
-    return df.iloc[:-1].reset_index(drop=True)
+        start = data[-1][0] + 1
+    return rows
 
 
-def degerlendir(c, yon_listesi, direnc, destek, a):
-    """a = kırılım mumunun indeksi, teyit mumu a+1. Dönüş: (aşama, sonuç)."""
-    yon = yon_listesi[a]
-    if yon is None:
-        return "yok", None
+def analiz_sembol(symbol):
+    rows = fetch(symbol)
+    if len(rows) < SMA_LEN + PRE + HORIZON + 20:
+        return []
+    df = pd.DataFrame(rows).iloc[:-1]                      # canlı mumu at
+    o, h, l, c, qv = [df[i].astype(float).reset_index(drop=True) for i in (1, 2, 3, 4, 7)]
+    t = df[0].astype("int64").reset_index(drop=True)
 
-    A, B = c.iloc[a], c.iloc[a + 1]
-    seviye = direnc.iloc[a] if yon == "AL" else destek.iloc[a]
+    sma = c.rolling(SMA_LEN).mean()
+    body = (c - o).abs() / o * 100
+    prev_c, prev_sma = c.shift(1), sma.shift(1)
 
-    if (yon == "AL" and not B["close"] > seviye) or (yon == "SAT" and not B["close"] < seviye):
-        return "seviye_x", None   # teyit mumu seviyenin yanlış tarafında kapandı
+    direct = (l <= sma) & (sma <= h)
+    near = ((l - sma).abs() / sma <= 0.003) | ((h - sma).abs() / sma <= 0.003)
+    bull = (prev_c < prev_sma) & (c > sma)
+    bear = (prev_c > prev_sma) & (c < sma)
+    sig = (body >= BODY_PCT) & (direct | near | bull | bear) & sma.notna() & prev_sma.notna()
 
-    baz_hacim = c["volume"].iloc[a - 20:a].mean()  # kırılım mumundan önceki 20 mum
-    if baz_hacim <= 0 or B["volume"] <= 0:
-        return "hacim_x", None
-    hacim_x = B["volume"] / baz_hacim
-    if hacim_x < VOL_MULT:
-        return "hacim_x", None
+    govde_ort = body.shift(1).rolling(PRE).mean()          # önceki 20 mumun ort. gövdesi
+    hacim_ort = qv.shift(1).rolling(PRE).mean()
 
-    taker_buy = B["taker_buy_base"] / B["volume"]
-    if (yon == "AL" and taker_buy < TAKER_BUY_MIN) or (yon == "SAT" and taker_buy > 1 - TAKER_BUY_MIN):
-        return "taker_x", None
-
-    return "ok", {
-        "yon": yon,
-        "open_time": int(B["open_time"]),
-        "body_pct": abs(A["close"] - A["open"]) / A["open"] * 100,
-        "hacim_x": hacim_x,
-        "taker_buy": taker_buy,
-        "close": B["close"],
-        "seviye": seviye,
-        "uzaklik": (B["close"] - seviye) / seviye * 100,
-    }
-
-
-sayac = {"taranan": 0, "kirilim": 0, "seviye_x": 0, "hacim_x": 0, "taker_x": 0, "ok": 0}
-sayac_lock = threading.Lock()
-
-
-def check_symbol(symbol):
-    c = klines_al(symbol)
-    if c is None:
-        return None
-    yon_l, direnc, destek = hesapla_kirilim(c)
-    asama, sonuc = degerlendir(c, yon_l, direnc, destek, len(c) - 2)
-
-    with sayac_lock:
-        sayac["taranan"] += 1
-        if asama != "yok":
-            sayac["kirilim"] += 1
-            sayac[asama] += 1
-    if asama != "yok":
-        print(f"  [kırılım] {symbol} {yon_l[-2]} -> {asama}", flush=True)
-    if sonuc:
-        sonuc["symbol"] = symbol
-    return sonuc
-
-
-def ileri_sonuc(c, b_idx, yon, giris):
-    """Girişten (teyit mumu kapanışı) sonraki UFUK_MUM mumda hedefe ulaşıldı mı?"""
-    ileri = c.iloc[b_idx + 1: b_idx + 1 + UFUK_MUM]
-    if len(ileri) == 0:
-        return None
-    if yon == "AL":
-        hedef = giris * (1 + HEDEF_PCT / 100)
-        vurdu = (ileri["high"] >= hedef).tolist()
-        maks_kar = ileri["high"].max() / giris - 1
-    else:
-        hedef = giris * (1 - HEDEF_PCT / 100)
-        vurdu = (ileri["low"] <= hedef).tolist()
-        maks_kar = 1 - ileri["low"].min() / giris
-    if True in vurdu:
-        k = vurdu.index(True)
-        once = ileri.iloc[:k]
-        sure_mum = k + 1
-    else:
-        once, sure_mum = ileri, None
-    if len(once) > 0:
-        maks_dusus = (1 - once["low"].min() / giris) if yon == "AL" else (once["high"].max() / giris - 1)
-    else:
-        maks_dusus = 0.0
-    return {
-        "hedef_vurdu": sure_mum is not None,
-        "sure_dk": sure_mum * 5 if sure_mum else None,
-        "maks_kar_pct": maks_kar * 100,
-        "once_maks_dusus_pct": max(maks_dusus, 0) * 100,
-        "ileri_mum": len(ileri),
-    }
-
-
-def simule(c, b_idx, yon, giris, stop_pct):
-    """Önce stop mu hedef mi? Aynı mumda ikisi de olursa temkinli: stop. Dönüş: (sonuç, net %)."""
-    ileri = c.iloc[b_idx + 1: b_idx + 1 + UFUK_MUM]
-    if len(ileri) == 0:
-        return "veri_yok", 0.0
-    h, l, cl = ileri["high"].tolist(), ileri["low"].tolist(), ileri["close"].tolist()
-    for i in range(len(ileri)):
-        if yon == "AL":
-            stop_oldu = l[i] <= giris * (1 - stop_pct / 100)
-            hedef_oldu = h[i] >= giris * (1 + HEDEF_PCT / 100)
-        else:
-            stop_oldu = h[i] >= giris * (1 + stop_pct / 100)
-            hedef_oldu = l[i] <= giris * (1 - HEDEF_PCT / 100)
-        if stop_oldu:
-            return "stop", -stop_pct - FEE_PCT
-        if hedef_oldu:
-            return "hedef", HEDEF_PCT - FEE_PCT
-    son = (cl[-1] / giris - 1) * 100
-    return "ufuk_sonu", (son if yon == "AL" else -son) - FEE_PCT
-
-
-def degerlendir_yeni(c, yon_listesi, direnc, destek, a):
-    """Kırılımdan sonraki BEKLEME_MUM mumda ilk agresif taker mumu teyittir.
-    Seviyenin ters tarafına kapanış gelirse kırılım iptal. Giriş: teyit mumunun kapanışı."""
-    yon = yon_listesi[a]
-    if yon is None:
-        return "yok", None
-    A = c.iloc[a]
-    seviye = direnc.iloc[a] if yon == "AL" else destek.iloc[a]
-    son = min(a + BEKLEME_MUM, len(c) - 1)
-
-    for idx in range(a + 1, son + 1):
-        m = c.iloc[idx]
-        if (yon == "AL" and m["close"] < seviye) or (yon == "SAT" and m["close"] > seviye):
-            return "iptal", None
-        if m["volume"] <= 0:
+    O, H, L, C, S = o.values, h.values, l.values, c.values, sma.values
+    out, last = [], -10**9
+    for i in np.where(sig.values)[0]:
+        if i < SMA_LEN + PRE + 11 or i + HORIZON >= len(C) or i - last < COOLDOWN:
             continue
-        taker = m["taker_buy_base"] / m["volume"]
-        if (yon == "AL" and taker >= TAKER_BUY_MIN) or (yon == "SAT" and taker <= 1 - TAKER_BUY_MIN):
-            return "ok", {
-                "yon": yon,
-                "open_time": int(m["open_time"]),
-                "b_idx": idx,
-                "bekleme_mum": idx - a,
-                "body_pct": abs(A["close"] - A["open"]) / A["open"] * 100,
-                "hacim_x": m["volume"] / max(c["volume"].iloc[a - 20:a].mean(), 1e-12),
-                "taker_buy": taker,
-                "close": m["close"],
-                "seviye": seviye,
-                "uzaklik": (m["close"] - seviye) / seviye * 100,
-            }
-    if a + BEKLEME_MUM > len(c) - 1:
-        return "veri_yok", None      # pencere henüz dolmadı
-    return "zaman_asimi", None
+        if not (govde_ort.iloc[i] > 0 and hacim_ort.iloc[i] > 0):
+            continue
+        last = i
+        d = 1 if C[i] > O[i] else -1                       # 1=LONG, -1=SHORT
+        entry = C[i]
+
+        # 4 özellik
+        govde_kat = body.iloc[i] / govde_ort.iloc[i]                       # 1) sıkışma → patlama
+        hacim_kat = qv.iloc[i] / hacim_ort.iloc[i]                         # 2) hacim
+        egim = (S[i - 1] / S[i - 11] - 1) * 100 * d                        # 3) SMA eğimi (yöne göre +)
+        alt, j = 0, i - 1                                                  # 4) kırılım öncesi karşı tarafta kalış
+        while j >= 0 and alt < 200 and not np.isnan(S[j]) and ((C[j] < S[j]) if d == 1 else (C[j] > S[j])):
+            alt += 1
+            j -= 1
+
+        # sonuç
+        fwd = (C[i + HORIZON] / entry - 1) * d * 100
+        hi, lo = H[i + 1:i + HORIZON + 1].max(), L[i + 1:i + HORIZON + 1].min()
+        if d == 1:
+            maxfav, maxadv = (hi / entry - 1) * 100, (lo / entry - 1) * 100
+        else:
+            maxfav, maxadv = (1 - lo / entry) * 100, (1 - hi / entry) * 100
+        tpsl = "YOK"
+        for k in range(1, HORIZON + 1):
+            if d == 1:
+                tp, sl = H[i + k] >= entry * (1 + TP_PCT / 100), L[i + k] <= entry * (1 - SL_PCT / 100)
+            else:
+                tp, sl = L[i + k] <= entry * (1 - TP_PCT / 100), H[i + k] >= entry * (1 + SL_PCT / 100)
+            if sl:                                         # aynı mumda ikisi de olursa SL say (temkinli)
+                tpsl = "SL"
+                break
+            if tp:
+                tpsl = "TP"
+                break
+
+        out.append(dict(
+            tarih=datetime.fromtimestamp(t[i] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            sembol=symbol, yon="LONG" if d == 1 else "SHORT", giris=entry,
+            govde_pct=round(body.iloc[i], 2), govde_kat=round(govde_kat, 2),
+            hacim_kat=round(hacim_kat, 2), sma_egim=round(egim, 3), alt_mum=alt,
+            fwd=round(fwd, 2), maxfav=round(maxfav, 2), maxadv=round(maxadv, 2), tpsl=tpsl))
+    return out
 
 
-def gecmis_test(mod="eski"):
-    """test   -> eski teyit (hemen sonraki mum: seviye + hacim + taker)
-       test10 -> yeni teyit (sonraki BEKLEME_MUM mumda ilk agresif taker mumu)"""
-    tickers = api_get("/fapi/v1/ticker/24hr", bekle=True)
-    if not isinstance(tickers, list):
-        print("Ticker alınamadı.")
+def ozet(g):
+    return {"adet": len(g),
+            "kazanma_%": round((g.fwd > 0).mean() * 100, 1),
+            "ort_getiri_%": round(g.fwd.mean(), 2),
+            "medyan_%": round(g.fwd.median(), 2),
+            "ort_max_lehine_%": round(g.maxfav.mean(), 2),
+            "ort_max_aleyhine_%": round(g.maxadv.mean(), 2),
+            f"TP{TP_PCT:g}_%": round((g.tpsl == "TP").mean() * 100, 1),
+            f"SL{SL_PCT:g}_%": round((g.tpsl == "SL").mean() * 100, 1)}
+
+
+def tablo(df, kolon):
+    try:
+        gruplar = pd.qcut(df[kolon], 4, duplicates="drop")
+    except Exception:
+        gruplar = pd.cut(df[kolon], 4)
+    satirlar = {str(k): ozet(g) for k, g in df.groupby(gruplar, observed=True)}
+    return pd.DataFrame(satirlar).T.to_string()
+
+
+def rapor(df):
+    L = [f"BACKTEST | {TIMEFRAME} | son {DAYS} gün | {df.sembol.nunique()} coin | {len(df)} sinyal",
+         f"Sonuç ufku: {HORIZON} mum | TP %{TP_PCT:g} / SL %{SL_PCT:g}", "",
+         "══ GENEL ══", pd.DataFrame({"hepsi": ozet(df)}).T.to_string(), ""]
+    L += ["══ YÖNE GÖRE ══",
+          pd.DataFrame({y: ozet(g) for y, g in df.groupby("yon")}).T.to_string(), ""]
+    adlar = [("govde_kat", "1) SIKIŞMA→PATLAMA: sinyal gövdesi / önceki 20 mum ort. gövdesi"),
+             ("hacim_kat", "2) HACİM: sinyal hacmi / önceki 20 mum ort. hacmi"),
+             ("sma_egim", "3) SMA EĞİMİ: son 10 mumda %, yöne göre (+ = yön lehine)"),
+             ("alt_mum", "4) KIRILIM ÖNCESİ: karşı tarafta kaç mum kalmış")]
+    for kolon, ad in adlar:
+        L += [f"══ {ad} ══", tablo(df, kolon), ""]
+
+    skor = ((df.hacim_kat >= HACIM_MIN).astype(int) + (df.govde_kat >= GOVDE_MIN).astype(int) +
+            (df.sma_egim >= EGIM_MIN).astype(int) + (df.alt_mum >= ALT_MIN).astype(int))
+    L += [f"══ KURAL TESTİ: kaç şart sağlanıyor? (hacim≥{HACIM_MIN:g}x, gövde≥{GOVDE_MIN:g}x, "
+          f"eğim≥{EGIM_MIN:g}%, alt mum≥{ALT_MIN}) ══",
+          pd.DataFrame({f"{k} şart": ozet(g) for k, g in df.groupby(skor)}).T.to_string(), "",
+          "══ İLK / SON YARI (tutarlılık kontrolü) ══"]
+    yari = len(df) // 2
+    ds = df.sort_values("tarih")
+    L += [pd.DataFrame({"ilk yarı": ozet(ds.iloc[:yari]), "son yarı": ozet(ds.iloc[yari:])}).T.to_string()]
+    return "\n".join(L)
+
+
+def tg_file(path):
+    if TOKEN == "BURAYA_TOKEN":
         return
-    semboller = [d["symbol"] for d in tickers
-                 if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME_USDT]
-    fn = degerlendir_yeni if mod == "yeni" else degerlendir
-    toplam = {}
-
-    def isle(sym):
-        c = klines_al(sym, TEST_LIMIT, bekle=True)
-        if c is None:
-            return None
-        yon_l, direnc, destek = hesapla_kirilim(c)
-        yerel, liste = {}, []
-        for a in range(30, len(c) - 1):
-            asama, sonuc = fn(c, yon_l, direnc, destek, a)
-            yerel[asama] = yerel.get(asama, 0) + 1
-            if sonuc:
-                bi = sonuc.get("b_idx", a + 1)
-                sonuc.setdefault("bekleme_mum", 1)
-                sonuc["symbol"] = sym
-                sonuc["zaman_utc"] = datetime.fromtimestamp(sonuc["open_time"] / 1000 + 300, timezone.utc).strftime("%m-%d %H:%M")
-                sonuc.update(ileri_sonuc(c, bi, sonuc["yon"], sonuc["close"]) or
-                             {"hedef_vurdu": False, "sure_dk": None, "maks_kar_pct": 0,
-                              "once_maks_dusus_pct": 0, "ileri_mum": 0})
-                for sp in STOP_LISTESI:
-                    s_sonuc, s_net = simule(c, bi, sonuc["yon"], sonuc["close"], sp)
-                    sonuc[f"sonuc_stop{sp:g}"] = s_sonuc
-                    sonuc[f"net_stop{sp:g}"] = s_net
-                liste.append(sonuc)
-        return yerel, liste
-
-    sinyaller = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        for r in ex.map(isle, semboller):
-            if r:
-                for k, v in r[0].items():
-                    toplam[k] = toplam.get(k, 0) + v
-                sinyaller.extend(r[1])
-
-    g = lambda k: toplam.get(k, 0)
-    kirilim = sum(v for k, v in toplam.items() if k != "yok")
-    gun = TEST_LIMIT * 5 / 60 / 24
-    print(f"\n{len(semboller)} sembol, yaklaşık son {gun:.1f} gün | mod: {'test10 (10 mumda agresif taker)' if mod == 'yeni' else 'eski (hemen sonraki mum)'}")
-    print(f"  Kırılım mumu (A) sayısı : {kirilim}")
-    if mod == "yeni":
-        print(f"  Teyit alamayan          : iptal (seviye geri kaybedildi) {g('iptal')} | zaman aşımı {g('zaman_asimi')} | pencere dolmadı {g('veri_yok')}")
-    else:
-        print(f"  Teyitte elenen          : seviye {g('seviye_x')} | hacim {g('hacim_x')} | taker {g('taker_x')}")
-    print(f"  Teyitli sinyal          : {g('ok')}")
-
-    if not sinyaller:
-        return
-    df = pd.DataFrame(sinyaller).sort_values("open_time")
-    dosya = "sinyal_listesi_test10.csv" if mod == "yeni" else "sinyal_listesi.csv"
-    df.to_csv(dosya, index=False)
-
-    tam = df[df["ileri_mum"] >= UFUK_MUM]   # tüm ufku görebilenler
-    vuran = tam[tam["hedef_vurdu"]]
-    print(f"\n── %{HEDEF_PCT:g} hedef testi (giriş: teyit mumu kapanışı, ufuk: {UFUK_MUM * 5 // 60} saat) ──")
-    print(f"  Değerlendirilen sinyal : {len(tam)}  (ufku dolmayan {len(df) - len(tam)} sinyal hariç)")
-    if len(tam):
-        print(f"  %{HEDEF_PCT:g}'e ulaşan         : {len(vuran)}  (%{len(vuran) / len(tam) * 100:.0f})")
-        print(f"  Ortalama maks. kâr     : %{tam['maks_kar_pct'].mean():.1f}")
-        print(f"  Hedefe giderken ortalama önce düşüş: %{vuran['once_maks_dusus_pct'].mean() if len(vuran) else 0:.1f}")
-        if mod == "yeni":
-            print(f"  Teyit ortalama kaç mum sonra geldi: {tam['bekleme_mum'].mean():.1f}  | kırılım seviyesinden ort. uzaklık: %{tam['uzaklik'].abs().mean():.1f}")
-
-    if len(tam):
-        print(f"\n── Stop simülasyonu (hedef +%{HEDEF_PCT:g}, komisyon+kayma %{FEE_PCT:g}/işlem, aynı mumda ikisi olursa stop sayılır) ──")
-        for ad, grp in (("HEPSİ", tam), ("AL", tam[tam["yon"] == "AL"]), ("SAT", tam[tam["yon"] == "SAT"])):
-            if len(grp) == 0:
-                continue
-            print(f"  [{ad}] {len(grp)} sinyal")
-            print(f"  {'Stop':>5} | {'hedef':>5} | {'stop':>5} | {'ufuk':>5} | {'kazanan%':>8} | {'ort net%':>8} | {'toplam net%':>11}")
-            for sp in STOP_LISTESI:
-                sc, nt = grp[f"sonuc_stop{sp:g}"], grp[f"net_stop{sp:g}"]
-                print(f"  %{sp:>4g} | {(sc == 'hedef').sum():>5} | {(sc == 'stop').sum():>5} | {(sc == 'ufuk_sonu').sum():>5} | "
-                      f"{(nt > 0).mean() * 100:>7.0f}% | {nt.mean():>8.2f} | {nt.sum():>11.1f}")
-    print(f"\n  Tüm sinyaller: {dosya} dosyasına yazıldı.")
-    if send_telegram_dosya(dosya, f"Geçmiş test ({mod}): {len(df)} sinyal"):
-        print("  CSV Telegram'a da gönderildi.")
-
-
-def scan_once():
-    print(f"\n[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Tarama başladı...", flush=True)
-
-    tickers = api_get("/fapi/v1/ticker/24hr")
-    if not isinstance(tickers, list):
-        print("Ticker alınamadı, tarama atlandı.", flush=True)
-        return
-
-    semboller = [
-        d["symbol"] for d in tickers
-        if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME_USDT
-    ]
-
-    bulunan = 0
-    for k in sayac:
-        sayac[k] = 0
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(check_symbol, s): s for s in semboller}
-        for f in as_completed(futures):
-            symbol = futures[f]
-            try:
-                s = f.result()
-            except Exception as e:
-                print(f"{symbol} hata: {e}", flush=True)
-                continue
-            if not s:
-                continue
-            if son_sinyal.get(symbol) == s["open_time"]:
-                continue
-            son_sinyal[symbol] = s["open_time"]
-            bulunan += 1
-
-            ikon = "🟢" if s["yon"] == "AL" else "🔴"
-            send_telegram(
-                f"{ikon} <b>KIRILIM TEYİTLİ {s['yon']}</b>\n\n"
-                f"• <b>Sembol</b>: {s['symbol']}\n"
-                f"• <b>Kırılım mumu gövde</b>: %{s['body_pct']:.2f}\n"
-                f"• <b>Kırılan seviye ({BREAK_LEN} mum)</b>: {s['seviye']}\n"
-                f"• <b>Teyit hacmi</b>: {s['hacim_x']:.1f}x\n"
-                f"• <b>Alıcı oranı</b>: %{s['taker_buy'] * 100:.0f}\n"
-                f"• <b>Fiyat</b>: {s['close']} (seviyeden %{s['uzaklik']:+.2f})\n"
-                f"• <b>Zaman Dilimi</b>: {TIMEFRAME}"
-            )
-            print(f"[SİNYAL] {s['symbol']} {s['yon']}", flush=True)
-
-    print(f"Tarama bitti. Taranan {sayac['taranan']}/{len(semboller)} | kırılım {sayac['kirilim']} | "
-          f"elenen: seviye {sayac['seviye_x']}, hacim {sayac['hacim_x']}, taker {sayac['taker_x']} | "
-          f"{bulunan} yeni sinyal.", flush=True)
+    try:
+        with open(path, "rb") as f:
+            http.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument",
+                      data={"chat_id": CHAT}, files={"document": f}, timeout=30)
+    except Exception as e:
+        print(f"Telegram hatası: {e}")
 
 
 def main():
-    arg = __import__("sys").argv[1] if len(__import__("sys").argv) > 1 else ""
-    if arg == "test":
-        gecmis_test("eski")
+    t = get("/fapi/v1/ticker/24hr")
+    if not isinstance(t, list):
+        print("Ticker alınamadı.")
         return
-    if arg == "test10":
-        gecmis_test("yeni")
+    semboller = [d["symbol"] for d in sorted(t, key=lambda x: -float(x.get("quoteVolume", 0)))
+                 if d["symbol"].endswith("USDT") and float(d.get("quoteVolume", 0)) >= MIN_VOLUME][:TOP_N]
+    print(f"{len(semboller)} coin taranıyor ({DAYS} gün, {TIMEFRAME})... birkaç dakika sürebilir.", flush=True)
+
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        sonuclar = list(ex.map(analiz_sembol, semboller))
+    kayitlar = [x for s in sonuclar for x in s]
+    if not kayitlar:
+        print("Hiç sinyal bulunamadı.")
         return
-    print(f"Bot başlatıldı | TF={TIMEFRAME} | Aralık={SCAN_INTERVAL_SEC}sn", flush=True)
-    while True:
-        baslangic = time.time()
-        try:
-            scan_once()
-        except Exception as e:
-            print(f"Genel hata: {e}", flush=True)
-        bekle = max(SCAN_INTERVAL_SEC - (time.time() - baslangic), block_remaining(), 1)
-        time.sleep(bekle)
+
+    df = pd.DataFrame(kayitlar).sort_values("tarih")
+    df.to_csv("backtest_sinyaller.csv", index=False, encoding="utf-8-sig")
+    metin = rapor(df)
+    with open("backtest_analiz.txt", "w", encoding="utf-8") as f:
+        f.write(metin)
+    print("\n" + metin)
+    print("\nDosyalar: backtest_sinyaller.csv, backtest_analiz.txt")
+    tg_file("backtest_analiz.txt")
+    tg_file("backtest_sinyaller.csv")
 
 
 if __name__ == "__main__":
