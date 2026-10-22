@@ -17,11 +17,11 @@ GUN_SONU_SAAT = 23          # her gün bu saatten sonra rapor + CSV gönderir (s
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "BURAYA_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "BURAYA_CHAT_ID")
 
-JSON_DOSYA = "sinyaller.json"
-CSV_DOSYA = "sonuclar.csv"
+JSON_DOSYA = "futures_sinyaller.json"
+CSV_DOSYA = "futures_sonuclar.csv"
 # -----------------------
 
-BASE = "https://api.binance.com"
+BASE = "https://fapi.binance.com"
 
 ALANLAR = [
     "zaman", "sembol", "giris", "acilis", "tepe", "yukselis", "anlik", "geri_cekilme",
@@ -39,31 +39,42 @@ durum = {"son_gun_sonu": None}
 
 
 # ---------- TELEGRAM ----------
+def telegram_hazir():
+    if "BURAYA" in TELEGRAM_TOKEN or "BURAYA" in TELEGRAM_CHAT_ID:
+        print("⚠️ Telegram token/chat id girilmemiş, mesaj gönderilmedi")
+        return False
+    return True
+
+
 def telegram_mesaj(metin):
-    if "BURAYA" in TELEGRAM_TOKEN:
+    if not telegram_hazir():
         return
     for i in range(0, len(metin), 4000):
         try:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
                 data={"chat_id": TELEGRAM_CHAT_ID, "text": metin[i:i + 4000]},
                 timeout=15,
             )
+            if r.status_code != 200:
+                print("⚠️ Telegram hatası:", r.status_code, r.text[:200])
         except Exception as e:
             print("Telegram hatası:", e)
 
 
 def telegram_dosya(yol):
-    if "BURAYA" in TELEGRAM_TOKEN or not os.path.exists(yol):
+    if not telegram_hazir() or not os.path.exists(yol):
         return
     try:
         with open(yol, "rb") as f:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
                 data={"chat_id": TELEGRAM_CHAT_ID},
                 files={"document": f},
                 timeout=30,
             )
+        if r.status_code != 200:
+            print("⚠️ Telegram dosya hatası:", r.status_code, r.text[:200])
     except Exception as e:
         print("Telegram dosya hatası:", e)
 
@@ -83,7 +94,7 @@ def mum_kontrol(t):
     sembol = t["symbol"]
     try:
         r = requests.get(
-            f"{BASE}/api/v3/klines",
+            f"{BASE}/fapi/v1/klines",
             params={"symbol": sembol, "interval": "15m", "limit": 1},
             timeout=10,
         )
@@ -120,7 +131,12 @@ def mum_kontrol(t):
 
 
 def tara():
-    tickers = requests.get(f"{BASE}/api/v3/ticker/24hr", timeout=15).json()
+    r = requests.get(f"{BASE}/fapi/v1/ticker/24hr", timeout=15)
+    tickers = r.json()
+    if not isinstance(tickers, list):
+        print("Binance futures hatası:", r.status_code, str(tickers)[:200])
+        return
+
     btc24 = next((float(t["priceChangePercent"]) for t in tickers if t["symbol"] == "BTCUSDT"), 0.0)
     adaylar = [
         t for t in tickers
@@ -142,14 +158,14 @@ def tara():
             sinyaller.append(m)
             yeniler.append(m)
 
-    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {len(adaylar)} coin tarandı")
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {len(adaylar)} futures coin tarandı")
     if not yeniler:
         print("  Sinyal yok")
     else:
         satirlar = []
         for m in sorted(yeniler, key=lambda x: -x["yukselis"]):
             satirlar.append(
-                f"🚀 {m['sembol']}  tepe %{m['yukselis']:.2f} | anlık %{m['anlik']:.2f} | "
+                f"🚀 {m['sembol']} (Futures)  tepe %{m['yukselis']:.2f} | anlık %{m['anlik']:.2f} | "
                 f"geri çekilme %{m['geri_cekilme']:.2f}\n"
                 f"Giriş: {m['giris']} | Mum hacmi: ${m['mum_hacim_usd']:,.0f} | "
                 f"Alım oranı: %{m['alim_orani']:.0f} | İşlem: {m['islem_sayisi']}\n"
@@ -164,7 +180,7 @@ def tara():
 def degerlendir(s):
     try:
         r = requests.get(
-            f"{BASE}/api/v3/klines",
+            f"{BASE}/fapi/v1/klines",
             params={
                 "symbol": s["sembol"],
                 "interval": "15m",
@@ -208,7 +224,7 @@ def rapor_metni():
     bekleyen = sum(1 for s in sinyaller if not s.get("bitti"))
     bugun = datetime.now().strftime("%Y-%m-%d")
     bugunku = sum(1 for s in sinyaller if s["zaman"].startswith(bugun))
-    metin = f"📊 GÜN SONU RAPORU\nBugün gelen sinyal: {bugunku}\nBekleyen (24s dolmadı): {bekleyen}\n"
+    metin = f"📊 GÜN SONU RAPORU (Futures)\nBugün gelen sinyal: {bugunku}\nBekleyen (24s dolmadı): {bekleyen}\n"
     if not biten:
         return metin + "Henüz 24 saati dolan sinyal yok."
     yuk = [s for s in biten if s["sonuc"] == "YUKSELDI"]
@@ -252,7 +268,7 @@ def gun_sonu_kontrol():
 
 
 # ---------- ANA DÖNGÜ ----------
-yaz(f"✅ Tarama botu başladı\nŞart: 24s hacim ≥ ${MIN_HACIM_USD:,} ve 15dk mumda %{MIN_YUKSELIS:.0f}+ yükseliş\nTarama: {TARAMA_SANIYE // 60} dakikada bir")
+yaz(f"✅ Futures tarama botu başladı\nŞart: 24s hacim ≥ ${MIN_HACIM_USD:,} ve 15dk mumda %{MIN_YUKSELIS:.0f}+ yükseliş\nTarama: {TARAMA_SANIYE // 60} dakikada bir")
 
 while True:
     baslangic = time.time()
