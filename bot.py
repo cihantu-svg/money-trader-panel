@@ -7,8 +7,8 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 # ---- AYARLAR ----
-MIN_HACIM_USD = 1_000_000   # 24 saatlik minimum hacim
-MIN_YUKSELIS = 10.0         # açık 15dk mumda açılıştan tepeye minimum % artış
+MIN_HACIM_USD = float(os.environ.get("MIN_HACIM_USD", "1000000"))
+MIN_YUKSELIS = float(os.environ.get("MIN_YUKSELIS", "10"))
 TARAMA_SANIYE = 7 * 60      # 7 dakikada bir tara
 DEGERLENDIRME_MS = 24 * 3600 * 1000
 GUN_SONU_SAAT = 23          # her gün bu saatten sonra rapor + CSV gönderir (sunucu saati)
