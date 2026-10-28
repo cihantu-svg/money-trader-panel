@@ -8,7 +8,7 @@ BASE = "https://fapi.binance.com"
 # --- Ortak ---
 TARAMA_ARALIK = 180    # tarama sıklığı (sn) -> 180 = 3 dakikada bir
 MIN_HACIM = 1_000_000  # 24s USDT hacim (0 yaparsan hacim filtresi kalkar)
-COOLDOWN = 4 * 500    # aynı coine, aynı yönde tekrar sinyal bekleme
+COOLDOWN = 1 * 3600    # aynı coine, aynı yönde tekrar sinyal bekleme
 RAPOR_SAATI = 21       # günlük rapor saati (UTC)
 ZAMAN_DILIMI = "15m"
 
