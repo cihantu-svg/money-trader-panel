@@ -13,7 +13,7 @@ RAPOR_SAATI = 21       # günlük rapor saati (UTC)
 ZAMAN_DILIMI = "15m"
 
 # --- Kırılım ---
-MUM_YUZDE = 5          # sinyal mumu boyu: AL için open->high, SAT için open->low %
+MUM_YUZDE = 8          # sinyal mumu boyu: AL için open->high, SAT için open->low %
 BO_LEN = 20            # kırılım referans periyodu
 BO_TAMPON = 0.5        # kırılım onay tamponu %
 HACIM_CARPAN = 2.0     # hacim, 20 mumluk ortalamanın kaç katı
