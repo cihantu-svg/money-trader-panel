@@ -13,7 +13,7 @@ RAPOR_SAATI = 21       # günlük rapor saati (UTC)
 ZAMAN_DILIMI = "15m"
 
 # --- Kırılım ---
-MUM_YUZDE = 8          # sinyal mumu boyu: AL için open->high, SAT için open->low %
+MUM_YUZDE = 7          # sinyal mumu boyu: AL için open->high, SAT için open->low %
 BO_LEN = 20            # kırılım referans periyodu
 BO_TAMPON = 0.5        # kırılım onay tamponu %
 HACIM_CARPAN = 2.0     # hacim, 20 mumluk ortalamanın kaç katı
@@ -21,13 +21,13 @@ RSI_LEN = 14
 RSI_AL = 60            # AL için RSI alt sınırı
 RSI_SAT = 40           # SAT için RSI üst sınırı
 
-# --- Sadece log: 4H SMA100 mesafesi (sinyali etkilemez) ---
+# --- Sadece log: SMA100 mesafeleri (sinyali etkilemez) ---
 SMA_LEN = 100
 
 DOSYA = "sinyaller.csv"
 ALANLAR = ["zaman", "tarih", "tip", "sembol", "fiyat", "mum_yuzde", "hacim_x",
-           "rsi", "hacim_24s", "degisim_24s", "sma4h_mesafe", "en_yuksek_24s",
-           "en_dusuk_24s", "sonuc_24s", "durum"]
+           "rsi", "hacim_24s", "degisim_24s", "sma5m_mesafe", "sma1h_mesafe",
+           "sma4h_mesafe", "en_yuksek_24s", "en_dusuk_24s", "sonuc_24s", "durum"]
 
 oturum = requests.Session()
 son = {}        # "SEMBOL|TIP" -> son sinyal zamanı
@@ -80,17 +80,21 @@ def csv_yukle():
             anahtar = f"{r['sembol']}|{r['tip']}"
             son[anahtar] = max(son.get(anahtar, 0), r["zaman"])
 
-def sma4h_mesafe(s, fiyat):
-    """4H SMA100'e yüzde mesafe (+ : SMA fiyatın üstünde, - : altında). Hata olursa None."""
+def sma_mesafe(s, fiyat, aralik):
+    """SMA100'e yüzde mesafe (+ : SMA fiyatın üstünde, - : altında). Hata olursa None."""
     try:
-        k = get("/fapi/v1/klines", symbol=s, interval="4h", limit=SMA_LEN)
+        k = get("/fapi/v1/klines", symbol=s, interval=aralik, limit=SMA_LEN)
+        time.sleep(0.1)
         if len(k) < SMA_LEN:
             return None
         sma = sum(float(x[4]) for x in k) / SMA_LEN
         return (sma - fiyat) / fiyat * 100
     except Exception as e:
-        print("sma hata", s, e)
+        print("sma hata", s, aralik, e)
         return None
+
+def fmt(x):
+    return f"{x:.2f}" if x is not None else ""
 
 # ---------- göstergeler ----------
 def ema(vals, n):
@@ -153,7 +157,9 @@ def kirilim_hesapla(s):
 def sinyal_ekle(tip, s, t, fiyat, mum_yuzde, d):
     simdi = time.time()
     son[f"{s}|{tip}"] = simdi
-    sma_m = sma4h_mesafe(s, fiyat)   # sadece log, sinyali etkilemez
+    m5 = sma_mesafe(s, fiyat, "5m")    # sadece log, sinyali etkilemez
+    m1h = sma_mesafe(s, fiyat, "1h")
+    m4h = sma_mesafe(s, fiyat, "4h")
     kayitlar.append({
         "zaman": simdi,
         "tarih": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
@@ -162,17 +168,16 @@ def sinyal_ekle(tip, s, t, fiyat, mum_yuzde, d):
         "rsi": f"{d['rsi']:.0f}",
         "hacim_24s": f"{float(t['quoteVolume']):.0f}",
         "degisim_24s": t["priceChangePercent"],
-        "sma4h_mesafe": f"{sma_m:.2f}" if sma_m is not None else "",
+        "sma5m_mesafe": fmt(m5), "sma1h_mesafe": fmt(m1h), "sma4h_mesafe": fmt(m4h),
         "en_yuksek_24s": "", "en_dusuk_24s": "", "sonuc_24s": "", "durum": ""})
     csv_yaz()
     yon = "🚀 KIRILIM AL" if tip == "KIRILIM_AL" else "🔻 KIRILIM SAT"
     isaret = "+" if tip == "KIRILIM_AL" else "-"
-    sma_txt = f"%{sma_m:.2f}" if sma_m is not None else "yok"
     telegram(f"{yon} {s}\n{ZAMAN_DILIMI} mum: {isaret}%{mum_yuzde:.1f}\n"
              f"Hacim: {d['hacim_x']:.1f}x ortalama | RSI: {d['rsi']:.0f}\n"
              f"Fiyat: {fiyat}\n"
              f"24s hacim: {float(t['quoteVolume'])/1e6:.1f}M | 24s değişim: %{t['priceChangePercent']}\n"
-             f"4H SMA100 mesafe: {sma_txt}")
+             f"SMA100 mesafe -> 5dk: %{fmt(m5) or 'yok'} | 1H: %{fmt(m1h) or 'yok'} | 4H: %{fmt(m4h) or 'yok'}")
 
 # ---------- 24 saat sonuç takibi ----------
 def sonuc_kontrol():
