@@ -8,7 +8,7 @@ BASE = "https://fapi.binance.com"
 # --- Ortak ---
 TARAMA_ARALIK = 180    # tarama sıklığı (sn) -> 180 = 3 dakikada bir
 MIN_HACIM = 1_000_000  # 24s USDT hacim (0 yaparsan hacim filtresi kalkar)
-COOLDOWN = 1 * 3600    # aynı coine, aynı yönde tekrar sinyal bekleme
+COOLDOWN = 3600        # aynı coine, aynı yönde tekrar sinyal bekleme (1 saat)
 RAPOR_SAATI = 21       # günlük rapor saati (UTC)
 ZAMAN_DILIMI = "15m"
 
@@ -21,16 +21,13 @@ RSI_LEN = 14
 RSI_AL = 60            # AL için RSI alt sınırı
 RSI_SAT = 40           # SAT için RSI üst sınırı
 
-# --- Ters hareket analizi (sadece CSV'ye yazar, sinyali etkilemez) ---
-TERS_PENCERE_DK = 60   # sinyalden sonra kaç dakika izlensin
-TERS_ESIK = 3.0        # sinyalin tersine en az bu kadar % hareket "ters hareket" sayılır
-HIZLI_TERS_DK = 30     # raporda: ters hareket bu süre (dk) içinde olduysa "hızlı ters"
+# --- Sadece log: 4H SMA100 mesafesi (sinyali etkilemez) ---
+SMA_LEN = 100
 
 DOSYA = "sinyaller.csv"
 ALANLAR = ["zaman", "tarih", "tip", "sembol", "fiyat", "mum_yuzde", "hacim_x",
-           "rsi", "hacim_24s", "degisim_24s",
-           "ters_dk", "max_ters_1s", "max_lehine_1s", "sonuc_1s",
-           "en_yuksek_24s", "en_dusuk_24s", "sonuc_24s", "durum"]
+           "rsi", "hacim_24s", "degisim_24s", "sma4h_mesafe", "en_yuksek_24s",
+           "en_dusuk_24s", "sonuc_24s", "durum"]
 
 oturum = requests.Session()
 son = {}        # "SEMBOL|TIP" -> son sinyal zamanı
@@ -82,6 +79,18 @@ def csv_yukle():
             kayitlar.append(r)
             anahtar = f"{r['sembol']}|{r['tip']}"
             son[anahtar] = max(son.get(anahtar, 0), r["zaman"])
+
+def sma4h_mesafe(s, fiyat):
+    """4H SMA100'e yüzde mesafe (+ : SMA fiyatın üstünde, - : altında). Hata olursa None."""
+    try:
+        k = get("/fapi/v1/klines", symbol=s, interval="4h", limit=SMA_LEN)
+        if len(k) < SMA_LEN:
+            return None
+        sma = sum(float(x[4]) for x in k) / SMA_LEN
+        return (sma - fiyat) / fiyat * 100
+    except Exception as e:
+        print("sma hata", s, e)
+        return None
 
 # ---------- göstergeler ----------
 def ema(vals, n):
@@ -144,6 +153,7 @@ def kirilim_hesapla(s):
 def sinyal_ekle(tip, s, t, fiyat, mum_yuzde, d):
     simdi = time.time()
     son[f"{s}|{tip}"] = simdi
+    sma_m = sma4h_mesafe(s, fiyat)   # sadece log, sinyali etkilemez
     kayitlar.append({
         "zaman": simdi,
         "tarih": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M"),
@@ -152,49 +162,17 @@ def sinyal_ekle(tip, s, t, fiyat, mum_yuzde, d):
         "rsi": f"{d['rsi']:.0f}",
         "hacim_24s": f"{float(t['quoteVolume']):.0f}",
         "degisim_24s": t["priceChangePercent"],
-        "ters_dk": "", "max_ters_1s": "", "max_lehine_1s": "", "sonuc_1s": "",
+        "sma4h_mesafe": f"{sma_m:.2f}" if sma_m is not None else "",
         "en_yuksek_24s": "", "en_dusuk_24s": "", "sonuc_24s": "", "durum": ""})
     csv_yaz()
     yon = "🚀 KIRILIM AL" if tip == "KIRILIM_AL" else "🔻 KIRILIM SAT"
     isaret = "+" if tip == "KIRILIM_AL" else "-"
+    sma_txt = f"%{sma_m:.2f}" if sma_m is not None else "yok"
     telegram(f"{yon} {s}\n{ZAMAN_DILIMI} mum: {isaret}%{mum_yuzde:.1f}\n"
              f"Hacim: {d['hacim_x']:.1f}x ortalama | RSI: {d['rsi']:.0f}\n"
              f"Fiyat: {fiyat}\n"
-             f"24s hacim: {float(t['quoteVolume'])/1e6:.1f}M | 24s değişim: %{t['priceChangePercent']}")
-
-# ---------- 1 saatlik ters hareket analizi (sadece CSV) ----------
-def ters_kontrol():
-    degisti = False
-    for r in kayitlar:
-        if r.get("max_ters_1s", "") != "" or time.time() - r["zaman"] < TERS_PENCERE_DK * 60:
-            continue
-        try:
-            ks = get("/fapi/v1/klines", symbol=r["sembol"], interval="1m",
-                     startTime=int(r["zaman"] * 1000), limit=TERS_PENCERE_DK)
-            if not ks:
-                continue
-            f0 = r["fiyat"]
-            al = r["tip"] == "KIRILIM_AL"
-            max_ters, max_lehine, ilk_dk = 0.0, 0.0, ""
-            for i, m in enumerate(ks, start=1):
-                yuksek, dusuk = float(m[2]), float(m[3])
-                ters = (f0 - dusuk) / f0 * 100 if al else (yuksek - f0) / f0 * 100
-                lehine = (yuksek - f0) / f0 * 100 if al else (f0 - dusuk) / f0 * 100
-                max_ters = max(max_ters, ters)
-                max_lehine = max(max_lehine, lehine)
-                if ilk_dk == "" and ters >= TERS_ESIK:
-                    ilk_dk = i
-            son_getiri = (float(ks[-1][4]) - f0) / f0 * 100 * (1 if al else -1)
-            r["ters_dk"] = ilk_dk
-            r["max_ters_1s"] = f"{max_ters:.2f}"
-            r["max_lehine_1s"] = f"{max_lehine:.2f}"
-            r["sonuc_1s"] = f"{son_getiri:.2f}"
-            degisti = True
-        except Exception as e:
-            print("ters hata", r["sembol"], e)
-        time.sleep(0.1)
-    if degisti:
-        csv_yaz()
+             f"24s hacim: {float(t['quoteVolume'])/1e6:.1f}M | 24s değişim: %{t['priceChangePercent']}\n"
+             f"4H SMA100 mesafe: {sma_txt}")
 
 # ---------- 24 saat sonuç takibi ----------
 def sonuc_kontrol():
@@ -239,12 +217,9 @@ def gunluk_rapor():
             ort = sum(float(r["en_yuksek_24s"]) for r in bitenler) / len(bitenler) if bitenler else 0
         else:
             ort = sum(-float(r["en_dusuk_24s"]) for r in bitenler) / len(bitenler) if bitenler else 0
-        olculen = [r for r in tum if r.get("max_ters_1s", "") != ""]
-        hizli = [r for r in olculen if r.get("ters_dk", "") != "" and float(r["ters_dk"]) <= HIZLI_TERS_DK]
         metin += (f"\n{tip}\nSon 24s sinyal: {len(son24)}\n"
                   f"Sonuçlanan: {len(bitenler)} | Başarılı: {basarili} | Oran: %{oran:.0f}\n"
-                  f"Ort. lehine max hareket: %{ort:.2f}\n"
-                  f"Hızlı ters (ilk {HIZLI_TERS_DK}dk %{TERS_ESIK:g}+): {len(hizli)}/{len(olculen)}\n")
+                  f"Ort. lehine max hareket: %{ort:.2f}\n")
     telegram(metin)
     if kayitlar:
         csv_yaz()
@@ -279,7 +254,6 @@ while True:
         if time.time() - son_tarama >= TARAMA_ARALIK:
             son_tarama = time.time()
             tara()
-        ters_kontrol()
         sonuc_kontrol()
         simdi = datetime.now(timezone.utc)
         if simdi.hour >= RAPOR_SAATI and son_rapor_gun != simdi.date():
