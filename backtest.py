@@ -1,204 +1,131 @@
-import os, time, requests
-import numpy as np
-import pandas as pd
-
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT = os.getenv("TELEGRAM_CHAT_ID")
+import time, csv, requests
+from statistics import mean
+from datetime import datetime, timezone
 
 BASE = "https://fapi.binance.com"
-TF = "15m"
-DAYS = 30
-TOP_N = 150          # hacme göre ilk 150 coin
-MIN_VOL = 1_000_000  # 24s hacim (USDT)
-SL, TP = 3.0, 8.0    # yüzde
-FEE = 0.1            # gidiş-dönüş komisyon (%)
-MAX_HOLD = 96        # en fazla 96 mum (24 saat) tut
-WINDOW = 3           # birlikte sinyal için pencere (mum)
-GAP = 5              # aynı coinde sinyaller arası min mum
 
+GUN = 30                          # kaç günlük geçmiş test edilsin
+TOP_N = 150                       # hacme göre ilk kaç coin
+MUM_YUZDE = 5                     # itme mumu: open->high en az %
+DELTA_ESIKLER = [3, 5, 10]        # itme deltası, önceki 20 mumun ortalama |delta|'sının kaç katı
+GERI_CEKILME = 5.0                # tepeden %5 düşünce giriş
+HEDEF = 10.0                      # girişten %10 kârda kapat
+STOP_LISTESI = [3, 5, 10]         # stop % (girişten aşağı), hepsi ayrı test edilir
+BEKLE_MUM = 4                    # geri çekilme için max bekleme (16 mum = 4 saat)
+TUT_MUM = 96                      # işlemde max kalma (96 mum = 24 saat)
+UCRET = 0.1                       # gidiş-dönüş komisyon %
+ORT_MUM = 20
 
-def get(path, params=None):
-    for _ in range(5):
-        r = requests.get(BASE + path, params=params, timeout=15)
+oturum = requests.Session()
+
+def get(path, **p):
+    for _ in range(2):
+        r = oturum.get(BASE + path, params=p, timeout=15)
         if r.status_code in (418, 429):
-            time.sleep(30)
+            time.sleep(int(r.headers.get("Retry-After", 60)))
             continue
         r.raise_for_status()
         return r.json()
-    raise RuntimeError("rate limit")
+    raise RuntimeError("Rate limit devam ediyor")
 
-
-def symbols():
-    t = get("/fapi/v1/ticker/24hr")
-    t = [x for x in t if x["symbol"].endswith("USDT") and float(x["quoteVolume"]) >= MIN_VOL]
-    t.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-    return [x["symbol"] for x in t[:TOP_N]]
-
-
-def candles(sym):
-    need = DAYS * 96 + 100
-    rows, end = [], None
-    while len(rows) < need:
-        p = {"symbol": sym, "interval": TF, "limit": 1500}
-        if end:
-            p["endTime"] = end
-        k = get("/fapi/v1/klines", p)
+def mumlar(s):
+    bitis = int(time.time() * 1000)
+    hedef = bitis - GUN * 86400 * 1000
+    out = []
+    while bitis > hedef:
+        k = get("/fapi/v1/klines", symbol=s, interval="15m", limit=1500, endTime=bitis)
+        time.sleep(0.5)
         if not k:
             break
-        rows = k + rows
-        end = k[0][0] - 1
-        time.sleep(0.12)
-    df = pd.DataFrame(rows).iloc[:, :10]
-    df.columns = ["t", "open", "high", "low", "close", "vol", "ct", "qv", "n", "tb"]
-    df = df.astype({c: float for c in ["open", "high", "low", "close", "vol", "tb"]})
-    df["t"] = pd.to_datetime(df["t"], unit="ms")
-    df["delta"] = 2 * df["tb"] - df["vol"]   # gerçek taker delta
-    return df.iloc[:-1].tail(need).reset_index(drop=True)  # son (kapanmamış) mumu at
+        out = k + out
+        bitis = k[0][0] - 1
+        if len(k) < 1500:
+            break
+    return out[:-1]   # son (kapanmamış) mumu at
 
-
-def rma(s, n):
-    return s.ewm(alpha=1 / n, adjust=False).mean()
-
-
-def supertrend(df, n=10, m=3.0):
-    h, l, c = df.high.values, df.low.values, df.close.values
-    pc = np.r_[c[0], c[:-1]]
-    tr = np.maximum(h - l, np.maximum(abs(h - pc), abs(l - pc)))
-    atr = rma(pd.Series(tr), n).values
-    src = (h + l) / 2
-    ub, lb = src + m * atr, src - m * atr
-    up = np.ones(len(c), bool)
-    for i in range(1, len(c)):
-        if lb[i] <= lb[i - 1] and c[i - 1] >= lb[i - 1]:
-            lb[i] = lb[i - 1]
-        if ub[i] >= ub[i - 1] and c[i - 1] <= ub[i - 1]:
-            ub[i] = ub[i - 1]
-        up[i] = (c[i] >= lb[i]) if up[i - 1] else (c[i] > ub[i])
-    return up
-
-
-def signals(df):
-    c, o, h, l, v, d = df.close, df.open, df.high, df.low, df.vol, df.delta
-    hh = h.rolling(20).max().shift(1)
-    ll = l.rolling(20).min().shift(1)
-    vs = v.rolling(20).mean()
-
-    # 1) Kırılım AL/SAT (FIBO TRADE mantığı)
-    dc = c.diff()
-    rsi = 100 - 100 / (1 + rma(dc.clip(lower=0), 14) / rma((-dc).clip(lower=0), 14))
-    macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
-    hist = macd - macd.ewm(span=9, adjust=False).mean()
-    aL = (c > hh * 1.005) & (v > 2 * vs) & (rsi > 60) & (hist > 0) & (macd > 0)
-    aS = (c < ll * 0.995) & (v > 2 * vs) & (rsi < 40) & (hist < 0) & (macd < 0)
-
-    # 2) Delta + Supertrend
-    up = pd.Series(supertrend(df), index=df.index)
-    prev = up.shift(1, fill_value=bool(up.iloc[0]))
-    flipUp, flipDn = up & ~prev, ~up & prev
-    ad = d.abs().rolling(20).mean()
-    roll = d.rolling(5).sum()
-    vok = v > 1.5 * vs
-    bL = up & ((c > hh) | flipUp) & (c > o) & vok & (d > 1.5 * ad) & (roll > 0)
-    bS = ~up & ((c < ll) | flipDn) & (c < o) & vok & (d < -1.5 * ad) & (roll < 0)
-
-    # 3) İkisi WINDOW mum içinde birlikte
-    near = lambda s: s.astype(int).rolling(WINDOW).max() > 0
-    cL = near(aL) & near(bL) & (aL | bL)
-    cS = near(aS) & near(bS) & (aS | bS)
-
-    return {"1-Kirilim": (aL, aS), "2-Delta+ST": (bL, bS), "3-Birlikte": (cL, cS)}
-
-
-def run(df, name, L, S, sym):
-    out = []
-    Lv, Sv = L.values, S.values
-    op, hi, lo, cl = df.open.values, df.high.values, df.low.values, df.close.values
-    n = len(df)
-    busy, last = -1, -999
-    for i in range(30, n - 2):
-        if i <= busy or i - last < GAP:
-            continue
-        side = 1 if Lv[i] else (-1 if Sv[i] else 0)
-        if not side:
-            continue
-        last = i
-        entry = op[i + 1]
-        sl = entry * (1 - side * SL / 100)
-        tp = entry * (1 + side * TP / 100)
-        end = min(i + 1 + MAX_HOLD, n - 1)
-        res, ex, j = "TIME", cl[end], end
-        for k in range(i + 1, end + 1):
-            hit_sl = lo[k] <= sl if side == 1 else hi[k] >= sl
-            hit_tp = hi[k] >= tp if side == 1 else lo[k] <= tp
-            if hit_sl:
-                res, ex, j = "SL", sl, k
-                break
-            if hit_tp:
-                res, ex, j = "TP", tp, k
-                break
-        busy = j
-        pnl = side * (ex - entry) / entry * 100 - FEE
-        out.append({"strategy": name, "symbol": sym, "time": str(df.t.iloc[i]),
-                    "side": "LONG" if side == 1 else "SHORT", "entry": entry,
-                    "result": res, "pnl": round(pnl, 2), "bars": j - i})
-    return out
-
-
-def summarize(tr):
-    lines = [f"BACKTEST {DAYS}g | {TF} | SL %{SL} TP %{TP} | komisyon %{FEE}\n"]
-    for name in ["1-Kirilim", "2-Delta+ST", "3-Birlikte"]:
-        g = tr[tr.strategy == name]
-        if g.empty:
-            lines.append(f"{name}\n  Sinyal yok\n")
-            continue
-        n, w = len(g), (g.pnl > 0).sum()
-        gp, gl = g.pnl[g.pnl > 0].sum(), -g.pnl[g.pnl <= 0].sum()
-        pf = gp / gl if gl else float("inf")
-        lines.append(
-            f"{name}\n  Sinyal: {n} (long {(g.side == 'LONG').sum()} / short {(g.side == 'SHORT').sum()})\n"
-            f"  TP {(g.result == 'TP').sum()} | SL {(g.result == 'SL').sum()} | Sure {(g.result == 'TIME').sum()}\n"
-            f"  Basari: %{w / n * 100:.1f} | Ort: %{g.pnl.mean():.2f} | Toplam: %{g.pnl.sum():.1f} | PF: {pf:.2f}\n")
-    return "\n".join(lines)
-
-
-def tg_msg(t):
-    if TOKEN and CHAT:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                      data={"chat_id": CHAT, "text": t}, timeout=30)
-
-
-def tg_file(path):
-    if TOKEN and CHAT:
-        with open(path, "rb") as f:
-            requests.post(f"https://api.telegram.org/bot{TOKEN}/sendDocument",
-                          data={"chat_id": CHAT}, files={"document": f}, timeout=60)
-
-
-def main():
-    syms = symbols()
-    print(f"{len(syms)} coin taranacak")
-    trades = []
-    for n, sym in enumerate(syms, 1):
-        try:
-            df = candles(sym)
-            if len(df) < 300:
+def test(s, k, delta_x, stop_pct):
+    o = [float(x[1]) for x in k]
+    h = [float(x[2]) for x in k]
+    l = [float(x[3]) for x in k]
+    c = [float(x[4]) for x in k]
+    d = [2 * float(x[10]) - float(x[7]) for x in k]   # delta = 2*taker alış - toplam (USDT)
+    sonuc = []
+    i = ORT_MUM
+    while i < len(k) - 1:
+        ort = mean(abs(x) for x in d[i - ORT_MUM:i])
+        mum = (h[i] - o[i]) / o[i] * 100
+        if c[i] > o[i] and mum >= MUM_YUZDE and ort > 0 and d[i] >= ort * delta_x:
+            tepe = h[i]
+            giris = None
+            for j in range(i + 1, min(i + 1 + BEKLE_MUM, len(k))):
+                seviye = tepe * (1 - GERI_CEKILME / 100)
+                if l[j] <= seviye:
+                    giris = j
+                    break
+                tepe = max(tepe, h[j])          # tepe yükselmeye devam ederse güncelle
+            if giris is None:
+                i += 1
                 continue
-            for name, (L, S) in signals(df).items():
-                trades += run(df, name, L, S, sym)
-        except Exception as e:
-            print("hata", sym, e)
-        if n % 20 == 0:
-            print(f"{n}/{len(syms)} bitti")
-    tr = pd.DataFrame(trades)
-    if tr.empty:
-        tg_msg("Backtest: hic sinyal cikmadi")
-        return
-    tr.to_csv("backtest_sonuc.csv", index=False)
-    txt = summarize(tr)
-    print(txt)
-    tg_msg(txt)
-    tg_file("backtest_sonuc.csv")
-
+            hedef = seviye * (1 + HEDEF / 100)
+            stop = seviye * (1 - stop_pct / 100)
+            cikis, tip, cj = None, "SURE", min(giris + TUT_MUM, len(k)) - 1
+            for j in range(giris, min(giris + TUT_MUM, len(k))):
+                if l[j] <= stop:                       # önce stop kontrolü (kötümser)
+                    cikis, tip, cj = stop, "STOP", j
+                    break
+                if j > giris and h[j] >= hedef:
+                    cikis, tip, cj = hedef, "HEDEF", j
+                    break
+            if cikis is None:
+                cikis = c[cj]
+            getiri = (cikis - seviye) / seviye * 100 - UCRET
+            sonuc.append({
+                "sembol": s,
+                "tarih": datetime.fromtimestamp(k[i][0] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "delta_x": round(d[i] / ort, 1), "esik": delta_x, "stop": stop_pct,
+                "itme_yuzde": round(mum, 1), "tepe": tepe, "giris": seviye, "cikis": cikis,
+                "sonuc": tip, "getiri": round(getiri, 2)})
+            i = cj + 1
+        else:
+            i += 1
+    return sonuc
 
 if __name__ == "__main__":
-    main()
+    ts = [t for t in get("/fapi/v1/ticker/24hr")
+          if t["symbol"].endswith("USDT") and "_" not in t["symbol"]]
+    ts.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
+    semboller = [t["symbol"] for t in ts[:TOP_N]]
+
+    veri = {}
+    for n, s in enumerate(semboller, 1):
+        try:
+            veri[s] = mumlar(s)
+            print(f"{n}/{len(semboller)} {s}")
+        except Exception as e:
+            print(s, e)
+
+    tum = []
+    print(f"\n{'delta':>6} {'stop%':>6} {'islem':>6} {'hedef%':>7} {'stop%':>6} {'basabas%':>9} {'ort.get%':>9} {'toplam%':>9}")
+    for dx in DELTA_ESIKLER:
+        for sp in STOP_LISTESI:
+            rows = []
+            for s, k in veri.items():
+                rows += test(s, k, dx, sp)
+            tum += rows
+            n = len(rows)
+            if n == 0:
+                print(f"{dx:>5}x {sp:>6} {0:>6}")
+                continue
+            hedef_o = sum(1 for x in rows if x["sonuc"] == "HEDEF") / n * 100
+            stop_o = sum(1 for x in rows if x["sonuc"] == "STOP") / n * 100
+            basabas = (sp + UCRET) / (HEDEF + sp) * 100
+            ort = sum(x["getiri"] for x in rows) / n
+            top = sum(x["getiri"] for x in rows)
+            print(f"{dx:>5}x {sp:>6} {n:>6} {hedef_o:>7.0f} {stop_o:>6.0f} {basabas:>9.0f} {ort:>9.2f} {top:>9.1f}")
+
+    if tum:
+        with open("backtest_islemler.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(tum[0].keys()))
+            w.writeheader()
+            w.writerows(tum)
+        print("\nTüm işlemler: backtest_islemler.csv")
