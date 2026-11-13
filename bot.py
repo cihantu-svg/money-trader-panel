@@ -1,7 +1,18 @@
+import sys
+import subprocess
+
+# aiohttp yüklü değilse otomatik yükle (Shell'le uğraşmazsın)
+try:
+    import aiohttp
+except ImportError:
+    print("aiohttp kütüphanesi eksik, otomatik olarak yükleniyor...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp"])
+    import aiohttp
+
 import os
 import time
 import asyncio
-import aiohttp
+import requests
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("TELEGRAM_CHAT_ID")
@@ -19,7 +30,7 @@ ilk_tarama = True
 
 
 async def fetch(session, semaphore, path, **p):
-    """Binance API'den asenkron veri çeker, rate limit (429/418) korumalıdır"""
+    """Binance API'den asenkron veri çeker, rate limit korumalıdır"""
     url = BASE + path
     for _ in range(2):
         async with semaphore:
@@ -127,7 +138,7 @@ async def process_symbol(session, semaphore, s):
 async def tara():
     global ilk_tarama
     async with aiohttp.ClientSession() as session:
-        # Binance ban yememek için aynı anda maksimum 20 eşzamanlı istek sınırı
+        # Binance ban yememek için aynı anda maksimum 20 eşzamanlı istek
         semaphore = asyncio.Semaphore(20)
 
         tickers = await fetch(session, semaphore, "/fapi/v1/ticker/24hr")
@@ -140,7 +151,6 @@ async def tara():
         
         baslangic = time.time()
         
-        # Tüm coinler için asenkron görevleri oluştur ve aynı anda çalıştır
         tasks = [process_symbol(session, semaphore, s) for s in semboller]
         await asyncio.gather(*tasks)
         
