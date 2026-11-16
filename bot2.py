@@ -1,4 +1,10 @@
-import os, time, asyncio, aiohttp
+import os, sys, time, asyncio, subprocess
+
+try:
+    import aiohttp
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "aiohttp"])
+    import aiohttp
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT = os.getenv("TELEGRAM_CHAT_ID")
