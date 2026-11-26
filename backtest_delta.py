@@ -1,34 +1,34 @@
-import sys, time, csv, statistics, requests
+import sys, time, csv, statistics, bisect, requests
 from datetime import datetime, timezone
 
 BASE = "https://fapi.binance.com"
 
 # ---------------- AYARLAR ----------------
-GUN = 30             # kaç günlük geçmiş (15m mum)
-MIN_HACIM = 1_000_000  # 24s USDT hacim alt sınırı (ana kodla aynı)
-MAX_COIN = 300       # en fazla kaç coin taransın (hacme göre sıralı)
-FEE = 0.08           # gidiş-dönüş komisyon % (taker 0.04 x 2)
+GUN = 30               # kac gunluk gecmis (15m mum)
+MIN_HACIM = 1_000_000  # 24s USDT hacim alt siniri (ana kodla ayni)
+MAX_COIN = 300         # en fazla kac coin (hacme gore sirali)
+FEE = 0.08             # gidis-donus komisyon %
 
-# Kırılım (ana kodla AYNI)
+# Kirilim (ana kodla AYNI)
 MUM_YUZDE = 5
 BO_LEN = 20
 BO_TAMPON = 0.5
 HACIM_CARPAN = 2.0
 RSI_AL = 60
-COOLDOWN_BAR = 4     # 1 saat = 4 mum
+COOLDOWN_BAR = 4       # 1 saat = 4 mum
 
-# Delta filtreleri
-DELTA_BOY_X = 3.0    # F1: kırılım deltası, son 20 mumun ort. |delta|'sının kaç katı
-ALICI_ORAN = 0.3     # F2: delta / hacim (0.3 ≈ alıcı payı %65)
-YUTMA_LEN = 10       # F3: önceki kaç mumun satış deltası yutulsun
-SERT_KIRMIZI = 0.5   # F4: sonraki mum deltası, kırılım deltasının -%50'sinden kötüyse ele
+# Yeni filtreler
+UC_MUM = 3             # kirilimdan sonra kac mumun toplam deltasi (giris bu mumun kapanisinda)
+SMA_LEN = 100
+SMA_ESIK = 2.0         # fiyat, SMA100'e en fazla % kac uzakta olsun
 
-# Çıkış kuralları
-MAX_BAR = 96         # en fazla 24 saat tut
-CIKIS_TEK = 0.5      # tek mum deltası <= -%50 kırılım deltası -> çık
-CIKIS_BIRIKIM = 1.0  # birikimli satış deltası <= -%100 kırılım deltası -> çık
+# Cikis
+MAX_BAR = 96           # en fazla 24 saat tut
+CIKIS_TEK = 0.5        # tek mum deltasi <= -%50 kirilim deltasi -> cik
+CIKIS_BIRIKIM = 1.0    # birikimli satis deltasi <= -%100 kirilim deltasi -> cik
 
 oturum = requests.Session()
+METRIKLER = []
 
 
 def get(path, **p):
@@ -81,75 +81,13 @@ def mumlar(s):
         if len(k) < 1500:
             break
         time.sleep(0.4)
-    return out[:-1]  # son (kapanmamış) mumu at
+    return out[:-1]  # kapanmamis son mumu at
 
 
-def isle(s, k, islemler, detay=False):
-    n = len(k)
-    if n < 200:
-        return
-    o = [float(x[1]) for x in k]
-    h = [float(x[2]) for x in k]
-    l = [float(x[3]) for x in k]
-    c = [float(x[4]) for x in k]
-    v = [float(x[5]) for x in k]
-    qv = [float(x[7]) for x in k]
-    delta = [2 * float(x[10]) - float(x[7]) for x in k]  # alıcı - satıcı (USDT)
-
-    macd = [a - b for a, b in zip(ema(c, 12), ema(c, 26))]
-    hist = [m - sg for m, sg in zip(macd, ema(macd, 9))]
-    rsi = rsi_seri(c)
-
-    son_i = -999
-    for i in range(60, n - 2 - MAX_BAR):
-        if i - son_i < COOLDOWN_BAR:
-            continue
-        direnc = max(h[i - BO_LEN:i])
-        kirilim = c[i] > direnc * (1 + BO_TAMPON / 100) and c[i - 1] <= direnc
-        hacim_ok = v[i] > HACIM_CARPAN * (sum(v[i - 19:i + 1]) / 20)
-        mom = rsi[i] > RSI_AL and hist[i] > 0
-        mum = (h[i] - o[i]) / o[i] * 100 >= MUM_YUZDE
-        if not (kirilim and hacim_ok and mom and mum):
-            continue
-        son_i = i
-        D = delta[i]
-        if D <= 0:
-            D_ok = False
-        else:
-            D_ok = True
-
-        ort_abs = sum(abs(x) for x in delta[i - 20:i]) / 20 or 1e-9
-        f_boy = D_ok and D >= DELTA_BOY_X * ort_abs
-        f_alici = D_ok and qv[i] > 0 and D / qv[i] >= ALICI_ORAN
-        satis = sum(-x for x in delta[i - YUTMA_LEN:i] if x < 0)
-        f_yutma = D_ok and D > satis
-        f_tut = D_ok and delta[i + 1] > -SERT_KIRMIZI * D
-
-        # strateji adı -> (filtre geçti mi, giriş mumu)
-        stratejiler = {
-            "0_TEMEL (sadece kirilim)": (True, i),
-            "0_TEMEL giris i+1": (True, i + 1),
-            "1_DELTA_BOY": (f_boy, i),
-            "2_ALICI_PAYI": (f_alici, i),
-            "3_YUTMA": (f_yutma, i),
-            "4_TUTUNMA (i+1 giris)": (f_tut, i + 1),
-            "5_KOMBINE (1+2+3)": (f_boy and f_alici and f_yutma, i),
-        }
-        stop = l[i]
-        tarih = datetime.fromtimestamp(k[i][0] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
-        if detay:
-            ev = lambda b: "EVET" if b else "hayir"
-            print(f"{s} {tarih} UTC | fiyat {c[i]} | mum %{(h[i]-o[i])/o[i]*100:.1f} | "
-                  f"delta {D/1e3:.0f}K ({D/ort_abs:.1f}x ort) | alici orani {D/qv[i]:.2f} | "
-                  f"BOY:{ev(f_boy)} ALICI:{ev(f_alici)} YUTMA:{ev(f_yutma)} TUTUNMA:{ev(f_tut)}")
-            continue
-        for ad, (gecti, e) in stratejiler.items():
-            if not gecti:
-                continue
-            for cikis in ("STOP+SABIT", "STOP+DELTA"):
-                getiri, neden = sim(e, c, o, l, delta, stop, D, cikis == "STOP+DELTA")
-                islemler.append({"sembol": s, "tarih": tarih, "strateji": ad,
-                                 "cikis": cikis, "neden": neden, "getiri": getiri})
+def mumlar_4h(s):
+    simdi = int(time.time() * 1000)
+    return get("/fapi/v1/klines", symbol=s, interval="4h",
+               startTime=simdi - (GUN + 20) * 86400000, limit=1500)
 
 
 def sim(e, c, o, l, delta, stop, D, delta_cikis):
@@ -168,26 +106,147 @@ def sim(e, c, o, l, delta, stop, D, delta_cikis):
     return (c[e + MAX_BAR] / giris - 1) * 100 - FEE, "sure"
 
 
+def isle(s, k, k4, islemler, detay=False):
+    n = len(k)
+    if n < 250:
+        return
+    o = [float(x[1]) for x in k]
+    h = [float(x[2]) for x in k]
+    l = [float(x[3]) for x in k]
+    c = [float(x[4]) for x in k]
+    v = [float(x[5]) for x in k]
+    qv = [float(x[7]) for x in k]
+    delta = [2 * float(x[10]) - float(x[7]) for x in k]  # alici - satici (USDT)
+
+    macd = [a - b for a, b in zip(ema(c, 12), ema(c, 26))]
+    hist = [m - sg for m, sg in zip(macd, ema(macd, 9))]
+    rsi = rsi_seri(c)
+
+    pref = [0.0]
+    for x in c:
+        pref.append(pref[-1] + x)
+
+    # 4h SMA100: sadece KAPANMIS 4h mumlar kullanilir (ileriye bakma yok)
+    c4 = [float(x[4]) for x in k4]
+    kap4, sma4 = [], []
+    for m in range(SMA_LEN - 1, len(k4)):
+        kap4.append(k4[m][0] + 14400000)
+        sma4.append(sum(c4[m - SMA_LEN + 1:m + 1]) / SMA_LEN)
+
+    son_i = -999
+    for i in range(SMA_LEN, n - UC_MUM - 1 - MAX_BAR):
+        if i - son_i < COOLDOWN_BAR:
+            continue
+        direnc = max(h[i - BO_LEN:i])
+        kirilim = c[i] > direnc * (1 + BO_TAMPON / 100) and c[i - 1] <= direnc
+        hacim_ok = v[i] > HACIM_CARPAN * (sum(v[i - 19:i + 1]) / 20)
+        mom = rsi[i] > RSI_AL and hist[i] > 0
+        mum = (h[i] - o[i]) / o[i] * 100 >= MUM_YUZDE
+        if not (kirilim and hacim_ok and mom and mum):
+            continue
+        son_i = i
+
+        D = delta[i]
+        yon = abs(D) or 1e-9
+        ort_abs = sum(abs(x) for x in delta[i - 20:i]) / 20 or 1e-9
+        satis = sum(-x for x in delta[i - 10:i] if x < 0)
+        uc = sum(delta[i + 1:i + 1 + UC_MUM])  # kirilimdan sonraki 3 mumun toplam deltasi
+
+        sma15 = (pref[i + 1] - pref[i + 1 - SMA_LEN]) / SMA_LEN
+        m15 = (c[i] - sma15) / sma15 * 100
+        idx = bisect.bisect_right(kap4, k[i][0] + 900000) - 1
+        m4 = (c[i] - sma4[idx]) / sma4[idx] * 100 if idx >= 0 else None
+
+        f3 = uc > 0
+        f15 = abs(m15) <= SMA_ESIK
+        f4 = m4 is not None and abs(m4) <= SMA_ESIK
+        tarih = datetime.fromtimestamp(k[i][0] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+        if detay:
+            ev = lambda b: "EVET" if b else "hayir"
+            m4t = f"{m4:+.1f}%" if m4 is not None else "yok"
+            print(f"{s} {tarih} UTC | fiyat {c[i]} | mum %{(h[i]-o[i])/o[i]*100:.1f} | "
+                  f"delta {D/1e3:.0f}K | 3mum toplam {uc/1e3:.0f}K | "
+                  f"SMA15m {m15:+.1f}% SMA4h {m4t} | "
+                  f"3MUM:{ev(f3)} SMA15m:{ev(f15)} SMA4h:{ev(f4)}")
+            continue
+
+        stop = l[i]
+        e3 = i + UC_MUM
+        METRIKLER.append({
+            "sembol": s, "tarih": tarih,
+            "delta_x": D / ort_abs,
+            "alici": D / qv[i] if qv[i] else 0,
+            "yutma": max(-50, min(50, D / (satis + 1e-9))),
+            "uc_mum": uc / yon,
+            "sma15_mesafe": m15,
+            "sma4h_mesafe": m4,
+            "getiri_sabit": sim(e3, c, o, l, delta, stop, yon, False)[0],
+            "getiri_delta": sim(e3, c, o, l, delta, stop, yon, True)[0]})
+
+        stratejiler = {
+            "0_TEMEL giris i": (True, i),
+            "0_TEMEL giris i+3": (True, e3),
+            "A_3MUM_TOPLAM>0": (f3, e3),
+            "B_SMA15m<=2%": (f15, i),
+            "C_SMA4h<=2%": (f4, i),
+            "D_3MUM + SMA15m": (f3 and f15, e3),
+            "E_3MUM + SMA4h": (f3 and f4, e3),
+        }
+        for ad, (gecti, e) in stratejiler.items():
+            if not gecti:
+                continue
+            for cikis in ("STOP+SABIT", "STOP+DELTA"):
+                getiri, neden = sim(e, c, o, l, delta, stop, yon, cikis == "STOP+DELTA")
+                islemler.append({"sembol": s, "tarih": tarih, "strateji": ad,
+                                 "cikis": cikis, "neden": neden, "getiri": getiri})
+
+
 def rapor(islemler):
-    print(f"\n{'STRATEJI':28} {'CIKIS':11} {'ISLEM':>5} {'KAZAN%':>7} {'ORT%':>7} {'MEDYAN%':>8} {'TOPLAM%':>8}")
-    print("-" * 80)
-    adlar = sorted({r["strateji"] for r in islemler})
-    for ad in adlar:
+    print(f"\n{'STRATEJI':22} {'CIKIS':11} {'ISLEM':>5} {'KAZAN%':>7} {'ORT%':>7} {'MEDYAN%':>8}")
+    print("-" * 66)
+    for ad in sorted({r["strateji"] for r in islemler}):
         for cikis in ("STOP+SABIT", "STOP+DELTA"):
             g = [r["getiri"] for r in islemler if r["strateji"] == ad and r["cikis"] == cikis]
             if not g:
                 continue
             kazan = sum(1 for x in g if x > 0) / len(g) * 100
-            print(f"{ad:28} {cikis:11} {len(g):5d} {kazan:7.0f} {statistics.mean(g):7.2f} "
-                  f"{statistics.median(g):8.2f} {sum(g):8.1f}")
+            print(f"{ad:22} {cikis:11} {len(g):5d} {kazan:7.0f} {statistics.mean(g):7.2f} "
+                  f"{statistics.median(g):8.2f}")
         print()
+
+
+def metrik_rapor():
+    print("\n=== HER OLCU ISE YARIYOR MU? (filtresiz kirilimlar 4 esit gruba bolundu) ===")
+    print("Giris: kirilimdan 3 mum sonra. Olcu gercekten bilgi veriyorsa sonuc gruptan gruba duzenli degismeli.")
+    olcumler = [("delta_x", "1) Kirilim deltasi / son 20 mum ort |delta|"),
+                ("alici", "2) Delta / hacim (alici baskinligi)"),
+                ("yutma", "3) Delta / onceki 10 mum satis deltasi"),
+                ("uc_mum", "4) Sonraki 3 mumun toplam deltasi / kirilim deltasi"),
+                ("sma15_mesafe", "5) Fiyatin 15m SMA100'e uzakligi % (+ ustunde, - altinda)"),
+                ("sma4h_mesafe", "6) Fiyatin 4h SMA100'e uzakligi %")]
+    for anahtar, baslik in olcumler:
+        r = sorted((x for x in METRIKLER if x[anahtar] is not None), key=lambda x: x[anahtar])
+        if len(r) < 8:
+            continue
+        print(f"\n{baslik}")
+        print(f"{'GRUP (dusukten yuksege)':28} {'ISLEM':>5} | {'SABIT kazan%':>12} {'ort%':>6} | {'DELTA kazan%':>12} {'ort%':>6}")
+        d = len(r) / 4
+        for g in range(4):
+            parca = r[int(g * d):int((g + 1) * d)]
+            aralik = f"{parca[0][anahtar]:.2f} .. {parca[-1][anahtar]:.2f}"
+            ks = sum(1 for x in parca if x["getiri_sabit"] > 0) / len(parca) * 100
+            kd = sum(1 for x in parca if x["getiri_delta"] > 0) / len(parca) * 100
+            os_ = statistics.mean(x["getiri_sabit"] for x in parca)
+            od = statistics.mean(x["getiri_delta"] for x in parca)
+            print(f"{aralik:28} {len(parca):5d} | {ks:12.0f} {os_:6.2f} | {kd:12.0f} {od:6.2f}")
 
 
 def kontrol(semboller):
     """python backtest_delta.py MANTRAUSDT SLXUSDT -> o coinlerin sinyallerini tek tek yazar"""
     for s in semboller:
         print(f"\n--- {s} (son {GUN} gun, UTC saat) ---")
-        isle(s, mumlar(s), [], detay=True)
+        isle(s, mumlar(s), mumlar_4h(s), [], detay=True)
 
 
 def main():
@@ -204,7 +263,7 @@ def main():
     for n, t in enumerate(tickerlar, 1):
         s = t["symbol"]
         try:
-            isle(s, mumlar(s), islemler)
+            isle(s, mumlar(s), mumlar_4h(s), islemler)
         except Exception as ex:
             print(s, ex)
         if n % 25 == 0:
@@ -217,8 +276,13 @@ def main():
         w = csv.DictWriter(f, fieldnames=list(islemler[0].keys()))
         w.writeheader()
         w.writerows(islemler)
+    with open("backtest_metrikler.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=list(METRIKLER[0].keys()))
+        w.writeheader()
+        w.writerows(METRIKLER)
     rapor(islemler)
-    print("Tum islemler: backtest_islemler.csv")
+    metrik_rapor()
+    print("\nDosyalar: backtest_islemler.csv, backtest_metrikler.csv")
 
 
 if __name__ == "__main__":
