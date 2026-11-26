@@ -14,7 +14,7 @@ COOLDOWN = 3600         # ayni coine tekrar sinyal bekleme (sn)
 # Kirilim: TradingView Pine koduyla ayni
 BO_LEN = 20             # onceki 20 mumun en yuksegi
 BO_TAMPON = 0.5         # kirilim tamponu %
-HACIM_CARPAN = 8.0      # hacim, 20 mumluk ortalamanin kac kati
+HACIM_CARPAN = 5.0      # hacim, 20 mumluk ortalamanin kac kati
 RSI_AL = 60             # RSI alt siniri (MACD histogrami da > 0 olmali)
 
 # SMA100 (15m) yakinligi
@@ -24,7 +24,7 @@ SMA_ESIK = 5.0          # kirilim mumu kapanisi SMA100'e en fazla %5 uzakta olsu
 
 # Delta tetigi
 DELTA_ORAN = 0.5        # sonraki yesil mumun deltasi >= kirilim deltasinin %50'si
-BEKLEME_MUM = 3         # kirilimdan sonra en fazla kac mum beklensin
+BEKLEME_MUM = 5         # kirilimdan sonra en fazla kac mum beklensin
 MUM_YESIL_SART = True   # tetik mumu ayrica yesil kapanmali (kapanis >= acilis)
 
 DOSYA = "sinyaller_delta.csv"
