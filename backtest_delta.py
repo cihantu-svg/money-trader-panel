@@ -1,4 +1,4 @@
-import time, csv, statistics, requests
+import sys, time, csv, statistics, requests
 from datetime import datetime, timezone
 
 BASE = "https://fapi.binance.com"
@@ -84,7 +84,7 @@ def mumlar(s):
     return out[:-1]  # son (kapanmamış) mumu at
 
 
-def isle(s, k, islemler):
+def isle(s, k, islemler, detay=False):
     n = len(k)
     if n < 200:
         return
@@ -137,6 +137,12 @@ def isle(s, k, islemler):
         }
         stop = l[i]
         tarih = datetime.fromtimestamp(k[i][0] / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M")
+        if detay:
+            ev = lambda b: "EVET" if b else "hayir"
+            print(f"{s} {tarih} UTC | fiyat {c[i]} | mum %{(h[i]-o[i])/o[i]*100:.1f} | "
+                  f"delta {D/1e3:.0f}K ({D/ort_abs:.1f}x ort) | alici orani {D/qv[i]:.2f} | "
+                  f"BOY:{ev(f_boy)} ALICI:{ev(f_alici)} YUTMA:{ev(f_yutma)} TUTUNMA:{ev(f_tut)}")
+            continue
         for ad, (gecti, e) in stratejiler.items():
             if not gecti:
                 continue
@@ -177,7 +183,17 @@ def rapor(islemler):
         print()
 
 
+def kontrol(semboller):
+    """python backtest_delta.py MANTRAUSDT SLXUSDT -> o coinlerin sinyallerini tek tek yazar"""
+    for s in semboller:
+        print(f"\n--- {s} (son {GUN} gun, UTC saat) ---")
+        isle(s, mumlar(s), [], detay=True)
+
+
 def main():
+    if len(sys.argv) > 1:
+        kontrol([x.upper() for x in sys.argv[1:]])
+        return
     tickerlar = [t for t in get("/fapi/v1/ticker/24hr")
                  if t["symbol"].endswith("USDT") and "_" not in t["symbol"]
                  and float(t["quoteVolume"]) >= MIN_HACIM]
